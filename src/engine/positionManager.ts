@@ -252,8 +252,8 @@ async function closePosition(
     });
 
     // 3. Cập nhật vốn giả lập (bao gồm phí)
-    const { updateCapital } = await import('../services/capitalManager');
-    await updateCapital(pnl, position.totalQuantity, position.avgEntryPrice, finalExitPrice, false); // isMaker=false (taker fee)
+    const { updateCapitalOnClose } = await import('../services/capitalManager');
+    await updateCapitalOnClose(pnl, position.totalQuantity, finalExitPrice, false); // isMaker=false (taker fee)
 
     const emoji = pnl >= 0 ? '✅' : '❌';
     console.log(
