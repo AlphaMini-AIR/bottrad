@@ -7,7 +7,7 @@ const MAKER_FEE = 0.0002;
 
 // Trừ phí entry khi mở lệnh
 export async function updateCapitalOnOpen(quantity: number, entry: number, isMaker = false) {
-  await mongoose.connect(process.env.MONGODB_URI!);
+  await mongoose.connect('mongodb+srv://assistantsupdev_db_user:rCp0BrUushhwIKR8@binance.bjmukc0.mongodb.net/?appName=Binance');
   const fee = entry * quantity * (isMaker ? MAKER_FEE : TAKER_FEE);
   const cap = await Capital.findOneAndUpdate(
     { user: 'default' },
@@ -19,7 +19,7 @@ export async function updateCapitalOnOpen(quantity: number, entry: number, isMak
 
 // Trừ phí exit và cộng/trừ PnL khi đóng lệnh
 export async function updateCapitalOnClose(pnl: number, quantity: number, exit: number, isMaker = false) {
-  await mongoose.connect(process.env.MONGODB_URI!);
+  await mongoose.connect('mongodb+srv://assistantsupdev_db_user:rCp0BrUushhwIKR8@binance.bjmukc0.mongodb.net/?appName=Binance');
   const fee = exit * quantity * (isMaker ? MAKER_FEE : TAKER_FEE);
   const net = pnl - fee;
   const cap = await Capital.findOneAndUpdate(

@@ -8,7 +8,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   if (typeof amount !== 'number' || isNaN(amount) || amount <= 0) {
     return res.status(400).json({ error: 'Invalid amount' });
   }
-  await mongoose.connect(process.env.MONGODB_URI!);
+  await mongoose.connect('mongodb+srv://assistantsupdev_db_user:rCp0BrUushhwIKR8@binance.bjmukc0.mongodb.net/?appName=Binance');
   const cap = await Capital.findOneAndUpdate(
     { user: 'default' },
     { $inc: { amount }, $set: { updatedAt: new Date() } },
