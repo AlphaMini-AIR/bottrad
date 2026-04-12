@@ -23,14 +23,20 @@
   "homepage": "https://github.com/AlphaMini-AIR/bottrad#readme",
   "description": "",
   "dependencies": {
+    "axios": "^1.15.0",
+    "ccxt": "^4.5.48",
     "dotenv": "^17.4.1",
     "ioredis": "^5.10.1",
     "mongoose": "^9.4.1",
+    "node-fetch": "^3.3.2",
+    "nodemailer": "^8.0.5",
     "technicalindicators": "^3.1.0",
     "ws": "^8.20.0"
   },
   "devDependencies": {
     "@types/node": "^25.5.2",
+    "@types/node-fetch": "^2.6.13",
+    "@types/nodemailer": "^8.0.0",
     "@types/ws": "^8.18.1",
     "pm2": "^6.0.14",
     "ts-node": "^10.9.2",

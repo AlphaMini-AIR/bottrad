@@ -1,5 +1,6 @@
 import WebSocket from 'ws';
 import redis from '../database/redis';
+import { scalperEvents } from '../engine/fastScalper'; // Đã có import
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────────
 const BINANCE_FAPI_BASE = 'https://fapi.binance.com';
@@ -120,11 +121,6 @@ function getBackoffDelay(attempt: number): number {
 
 // ─── 1. getMultiTimeframeKlines ────────────────────────────────────────────────
 
-/**
- * Fetch nến cho 3 khung thời gian ('4h', '1h', '15m') song song.
- * 4H: 60 nến (đủ EMA50 + margin), 1H: 20 nến, 15M: 30 nến (đủ RSI14 + ATR14).
- * Dùng Promise.allSettled để 1 khung lỗi không ảnh hưởng 2 khung còn lại.
- */
 export async function getMultiTimeframeKlines(symbol: string): Promise<MultiTimeframeResult> {
   const tasks: Array<{ interval: '4h' | '1h' | '15m'; limit: number }> = [
     { interval: '4h', limit: 60 },
@@ -171,7 +167,6 @@ async function fetchKlines(
       throw new Error(`HTTP ${res.status}: ${body}`);
     }
 
-    // SỬA TẠI ĐÂY: Thêm dấu [] vào sau KlineRaw
     const raw = (await res.json()) as KlineRaw[];
 
     return raw.map(parseKline);
@@ -179,15 +174,9 @@ async function fetchKlines(
     clearTimeout(timeout);
   }
 }
+
 // ─── 2. monitorWhaleTrades ─────────────────────────────────────────────────────
 
-/**
- * Kết nối WebSocket aggTrade stream cho danh sách symbols.
- * Khi phát hiện giao dịch > WHALE_THRESHOLD_USD, lưu vào Redis list WHALE:<symbol>.
- * List tự hết hạn sau WHALE_TTL_SECONDS giây.
- *
- * Trả về hàm cleanup() để đóng tất cả kết nối.
- */
 export function monitorWhaleTrades(symbols: string[]): () => void {
   let stopped = false;
   const activeConnections = new Map<string, WebSocket>();
@@ -198,7 +187,6 @@ export function monitorWhaleTrades(symbols: string[]): () => void {
     activeConnections.set(symLower, ws);
   }
 
-  // Cleanup function
   return () => {
     stopped = true;
     for (const [, ws] of activeConnections) {
@@ -245,7 +233,6 @@ function connectWhaleStream(
 
         const key = `WHALE:${symbol}`;
 
-        // MULTI: push + set TTL atomically
         const pipeline = redis.pipeline();
         pipeline.lpush(key, JSON.stringify(entry));
         pipeline.expire(key, WHALE_TTL_SECONDS);
@@ -254,6 +241,14 @@ function connectWhaleStream(
         console.log(
           `[MarketData][Whale] 🐋 ${symbol} ${side} $${value.toLocaleString('en-US', { maximumFractionDigits: 0 })} @ ${price}`,
         );
+
+        // 🟢 BỔ SUNG: Bắn tín hiệu Fast Scalp bằng Event Emitter
+        scalperEvents.emit('WHALE_DETECTED', {
+          symbol: symbol,
+          side: side,
+          usdVolume: value,
+          price: price
+        });
       }
     } catch (err) {
       logError('Whale:parse', err);
@@ -261,7 +256,7 @@ function connectWhaleStream(
   });
 
   ws.on('close', (code: number) => {
-    if (isStopped?.()) return; // Không reconnect nếu đã cleanup
+    if (isStopped?.()) return;
     const delay = getBackoffDelay(attempt);
     console.warn(
       `[MarketData][Whale] ${symbolLower} closed (code: ${code}). Reconnecting in ${(delay / 1000).toFixed(1)}s...`,
@@ -283,12 +278,6 @@ function connectWhaleStream(
 
 // ─── 3. getRadarData ───────────────────────────────────────────────────────────
 
-/**
- * Kết nối WebSocket !miniTicker@arr, lọc top 10 coin volume cao nhất,
- * flush vào Redis key RADAR:HOT_COINS mỗi 5 giây.
- *
- * Trả về hàm cleanup() để dừng radar.
- */
 export function getRadarData(): () => void {
   const REDIS_KEY = 'RADAR:HOT_COINS';
   let latestTop: { symbol: string; price: number; quoteVolume: number }[] = [];
@@ -325,7 +314,6 @@ export function getRadarData(): () => void {
     () => stopped,
   );
 
-  // Flush to Redis mỗi 5 giây
   flushTimer = setInterval(async () => {
     if (latestTop.length === 0) return;
     try {
@@ -338,7 +326,6 @@ export function getRadarData(): () => void {
     }
   }, RADAR_FLUSH_INTERVAL_MS);
 
-  // Cleanup function
   return () => {
     stopped = true;
     if (flushTimer) clearInterval(flushTimer);
@@ -398,13 +385,6 @@ function connectRadarStream(
 
 // ─── 4. getMoneyFlowData ──────────────────────────────────────────────────────
 
-/**
- * Fetch dữ liệu dòng tiền thông minh cho 1 symbol:
- * - Long/Short Account Ratio (tỉ lệ tài khoản long vs short)
- * - Open Interest (khối lượng hợp đồng mở)
- * - Funding Rate (phí funding)
- * - Taker Buy/Sell Volume (áp lực mua/bán thực tế)
- */
 export async function getMoneyFlowData(symbol: string): Promise<MoneyFlowData> {
   const result: MoneyFlowData = {
     symbol,
@@ -424,49 +404,40 @@ export async function getMoneyFlowData(symbol: string): Promise<MoneyFlowData> {
 
   try {
     const [lsRes, oiRes, frRes, takerRes, topAccRes, topPosRes, depthRes, tickerRes] = await Promise.allSettled([
-      // 1. Long/Short Account Ratio (toàn bộ thị trường)
       fetch(
         `${BINANCE_FAPI_BASE}/futures/data/globalLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=5m&limit=1`,
         { signal: controller.signal },
       ),
-      // 2. Open Interest Statistics
       fetch(
         `${BINANCE_FAPI_BASE}/futures/data/openInterestHist?symbol=${encodeURIComponent(symbol)}&period=5m&limit=2`,
         { signal: controller.signal },
       ),
-      // 3. Funding Rate
       fetch(
         `${BINANCE_FAPI_BASE}/fapi/v1/fundingRate?symbol=${encodeURIComponent(symbol)}&limit=1`,
         { signal: controller.signal },
       ),
-      // 4. Taker Buy/Sell Volume
       fetch(
         `${BINANCE_FAPI_BASE}/futures/data/takerlongshortRatio?symbol=${encodeURIComponent(symbol)}&period=5m&limit=1`,
         { signal: controller.signal },
       ),
-      // 5. Top Trader Long/Short Ratio (Accounts) — top 20% tài khoản lớn nhất
       fetch(
         `${BINANCE_FAPI_BASE}/futures/data/topLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=5m&limit=1`,
         { signal: controller.signal },
       ),
-      // 6. Top Trader Long/Short Ratio (Positions) — vị thế thực tế top traders
       fetch(
         `${BINANCE_FAPI_BASE}/futures/data/topLongShortPositionRatio?symbol=${encodeURIComponent(symbol)}&period=5m&limit=1`,
         { signal: controller.signal },
       ),
-      // 7. Order Book Depth — sổ lệnh (20 mức giá)
       fetch(
         `${BINANCE_FAPI_BASE}/fapi/v1/depth?symbol=${encodeURIComponent(symbol)}&limit=20`,
         { signal: controller.signal },
       ),
-      // 8. 24h Ticker — số lượng giao dịch
       fetch(
         `${BINANCE_FAPI_BASE}/fapi/v1/ticker/24hr?symbol=${encodeURIComponent(symbol)}`,
         { signal: controller.signal },
       ),
     ]);
 
-    // Parse Long/Short Ratio
     if (lsRes.status === 'fulfilled' && lsRes.value.ok) {
       const data = await lsRes.value.json() as Array<{ longAccount: string; shortAccount: string; longShortRatio: string }>;
       if (data.length > 0) {
@@ -478,7 +449,6 @@ export async function getMoneyFlowData(symbol: string): Promise<MoneyFlowData> {
       }
     }
 
-    // Parse Open Interest
     if (oiRes.status === 'fulfilled' && oiRes.value.ok) {
       const data = await oiRes.value.json() as Array<{ sumOpenInterest: string; sumOpenInterestValue: string }>;
       if (data.length >= 1) {
@@ -491,7 +461,6 @@ export async function getMoneyFlowData(symbol: string): Promise<MoneyFlowData> {
       }
     }
 
-    // Parse Funding Rate
     if (frRes.status === 'fulfilled' && frRes.value.ok) {
       const data = await frRes.value.json() as Array<{ fundingRate: string }>;
       if (data.length > 0) {
@@ -499,7 +468,6 @@ export async function getMoneyFlowData(symbol: string): Promise<MoneyFlowData> {
       }
     }
 
-    // Parse Taker Buy/Sell Ratio
     if (takerRes.status === 'fulfilled' && takerRes.value.ok) {
       const data = await takerRes.value.json() as Array<{ buySellRatio: string; buyVol: string; sellVol: string }>;
       if (data.length > 0) {
@@ -511,7 +479,6 @@ export async function getMoneyFlowData(symbol: string): Promise<MoneyFlowData> {
       }
     }
 
-    // Parse Top Trader Accounts
     if (topAccRes.status === 'fulfilled' && topAccRes.value.ok) {
       const data = await topAccRes.value.json() as Array<{ longAccount: string; shortAccount: string; longShortRatio: string }>;
       if (data.length > 0) {
@@ -523,7 +490,6 @@ export async function getMoneyFlowData(symbol: string): Promise<MoneyFlowData> {
       }
     }
 
-    // Parse Top Trader Positions
     if (topPosRes.status === 'fulfilled' && topPosRes.value.ok) {
       const data = await topPosRes.value.json() as Array<{ longAccount: string; shortAccount: string; longShortRatio: string }>;
       if (data.length > 0) {
@@ -535,7 +501,6 @@ export async function getMoneyFlowData(symbol: string): Promise<MoneyFlowData> {
       }
     }
 
-    // Parse Order Book Depth
     if (depthRes.status === 'fulfilled' && depthRes.value.ok) {
       const data = await depthRes.value.json() as { bids: string[][]; asks: string[][] };
       if (data.bids && data.asks) {
@@ -553,7 +518,6 @@ export async function getMoneyFlowData(symbol: string): Promise<MoneyFlowData> {
       }
     }
 
-    // Parse 24h Ticker
     if (tickerRes.status === 'fulfilled' && tickerRes.value.ok) {
       const data = await tickerRes.value.json() as { count: number };
       if (data.count) {
