@@ -1,0 +1,39 @@
+{
+  "name": "bottrad",
+  "version": "1.0.0",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "ts-node src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "pm2:start": "pm2 start dist/index.js --name bottrad",
+    "pm2:stop": "pm2 stop bottrad",
+    "pm2:logs": "pm2 logs bottrad"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AlphaMini-AIR/bottrad.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/AlphaMini-AIR/bottrad/issues"
+  },
+  "homepage": "https://github.com/AlphaMini-AIR/bottrad#readme",
+  "description": "",
+  "dependencies": {
+    "dotenv": "^17.4.1",
+    "ioredis": "^5.10.1",
+    "mongoose": "^9.4.1",
+    "technicalindicators": "^3.1.0",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "@types/ws": "^8.18.1",
+    "pm2": "^6.0.14",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.2"
+  }
+}
