@@ -1,46 +1,25 @@
 {
     "active_coins": {
-        "BTCUSDT": {
-            "sl_mult": 0.5,
-            "tp_mult": 1.0,
-            "min_prob": 0.65,
-            "strategy": "SCALP",
-            "aucpr": 0.3684
-        },
-        "ETHUSDT": {
-            "sl_mult": 0.5,
-            "tp_mult": 1.0,
-            "min_prob": 0.65,
-            "strategy": "SCALP",
-            "aucpr": 0.3558
-        },
-        "LINKUSDT": {
-            "sl_mult": 0.5,
-            "tp_mult": 1.0,
-            "min_prob": 0.65,
-            "strategy": "SCALP",
-            "aucpr": 0.3596
-        },
         "NEARUSDT": {
             "sl_mult": 0.5,
             "tp_mult": 1.0,
             "min_prob": 0.65,
             "strategy": "SCALP",
-            "aucpr": 0.3478
+            "aucpr": 0.3401
         },
         "SOLUSDT": {
             "sl_mult": 0.5,
             "tp_mult": 1.0,
             "min_prob": 0.65,
             "strategy": "SCALP",
-            "aucpr": 0.3541
+            "aucpr": 0.356
         },
         "TAOUSDT": {
             "sl_mult": 0.5,
             "tp_mult": 1.0,
             "min_prob": 0.65,
             "strategy": "SCALP",
-            "aucpr": 0.3517
+            "aucpr": 0.3514
         }
     }
 }

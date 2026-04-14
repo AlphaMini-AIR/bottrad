@@ -73,11 +73,11 @@ class BulkHistoryFetcher {
 
     async run() {
         await connectDB();
-        const coins = ['NEARUSDT', 'PETUSDT', 'TAOUSDT'];
+        const coins = ['SOLUSDT'];
         for (const coin of coins) {
             await this.fetchHistory(coin);
         }
-        console.log('\n✅ [DATABASE] Đã nạp đầy dữ liệu 6 tháng cho 3 coin!');
+        console.log('\n✅ [DATABASE] Đã nạp đầy dữ liệu 6 tháng cho 1 coin!');
         process.exit();
     }
 }
