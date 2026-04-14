@@ -1,40 +1,49 @@
 /**
- * src/services/ai/AiEngine.js
+ * src/services/ai/AiEngine.js - Version 5.0 (7 Features & Dynamic Models)
  */
 const ort = require('onnxruntime-node');
 const path = require('path');
+const fs = require('fs');
 
 class AiEngine {
     constructor() {
-        this.session = null;
+        // Quản lý nhiều model cùng lúc cho từng coin
+        this.sessions = {};
     }
 
-    async init() {
-        if (!this.session) {
-            const modelPath = path.join(__dirname, '../../../ai_quant_sniper.onnx');
-            this.session = await ort.InferenceSession.create(modelPath);
-            console.log('🧠 [AI ENGINE] Đã nạp thành công bộ não ONNX V4.1 vào RAM!');
+    async init(symbol) {
+        if (!this.sessions[symbol]) {
+            // Đọc model động theo tên coin sinh ra từ Python
+            const modelPath = path.join(__dirname, `../../../model_${symbol}.onnx`);
+            if (fs.existsSync(modelPath)) {
+                this.sessions[symbol] = await ort.InferenceSession.create(modelPath);
+                console.log(`🧠 [AI ENGINE] Đã nạp thành công bộ não ONNX V5.0 cho ${symbol}!`);
+            } else {
+                console.warn(`⚠️ [AI ENGINE] Không tìm thấy model cho ${symbol} tại ${modelPath}`);
+            }
         }
     }
 
     /**
-     * historyCandles: Mảng chứa ít nhất 721 documents từ MarketData
-     * Sắp xếp thời gian tăng dần (Nến mới nhất nằm ở cuối mảng)
+     * LƯU Ý: Phải truyền thêm symbol vào từ main.js
      */
-    async predict(historyCandles) {
-        await this.init();
+    async predict(historyCandles, symbol) {
+        await this.init(symbol);
+
+        if (!this.sessions[symbol]) return 0;
 
         if (historyCandles.length < 721) {
-            console.warn('⚠️ [AI] Không đủ 721 nến lịch sử để tính Quant Features.');
-            return 0; // Trả về 0% win rate để từ chối giao dịch
+            console.warn(`⚠️ [AI] ${symbol} không đủ 721 nến lịch sử.`);
+            return 0; 
         }
 
         const current = historyCandles[historyCandles.length - 1];
 
-        // --- HÀM HỖ TRỢ TÍNH ĐỘ LỆCH CHUẨN (STANDARD DEVIATION) ---
+        // --- CÔNG THỨC TOÁN HỌC KHỚP VỚI PANDAS PYTHON (Chia N-1) ---
         const calcStd = (arr) => {
+            if (arr.length <= 1) return 0;
             const mean = arr.reduce((a, b) => a + b) / arr.length;
-            const variance = arr.map(x => Math.pow(x - mean, 2)).reduce((a, b) => a + b) / arr.length;
+            const variance = arr.map(x => Math.pow(x - mean, 2)).reduce((a, b) => a + b) / (arr.length - 1);
             return Math.sqrt(Math.max(0, variance));
         };
 
@@ -79,29 +88,48 @@ class AiEngine {
         const current_funding = current.funding_rate || 0;
         const funding_delta_12h = current_funding - old_funding;
 
-        // 5. Đóng gói Tensor 5 chiều (Khớp 100% với file Python)
-        // Thứ tự: hurst, vwap, wick, vol_acc, fund_delta
+        // 5. ATR Normalized (14 chu kỳ)
+        let sumTr = 0;
+        for (let i = historyCandles.length - 14; i < historyCandles.length; i++) {
+            let h = historyCandles[i].high;
+            let l = historyCandles[i].low;
+            let pc = historyCandles[i - 1].close;
+            let tr = Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
+            sumTr += tr;
+        }
+        const atr_norm = (sumTr / 14) / current.close;
+
+        // 6. RSI (14 chu kỳ)
+        let gains = 0, losses = 0;
+        for (let i = historyCandles.length - 14; i < historyCandles.length; i++) {
+            let diff = historyCandles[i].close - historyCandles[i - 1].close;
+            if (diff > 0) gains += diff;
+            else losses -= diff;
+        }
+        const rs = (gains / 14) / ((losses / 14) + 1e-8);
+        const rsi = 100 - (100 / (1 + rs));
+
+        // 7. Đóng gói Tensor 7 chiều (Khớp hoàn toàn với danh sách features bên Python)
         const inputData = Float32Array.from([
-            hurst_proxy, dist_vwap, wick_to_body, vol_acceleration, funding_delta_12h
+            hurst_proxy, dist_vwap, wick_to_body, vol_acceleration, funding_delta_12h, atr_norm, rsi
         ]);
 
-        const tensor = new ort.Tensor('float32', inputData, [1, 5]);
+        // Cập nhật tensor nhận mảng 7 chiều
+        const tensor = new ort.Tensor('float32', inputData, [1, 7]);
 
-        // 6. Chạy Suy Luận ONNX
         try {
             const feeds = { float_input: tensor };
-            const results = await this.session.run(feeds);
-
-            // Xử lý dữ liệu trả về từ XGBoost ONNX (Lấy xác suất Class 1)
-            // Cấu trúc trả về thường là mảng probabilities[0][1] hoặc flat array
+            const results = await this.sessions[symbol].run(feeds);
+            
             let winProb = 0;
-            if (results.probabilities.data) {
-                // Tùy phiên bản ONNX, xác suất nhãn 1 thường ở index 1
+            if (results.probabilities && results.probabilities.data) {
                 winProb = results.probabilities.data[1] !== undefined ? results.probabilities.data[1] : 0;
+            } else if (results.output_probability && results.output_probability.data) {
+                 winProb = results.output_probability.data[1]; 
             }
             return winProb;
         } catch (err) {
-            console.error('❌ [AI ENGINE] Lỗi khi chạy mô hình:', err.message);
+            console.error(`❌ [AI ENGINE] Lỗi khi chạy mô hình ${symbol}:`, err.message);
             return 0;
         }
     }

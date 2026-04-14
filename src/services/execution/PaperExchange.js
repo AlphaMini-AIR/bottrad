@@ -14,8 +14,12 @@ class PaperExchange {
 
             if (account.open_positions.some(p => p.symbol === symbol)) return false;
 
+            // --- FIXED: Giả lập Slippage (Trượt giá 0.05%) cho lệnh Market ---
+            const slippage = 0.0005;
+            const executedPrice = side === 'LONG' ? price * (1 + slippage) : price * (1 - slippage);
+
             const leverage = 10;
-            const notionalValue = price * size;
+            const notionalValue = executedPrice * size;
             const marginRequired = notionalValue / leverage;
             const fee = notionalValue * this.TAKER_FEE_RATE;
 
@@ -26,13 +30,13 @@ class PaperExchange {
             account.open_positions.push({
                 symbol,
                 side,
-                entry_price: price,
+                entry_price: executedPrice, // Ghi nhận giá đã trượt
                 margin: marginRequired,
                 leverage,
                 size,
                 mode,
-                hard_sl: hardSl,       // LƯU SL VÀO SỔ
-                take_profit: takeProfit // LƯU TP VÀO SỔ
+                hard_sl: hardSl,
+                take_profit: takeProfit
             });
 
             await account.save();
@@ -81,22 +85,51 @@ class PaperExchange {
         const account = await PaperAccount.findOne({ account_id: 'main_paper' });
         if (!account || account.open_positions.length === 0) return;
 
-        // Lặp ngược mảng để an toàn khi xóa phần tử
         for (let i = account.open_positions.length - 1; i >= 0; i--) {
             const p = account.open_positions[i];
             const currentPrice = livePrices[p.symbol];
             if (!currentPrice) continue;
 
-            // Kiểm tra SL và TP
+            // --- THÊM LOGIC TRAILING STOP (DỜI SL VỀ HÒA VỐN) ---
+            const entry = p.entry_price;
+            const tp = p.take_profit;
+            const sl = p.hard_sl;
+
+            // Tính toán giá trị lợi nhuận kỳ vọng
+            const expectedProfitDistance = Math.abs(tp - entry);
+            const currentDistance = Math.abs(currentPrice - entry);
+
             if (p.side === 'LONG') {
+                // Nếu giá đã đi được hơn 50% quãng đường tới TP, dời SL lên điểm Entry (Hòa vốn)
+                if (currentPrice > entry && currentDistance >= expectedProfitDistance * 0.5) {
+                    if (p.hard_sl < entry) {
+                        p.hard_sl = entry;
+                        console.log(`🛡️ [TRAILING STOP] ${p.symbol} - Dời SL lên điểm hòa vốn: ${entry}`);
+                        await account.save();
+                    }
+                }
+
+                // Xử lý chốt lệnh
                 if (currentPrice <= p.hard_sl) await this.closePosition(account, i, currentPrice, 'Chạm Cắt Lỗ (SL)');
                 else if (currentPrice >= p.take_profit) await this.closePosition(account, i, currentPrice, 'Chạm Chốt Lời (TP)');
+
             } else if (p.side === 'SHORT') {
+                // Nếu giá đi đúng hướng (giảm) hơn 50%, dời SL xuống điểm Entry
+                if (currentPrice < entry && currentDistance >= expectedProfitDistance * 0.5) {
+                    if (p.hard_sl > entry) {
+                        p.hard_sl = entry;
+                        console.log(`🛡️ [TRAILING STOP] ${p.symbol} - Dời SL xuống điểm hòa vốn: ${entry}`);
+                        await account.save();
+                    }
+                }
+
+                // Xử lý chốt lệnh
                 if (currentPrice >= p.hard_sl) await this.closePosition(account, i, currentPrice, 'Chạm Cắt Lỗ (SL)');
                 else if (currentPrice <= p.take_profit) await this.closePosition(account, i, currentPrice, 'Chạm Chốt Lời (TP)');
             }
         }
     }
+    
     async processFunding(fundingRateMap, currentPrices) {
         const account = await PaperAccount.findOne({ account_id: 'main_paper' });
         if (!account || account.open_positions.length === 0) return;

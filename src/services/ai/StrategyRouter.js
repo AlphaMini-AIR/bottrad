@@ -15,7 +15,7 @@ class StrategyRouter {
      */
     async evaluate(symbol, history, aiWinProb, meta) {
         const current = history[history.length - 1];
-        
+
         // 1. CHỐNG LOOK-AHEAD BIAS: Nếu dữ liệu bị lỗi/stale, từ chối ngay
         if (current.isStaleData) return { approved: false, reason: "STALE_DATA" };
 
@@ -84,7 +84,16 @@ class StrategyRouter {
 
     execRangeLogic(prob, history, meta) {
         const current = history[history.length - 1];
-        // Range: Cần cảm biến Râu nến (Wick) và Gia tốc Volume
+
+        // 1. Tính ADX để xác định thị trường có đang Sideway không
+        const adx = this.calculateADXProxy(history);
+
+        // Nếu ADX > 25, thị trường đang Trend mạnh -> KHÔNG đánh Range
+        if (adx > 25) {
+            return { approved: false, reason: `RANGE_REJECTED_TRENDING (ADX: ${adx.toFixed(1)})` };
+        }
+
+        // 2. Cảm biến Râu nến (Wick) và Gia tốc Volume
         const body = Math.abs(current.close - current.open) + 1e-8;
         const wick = current.high - current.low;
         const wickToBody = wick / body;
@@ -93,24 +102,80 @@ class StrategyRouter {
         for (let i = history.length - 15; i < history.length; i++) avgVol += history[i].volume;
         const volAccel = current.volume / (avgVol / 15 + 1e-8);
 
-        // Các thông số 2.5 và 3.0 này sau này có thể đưa vào meta nếu AI học được
         if (wickToBody > 2.5 && volAccel > 3.0) {
             return { approved: true };
         }
+
         return { approved: false, reason: "RANGE_NO_LIQUIDATION_SIGN" };
     }
 
     execScalpLogic(prob, history, meta) {
         const current = history[history.length - 1];
-        // Scalp: Cần biến động cực mạnh (Momentum)
-        let sumVol = 0;
-        for (let i = history.length - 5; i < history.length; i++) sumVol += history[i].volume;
-        const momentum = current.volume / (sumVol / 5 + 1e-8);
 
-        if (momentum > (meta.min_momentum || 4.0)) {
+        // Tính trung bình volume của 5 nến TRƯỚC ĐÓ (không bao gồm nến hiện tại)
+        let sumVol = 0;
+        for (let i = history.length - 6; i < history.length - 1; i++) {
+            sumVol += history[i].volume;
+        }
+        const avgVol = (sumVol / 5) + 1e-8;
+
+        // Gia tốc volume của nến hiện tại
+        const momentum = current.volume / avgVol;
+
+        // VÁ LỖI: 
+        // 1. Hạ ngưỡng vào lệnh xuống 1.5 (Volume tăng 50% là đủ để xác nhận có dòng tiền)
+        // 2. Chặn các nến có volume x3 (Climax/Kiệt sức) để tránh bị cắn Stoploss ngược
+        const min_mom = meta.min_momentum || 1.5;
+        const max_mom = 3.0;
+
+        if (momentum >= min_mom && momentum <= max_mom) {
             return { approved: true };
         }
-        return { approved: false, reason: "SCALP_NOT_ENOUGH_MOMENTUM" };
+
+        return {
+            approved: false,
+            reason: `SCALP_REJECTED (Momentum: ${momentum.toFixed(2)} - Nằm ngoài vùng an toàn 1.5 -> 3.0)`
+        };
+    }
+    calculateADXProxy(history, period = 14) {
+        if (history.length < period + 1) return 20; // Mặc định sideway nếu thiếu nến
+
+        let trSum = 0;
+        let plusDmSum = 0;
+        let minusDmSum = 0;
+
+        for (let i = history.length - period; i < history.length; i++) {
+            const current = history[i];
+            const prev = history[i - 1];
+
+            const tr = Math.max(
+                current.high - current.low,
+                Math.abs(current.high - prev.close),
+                Math.abs(current.low - prev.close)
+            );
+            trSum += tr;
+
+            const upMove = current.high - prev.high;
+            const downMove = prev.low - current.low;
+
+            let plusDm = 0;
+            let minusDm = 0;
+
+            if (upMove > downMove && upMove > 0) plusDm = upMove;
+            if (downMove > upMove && downMove > 0) minusDm = downMove;
+
+            plusDmSum += plusDm;
+            minusDmSum += minusDm;
+        }
+
+        if (trSum === 0) return 0;
+
+        const plusDI = (plusDmSum / trSum) * 100;
+        const minusDI = (minusDmSum / trSum) * 100;
+
+        // Tính DX (Directional Index) làm proxy cho ADX giúp giảm tải cho CPU
+        const dx = (Math.abs(plusDI - minusDI) / (plusDI + minusDI + 1e-8)) * 100;
+        return dx;
     }
 }
 

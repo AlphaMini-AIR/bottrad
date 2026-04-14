@@ -67,7 +67,7 @@ class RiskManager {
         // Cắt số thập phân cho Giá SL/TP
         let priceDecimals = precision.tickSize < 1 ? precision.tickSize.toString().split('.')[1].length : 0;
         let slPrice = decision.side === 'LONG' ? decision.price - slDistance : decision.price + slDistance;
-        let tpPrice = decision.side === 'LONG' ? decision.price + (slDistance * 3) : decision.price - (slDistance * 3); // R:R 1:3
+        let tpPrice = decision.side === 'LONG' ? decision.price + (slDistance * 2) : decision.price - (slDistance * 3); // R:R 1:3
 
         slPrice = parseFloat(slPrice.toFixed(priceDecimals));
         tpPrice = parseFloat(tpPrice.toFixed(priceDecimals));
