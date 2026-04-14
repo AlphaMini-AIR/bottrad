@@ -1,25 +1,28 @@
 {
     "active_coins": {
         "NEARUSDT": {
-            "sl_mult": 0.5,
-            "tp_mult": 1.0,
-            "min_prob": 0.65,
-            "strategy": "SCALP",
-            "aucpr": 0.3401
+            "sl_mult": 1.5,
+            "tp_mult": 3.75,
+            "time_limit": 240,
+            "fee_buffer": 0.0015,
+            "strategy": "RANGE",
+            "aucpr": 0.2494
         },
         "SOLUSDT": {
-            "sl_mult": 0.5,
-            "tp_mult": 1.0,
-            "min_prob": 0.65,
-            "strategy": "SCALP",
-            "aucpr": 0.356
+            "sl_mult": 3.0,
+            "tp_mult": 7.5,
+            "time_limit": 720,
+            "fee_buffer": 0.002,
+            "strategy": "SWING",
+            "aucpr": 0.2318
         },
         "TAOUSDT": {
-            "sl_mult": 0.5,
-            "tp_mult": 1.0,
-            "min_prob": 0.65,
+            "sl_mult": 1.0,
+            "tp_mult": 2.5,
+            "time_limit": 60,
+            "fee_buffer": 0.0012,
             "strategy": "SCALP",
-            "aucpr": 0.3514
+            "aucpr": 0.2514
         }
     }
 }

@@ -1,8 +1,8 @@
-# train_master.py - Version 5.0 (Perfected Quant Model)
 import pandas as pd
 import numpy as np
 import xgboost as xgb
 import onnxmltools
+import optuna
 import json
 import os
 import warnings
@@ -10,201 +10,181 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import average_precision_score
 from onnxmltools.convert.common.data_types import FloatTensorType
 
-# Tắt cảnh báo pandas để log console sạch sẽ
 warnings.filterwarnings('ignore')
 
-print("🧠 [AI PIPELINE] Khởi tạo hệ thống Discovery V5.0 (Perfected)...")
-
-# --- BỘ THAM SỐ CHIẾN THUẬT ĐỂ AI THỬ NGHIỆM ---
+# --- DANH MỤC CHIẾN THUẬT (Khớp với StrategyRouter.js) ---
 STRATEGY_PROFILES = {
-    # Swing: SL = 2 lần độ giật trung bình, TP = 4 lần (Né nhiễu tối đa, ăn trend dài)
-    "SWING": {"sl_mult": 2.0, "tp_mult": 4.0, "min_prob": 0.70},
-    # Range: Đánh trong biên độ vừa phải
-    "RANGE": {"sl_mult": 1.0, "tp_mult": 2.0, "min_prob": 0.60},
-    # Scalp: SL = 0.5 lần độ giật, đánh cực nhanh, chạy ngay
-    "SCALP": {"sl_mult": 0.5, "tp_mult": 1.0, "min_prob": 0.65}
+    "SCALP": {"sl_mult": 1.0, "tp_mult": 2.5, "time_limit": 60,  "fee_buffer": 0.0012},
+    "RANGE": {"sl_mult": 1.5, "tp_mult": 3.75, "time_limit": 240, "fee_buffer": 0.0015},
+    "SWING": {"sl_mult": 3.0, "tp_mult": 7.5, "time_limit": 720, "fee_buffer": 0.0020}
 }
-# ---------------------------------------------------------
-# 1. TÍNH TOÁN QUANT FEATURES (7 ĐẶC TRƯNG CHUYÊN SÂU)
-# ---------------------------------------------------------
+
+# THỨ TỰ 7 ĐẶC TRƯNG - PHẢI KHỚP TUYỆT ĐỐI VỚI AiEngine.js
+FEATURES = [
+    'hurst_proxy',        # 1
+    'dist_vwap',         # 2
+    'wick_to_body',      # 3
+    'vol_acceleration',  # 4
+    'funding_delta_12h', # 5
+    'atr_norm',          # 6
+    'rsi'                # 7
+]
+
 def calculate_quant_features(df):
-    df = df.sort_values(by=['symbol', 'timestamp']).copy()
-
-    def apply_features(group):
-        # 1. Hurst Proxy (Variance Ratio 20m)
-        ret_1m = group['close'].pct_change(1)
-        ret_20m = group['close'].pct_change(20)
-        group['hurst_proxy'] = ret_20m.rolling(20).std() / (np.sqrt(20) * ret_1m.rolling(20).std() + 1e-8)
-
-        # 2. Distance to VWAP 4h (240m)
-        rolling_pv = (group['close'] * group['volume']).rolling(window=240).sum()
-        rolling_vol = group['volume'].rolling(window=240).sum() + 1e-8
-        group['vwap_4h'] = rolling_pv / rolling_vol
-        group['dist_vwap'] = (group['close'] - group['vwap_4h']) / group['vwap_4h']
-
-        # 3. Wick to Body & Volume Acceleration
+    """Tính toán 7 đặc trưng khớp với logic Node.js"""
+    df = df.copy()
+    if 'symbol' not in df.columns: df = df.reset_index()
+    df = df.sort_values(by=['symbol', 'timestamp'])
+    
+    all_groups = []
+    for symbol, group in df.groupby('symbol'):
+        group = group.copy()
+        
+        # 1. Hurst Proxy (Dùng ddof=1 để khớp với N-1 trong JS)
+        ret1m = group['close'].pct_change(1)
+        ret20m = group['close'].pct_change(20)
+        std1m = ret1m.rolling(20).std(ddof=1)
+        std20m = ret20m.rolling(20).std(ddof=1)
+        group['hurst_proxy'] = std20m / (np.sqrt(20) * std1m + 1e-8)
+        
+        # 2. Distance to VWAP 4h
+        pv = group['close'] * group['volume']
+        vwap4h = pv.rolling(240).sum() / (group['volume'].rolling(240).sum() + 1e-8)
+        group['dist_vwap'] = (group['close'] - vwap4h) / (vwap4h + 1e-8)
+        
+        # 3. Candle Behavior
         body = abs(group['close'] - group['open']) + 1e-8
-        wick = group['high'] - group['low']
-        group['wick_to_body'] = wick / body
-        group['vol_acceleration'] = group['volume'] / (group['volume'].rolling(window=15).mean() + 1e-8)
-
-        # 4. Funding Delta 12h
+        group['wick_to_body'] = (group['high'] - group['low']) / body
+        group['vol_acceleration'] = group['volume'] / (group['volume'].rolling(15).mean() + 1e-8)
+        
+        # 4. Funding Delta 12h (720 nến)
         if 'funding_rate' in group.columns:
             group['funding_delta_12h'] = group['funding_rate'].diff(720).fillna(0)
         else:
             group['funding_delta_12h'] = 0.0
             
-        # 5. ATR Normalized (Đo lường độ biến động)
-        group['prev_close'] = group['close'].shift(1)
-        group['tr'] = np.maximum(group['high'] - group['low'], 
-                      np.maximum(abs(group['high'] - group['prev_close']), 
-                                 abs(group['low'] - group['prev_close'])))
-        group['atr'] = group['tr'].rolling(14).mean()
-        group['atr_norm'] = group['atr'] / group['close']
+        # 5. ATR Norm (Khớp logic JS: average_tr / price)
+        h_l = group['high'] - group['low']
+        h_pc = abs(group['high'] - group['close'].shift(1))
+        l_pc = abs(group['low'] - group['close'].shift(1))
+        tr = pd.concat([h_l, h_pc, l_pc], axis=1).max(axis=1)
+        group['atr_norm'] = (tr.rolling(14).mean()) / (group['close'] + 1e-8)
         
-        # 6. RSI 14 (Đo lường động lượng)
+        # 6. RSI 14
         delta = group['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / (loss + 1e-8)
-        group['rsi'] = 100 - (100 / (1 + rs))
-
-        return group
-
-    result_dfs = []
-    for sym, group in df.groupby('symbol'):
-        result_dfs.append(apply_features(group.copy()))
-    return pd.concat(result_dfs).dropna()
-
-# ---------------------------------------------------------
-# 2. GÁN NHÃN TRIPLE-BARRIER (VÁ LỖI VA CHẠM NẾN)
-# ---------------------------------------------------------
-# ---------------------------------------------------------
-# 2. GÁN NHÃN TRIPLE-BARRIER (SỬ DỤNG ATR DYNAMIC)
-# ---------------------------------------------------------
-def apply_triple_barrier(df, sl_mult, tp_mult, time_limit=240):
-    def process_labels(group):
-        closes = group['close'].values
-        highs = group['high'].values
-        lows = group['low'].values
-        atrs = group['atr'].values # Lấy mảng ATR đã tính sẵn
-        labels = np.zeros(len(closes))
-
-        for i in range(len(closes) - time_limit):
-            # Lấy ATR của nến hiện tại (nếu bị NaN do chưa đủ 14 nến thì lấy tạm 0.1% giá)
-            current_atr = atrs[i] if not np.isnan(atrs[i]) else (closes[i] * 0.001)
-
-            # Tính giá TP/SL động
-            tp_price = closes[i] + (current_atr * tp_mult)
-            sl_price = closes[i] - (current_atr * sl_mult)
-            
-            f_highs = highs[i+1 : i+time_limit+1]
-            f_lows = lows[i+1 : i+time_limit+1]
-
-            hit_tp_mask = f_highs >= tp_price
-            hit_sl_mask = f_lows <= sl_price
-
-            hit_tp_idx = np.argmax(hit_tp_mask) if np.any(hit_tp_mask) else -1
-            hit_sl_idx = np.argmax(hit_sl_mask) if np.any(hit_sl_mask) else -1
-
-            if hit_tp_idx != -1 and hit_sl_idx != -1:
-                if hit_tp_idx < hit_sl_idx:
-                    labels[i] = 1
-                else:
-                    labels[i] = 0 
-            elif hit_tp_idx != -1 and hit_sl_idx == -1:
-                labels[i] = 1
-            else:
-                labels[i] = 0  
-
-        group['target'] = labels
-        return group.iloc[:-time_limit]
-
-    result_dfs = []
-    for sym, group in df.groupby('symbol'):
-        result_dfs.append(process_labels(group.copy()))
-    return pd.concat(result_dfs)
-
-# ---------------------------------------------------------
-# 3. HUẤN LUYỆN CHÉO (WALK-FORWARD) & XUẤT ONNX
-# ---------------------------------------------------------
-def train_and_export(df):
-    features = ['hurst_proxy', 'dist_vwap', 'wick_to_body', 'vol_acceleration', 'funding_delta_12h', 'atr_norm', 'rsi']
-    white_list_metadata = {}
-    
-    # Chia dữ liệu thành 3 phase nối tiếp nhau để kiểm tra chéo
-    tscv = TimeSeriesSplit(n_splits=3) 
-
-    for symbol in df['symbol'].unique():
-        print(f"\n🚀 Đang tìm 'Sở trường' cho {symbol}...")
-        coin_raw = df[df['symbol'] == symbol].copy()
+        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        group['rsi'] = 100 - (100 / (1 + (gain / (loss + 1e-8))))
         
-        best_aucpr = 0
-        best_meta = None
+        all_groups.append(group)
+        
+    return pd.concat(all_groups).dropna()
+
+def apply_triple_barrier(df, config):
+    """Dán nhãn linh động theo từng khung thời gian chiến thuật"""
+    closes = df['close'].values
+    highs = df['high'].values
+    lows = df['low'].values
+    # Sử dụng ATR tuyệt đối để tính giá TP/SL
+    atr = (df['atr_norm'] * df['close']).values 
+    
+    labels = np.zeros(len(closes))
+    limit = config['time_limit']
+
+    for i in range(len(closes) - limit):
+        # Tính toán giá mục tiêu
+        tp_price = closes[i] + (atr[i] * config['tp_mult']) + (closes[i] * config['fee_buffer'])
+        sl_price = closes[i] - (atr[i] * config['sl_mult'])
+        
+        window_highs = highs[i+1 : i+limit+1]
+        window_lows = lows[i+1 : i+limit+1]
+        
+        tp_hit = np.where(window_highs >= tp_price)[0]
+        sl_hit = np.where(window_lows <= sl_price)[0]
+        
+        first_tp = tp_hit[0] if len(tp_hit) > 0 else 999
+        first_sl = sl_hit[0] if len(sl_hit) > 0 else 999
+        
+        if first_tp < first_sl and first_tp != 999:
+            labels[i] = 1 # Thắng
+            
+    df['target'] = labels
+    return df.iloc[:-limit]
+
+def train_and_export(df):
+    white_list_metadata = {}
+    symbols = df['symbol'].unique()
+
+    for symbol in symbols:
+        print(f"\n🧠 [ARCHITECT] Đang phân tích sở trường cho {symbol}...")
+        coin_data = df[df['symbol'] == symbol].copy()
+        
+        best_score = -1
+        best_profile = None
+        best_model = None
+        best_params = None
 
         for name, config in STRATEGY_PROFILES.items():
-            # Truyền sl_mult và tp_mult thay vì risk và reward
-            labeled_df = apply_triple_barrier(coin_raw.copy(), config['sl_mult'], config['tp_mult'])
-            if len(labeled_df) < 500: continue
+            labeled_df = apply_triple_barrier(coin_data.copy(), config)
+            if len(labeled_df) < 1000: continue # Đảm bảo đủ dữ liệu học
             
-            X, y = labeled_df[features].values, labeled_df['target'].values
+            X, y = labeled_df[FEATURES].values, labeled_df['target'].values
+            tscv = TimeSeriesSplit(n_splits=3)
             
-            # Huấn luyện và đánh giá trên 3 pha thị trường khác nhau
-            fold_aucpr = []
-            for train_idx, test_idx in tscv.split(X):
-                X_train, X_test = X[train_idx], X[test_idx]
-                y_train, y_test = y[train_idx], y[test_idx]
-                
-                # Bỏ qua fold nếu không đủ mẫu lệnh thắng để AI học
-                if np.sum(y_train == 1) < 5 or np.sum(y_test == 1) < 1: continue
+            def objective(trial):
+                params = {
+                    'n_estimators': trial.suggest_int('n_estimators', 80, 200),
+                    'max_depth': trial.suggest_int('max_depth', 3, 6),
+                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
+                    'subsample': 0.7,
+                    'colsample_bytree': 0.7,
+                    'scale_pos_weight': (len(y) - sum(y)) / (sum(y) + 1e-8), # Xử lý lệch nhãn
+                    'verbosity': 0
+                }
+                scores = []
+                for train_idx, val_idx in tscv.split(X):
+                    if sum(y[train_idx]) < 10: return 0
+                    model = xgb.XGBClassifier(**params)
+                    model.fit(X[train_idx], y[train_idx])
+                    preds = model.predict_proba(X[val_idx])[:, 1]
+                    scores.append(average_precision_score(y[val_idx], preds))
+                return np.mean(scores)
 
-                model = xgb.XGBClassifier(
-                    n_estimators=150, max_depth=5, learning_rate=0.03,
-                    scale_pos_weight=(len(y_train) - np.sum(y_train)) / (np.sum(y_train) + 1e-8),
-                    eval_metric='aucpr'
-                )
-                model.fit(X_train, y_train)
-                preds = model.predict_proba(X_test)[:, 1]
-                fold_aucpr.append(average_precision_score(y_test, preds))
-
-            avg_aucpr = np.mean(fold_aucpr) if fold_aucpr else 0
-            print(f"   - Thử nghiệm {name}: AUCPR (Trung bình 3 pha) = {avg_aucpr:.4f}")
-
-            if avg_aucpr > best_aucpr:
-                best_aucpr = avg_aucpr
-                best_meta = {**config, "strategy": name, "aucpr": round(avg_aucpr, 4)}
-
-        # KCS: Vượt qua ngưỡng AUCPR 0.15 trong cả 3 pha mới được phép trade
-        if best_aucpr > 0.15:
-            print(f"✅ CHỐT: {symbol} áp dụng chiến thuật {best_meta['strategy']} (AUCPR: {best_aucpr:.4f})")
-            white_list_metadata[symbol] = best_meta
+            study = optuna.create_study(direction='maximize')
+            study.optimize(objective, n_trials=15)
             
-            # BƯỚC QUYẾT ĐỊNH: Train lại não trên 100% dữ liệu lịch sử để lấy tri thức mới nhất
-            llabeled_df = apply_triple_barrier(coin_raw.copy(), best_meta['sl_mult'], best_meta['tp_mult'])
-            X_final, y_final = labeled_df[features].values, labeled_df['target'].values
-            
-            final_model = xgb.XGBClassifier(
-                n_estimators=150, max_depth=5, learning_rate=0.03,
-                scale_pos_weight=(len(y_final) - np.sum(y_final)) / (np.sum(y_final) + 1e-8)
-            )
-            final_model.fit(X_final, y_final)
+            if study.best_value > best_score:
+                best_score = study.best_value
+                best_profile = name
+                best_params = study.best_params
 
-            # Xuất model ONNX
-            initial_type = [('float_input', FloatTensorType([None, len(features)]))]
+        # Điều kiện duyệt: AUC-PR phải đạt ngưỡng "thông minh"
+        if best_score > 0.20:
+            print(f"🔥 {symbol} CHỐT: {best_profile} | Score: {best_score:.4f}")
+            
+            final_df = apply_triple_barrier(coin_data.copy(), STRATEGY_PROFILES[best_profile])
+            final_model = xgb.XGBClassifier(**best_params)
+            final_model.fit(final_df[FEATURES].values, final_df['target'].values)
+            
+            # Export ONNX (float_input, 7 dims)
+            initial_type = [('float_input', FloatTensorType([None, 7]))]
             onnx_model = onnxmltools.convert_xgboost(final_model, initial_types=initial_type)
             with open(f"model_{symbol}.onnx", "wb") as f:
                 f.write(onnx_model.SerializeToString())
+            
+            white_list_metadata[symbol] = {
+                **STRATEGY_PROFILES[best_profile],
+                "strategy": best_profile,
+                "aucpr": round(best_score, 4)
+            }
         else:
-            print(f"❌ {symbol}: Không vượt qua bài Test thị trường. Tạm giam.")
+            print(f"⚠️ {symbol} LOẠI BỎ (Không tìm thấy thế mạnh phù hợp).")
 
-    # Xuất định dạng Object Dictionary chuẩn cho NodeJS
     with open("white_list.json", "w") as f:
         json.dump({"active_coins": white_list_metadata}, f, indent=4)
-    print("\n📜 Đã cập nhật white_list.json với các bộ cấu hình động.")
 
 if __name__ == "__main__":
-    test_csv = 'dataset_multi_3months.csv'
-    if os.path.exists(test_csv):
-        df = pd.read_csv(test_csv)
-        df = calculate_quant_features(df)
-        train_and_export(df)
+    if os.path.exists('dataset_multi_3months.csv'):
+        df = pd.read_csv('dataset_multi_3months.csv')
+        df_feat = calculate_quant_features(df)
+        train_and_export(df_feat)

@@ -1,181 +1,188 @@
 /**
- * src/services/ai/StrategyRouter.js - Version 4.2 (Dynamic Logic)
+ * src/services/ai/StrategyRouter.js - Version 6.5 (Advanced Intelligent Routing)
+ * Tích hợp lọc xu hướng (ADX), Momentum và AI Reversal
  */
+
 class StrategyRouter {
     constructor() {
         this.lastTradeTime = {};
-        this.highVolatilityMode = {};
+        // Ngưỡng AI Win Probability
+        this.LONG_THRESHOLD = 0.70;
+        this.SHORT_THRESHOLD = 0.30;
+        this.SUPER_SIGNAL_LONG = 0.85;
+        this.SUPER_SIGNAL_SHORT = 0.15;
     }
 
     /**
-     * @param {string} symbol - Tên coin
-     * @param {Array} history - Dữ liệu nến lịch sử
-     * @param {number} aiWinProb - Xác suất từ AI (0-1)
-     * @param {Object} meta - Thông tin chiến thuật học được từ white_list.json
+     * Đánh giá lệnh mới dựa trên AI và bộ lọc kỹ thuật
      */
     async evaluate(symbol, history, aiWinProb, meta) {
         const current = history[history.length - 1];
-
-        // 1. CHỐNG LOOK-AHEAD BIAS: Nếu dữ liệu bị lỗi/stale, từ chối ngay
         if (current.isStaleData) return { approved: false, reason: "STALE_DATA" };
 
-        // 2. XÁC ĐỊNH CHIỀU VÀO LỆNH & NGƯỠNG TỰ TIN (Học từ AI)
-        // Thay vì fix cứng 0.5, ta dùng ngưỡng meta.min_prob (ví dụ 0.7) mà AI đã tính toán là hiệu quả nhất
         let intendedSide = null;
-        const threshold = meta.min_prob || 0.6; // Mặc định 0.6 nếu chưa học được
+        let isSuperSignal = false;
 
-        if (aiWinProb >= threshold) intendedSide = "LONG";
-        else if (aiWinProb <= (1 - threshold)) intendedSide = "SHORT";
-        else return { approved: false, reason: "LOW_CONFIDENCE" };
-
-        // 3. KIỂM TRA COOL-DOWN (Hồi chiêu)
-        const now = current.timestamp;
-        const cooldown = this.highVolatilityMode[symbol] ? 60 * 60 * 1000 : 15 * 60 * 1000;
-        if (now - (this.lastTradeTime[symbol] || 0) < cooldown) {
-            return { approved: false, reason: "COOLDOWN" };
+        // 1. PHÂN LOẠI TÍN HIỆU AI
+        if (aiWinProb >= this.LONG_THRESHOLD) {
+            intendedSide = "LONG";
+            if (aiWinProb >= this.SUPER_SIGNAL_LONG) isSuperSignal = true;
+        } else if (aiWinProb <= this.SHORT_THRESHOLD) {
+            intendedSide = "SHORT";
+            if (aiWinProb <= this.SUPER_SIGNAL_SHORT) isSuperSignal = true;
+        } else {
+            return { approved: false, reason: `NEUTRAL_ZONE (${(aiWinProb * 100).toFixed(1)}%)` };
         }
 
-        // 4. THỰC THI CHIẾN THUẬT DỰA TRÊN "SỞ TRƯỜNG" (Không check tên coin)
+        // 2. KIỂM TRA COOLDOWN (Nghỉ ngơi giữa các lệnh)
+        const now = Date.now();
+        const baseCooldown = 30 * 60 * 1000; // 30 phút
+        const timeSinceLast = now - (this.lastTradeTime[symbol] || 0);
+
+        if (!isSuperSignal && timeSinceLast < baseCooldown) {
+            return { approved: false, reason: "SMART_COOLDOWN_ACTIVE" };
+        }
+
+        // 3. ĐIỀU PHỐI CHIẾN THUẬT (ROUTING)
         let strategyResult = { approved: false };
+        const adx = this.calculateADXProxy(history);
 
         switch (meta.strategy) {
-            case 'SWING':
-                strategyResult = this.execSwingLogic(aiWinProb, current, meta);
+            case 'SWING': 
+                strategyResult = this.execSwingLogic(aiWinProb, adx, isSuperSignal); 
                 break;
-            case 'RANGE':
-                strategyResult = this.execRangeLogic(aiWinProb, history, meta);
+            case 'RANGE': 
+                strategyResult = this.execRangeLogic(aiWinProb, adx, history); 
                 break;
-            case 'SCALP':
-                strategyResult = this.execScalpLogic(aiWinProb, history, meta);
+            case 'SCALP': 
+                strategyResult = this.execScalpLogic(aiWinProb, history, isSuperSignal); 
                 break;
-            default:
+            default: 
                 return { approved: false, reason: "UNKNOWN_STRATEGY" };
         }
 
         if (strategyResult.approved) {
             this.lastTradeTime[symbol] = now;
-            console.log(`\n🔥 [ROUTER] DUYỆT LỆNH: ${symbol} | Phương pháp: ${meta.strategy} | Side: ${intendedSide}`);
+            console.log(`🎯 [ENTRY] ${symbol} | ${intendedSide} | AI: ${(aiWinProb * 100).toFixed(1)}% | Mode: ${meta.strategy} | ADX: ${adx.toFixed(1)}`);
             return {
                 ...strategyResult,
                 symbol,
                 side: intendedSide,
                 mode: meta.strategy,
                 price: current.close,
-                atr_multiplier: meta.atr_multiplier // Truyền xuống RiskManager
+                isSuperSignal
             };
         }
-
+        
         return strategyResult;
     }
 
-    // --- LOGIC CHI TIẾT CHO TỪNG PHƯƠNG PHÁP ---
-
-    execSwingLogic(prob, current, meta) {
-        // Swing: Quan trọng nhất là phí Funding. 
-        // Nếu phí phạt quá nặng chiều định đánh, ép xác suất phải cực cao (> 80%)
-        const isCloseToFunding = (current.next_funding_time - current.timestamp) < 2 * 60 * 60 * 1000;
-        const isPaying = (current.funding_rate > 0 && prob > 0.5) || (current.funding_rate < 0 && prob < 0.5);
-
-        if (isCloseToFunding && isPaying && Math.abs(prob - 0.5) < 0.3) {
-            return { approved: false, reason: "SWING_FUNDING_PROTECTION" };
-        }
-        return { approved: true };
-    }
-
-    execRangeLogic(prob, history, meta) {
-        const current = history[history.length - 1];
-
-        // 1. Tính ADX để xác định thị trường có đang Sideway không
-        const adx = this.calculateADXProxy(history);
-
-        // Nếu ADX > 25, thị trường đang Trend mạnh -> KHÔNG đánh Range
-        if (adx > 25) {
-            return { approved: false, reason: `RANGE_REJECTED_TRENDING (ADX: ${adx.toFixed(1)})` };
-        }
-
-        // 2. Cảm biến Râu nến (Wick) và Gia tốc Volume
-        const body = Math.abs(current.close - current.open) + 1e-8;
-        const wick = current.high - current.low;
-        const wickToBody = wick / body;
-
-        let avgVol = 0;
-        for (let i = history.length - 15; i < history.length; i++) avgVol += history[i].volume;
-        const volAccel = current.volume / (avgVol / 15 + 1e-8);
-
-        if (wickToBody > 2.5 && volAccel > 3.0) {
+    /**
+     * LOGIC SWING: Ưu tiên bám đuổi xu hướng mạnh
+     */
+    execSwingLogic(prob, adx, isSuper) {
+        // Swing cần xu hướng (ADX > 25) hoặc AI cực mạnh
+        if (adx > 25 || isSuper) {
             return { approved: true };
         }
-
-        return { approved: false, reason: "RANGE_NO_LIQUIDATION_SIGN" };
+        return { approved: false, reason: "SWING_WAITING_FOR_TREND" };
     }
 
-    execScalpLogic(prob, history, meta) {
-        const current = history[history.length - 1];
+    /**
+     * LOGIC RANGE: Ưu tiên thị trường đi ngang, biến động thấp
+     */
+    execRangeLogic(prob, adx, history) {
+        // Range cần thị trường không có trend (ADX < 20)
+        if (adx < 22) {
+            return { approved: true };
+        }
+        return { approved: false, reason: "RANGE_REJECT_TRENDING" };
+    }
 
-        // Tính trung bình volume của 5 nến TRƯỚC ĐÓ (không bao gồm nến hiện tại)
+    /**
+     * LOGIC SCALP: Ưu tiên bùng nổ khối lượng (Momentum)
+     */
+    execScalpLogic(prob, history, isSuper) {
+        const current = history[history.length - 1];
         let sumVol = 0;
-        for (let i = history.length - 6; i < history.length - 1; i++) {
+        const period = 10;
+        for (let i = history.length - (period + 1); i < history.length - 1; i++) {
             sumVol += history[i].volume;
         }
-        const avgVol = (sumVol / 5) + 1e-8;
+        const avgVol = sumVol / period;
+        const momentum = current.volume / (avgVol + 1e-8);
 
-        // Gia tốc volume của nến hiện tại
-        const momentum = current.volume / avgVol;
-
-        // VÁ LỖI: 
-        // 1. Hạ ngưỡng vào lệnh xuống 1.5 (Volume tăng 50% là đủ để xác nhận có dòng tiền)
-        // 2. Chặn các nến có volume x3 (Climax/Kiệt sức) để tránh bị cắn Stoploss ngược
-        const min_mom = meta.min_momentum || 1.5;
-        const max_mom = 3.0;
+        // Scalp cần sự đột biến volume nhưng không được quá Climax (dễ đảo chiều)
+        const min_mom = 1.3;
+        const max_mom = isSuper ? 4.5 : 3.0;
 
         if (momentum >= min_mom && momentum <= max_mom) {
             return { approved: true };
         }
-
-        return {
-            approved: false,
-            reason: `SCALP_REJECTED (Momentum: ${momentum.toFixed(2)} - Nằm ngoài vùng an toàn 1.5 -> 3.0)`
-        };
+        return { approved: false, reason: `SCALP_MOM_FAIL (${momentum.toFixed(1)}x)` };
     }
-    calculateADXProxy(history, period = 14) {
-        if (history.length < period + 1) return 20; // Mặc định sideway nếu thiếu nến
 
-        let trSum = 0;
-        let plusDmSum = 0;
-        let minusDmSum = 0;
+    /**
+     * CẮT LỆNH CHỦ ĐỘNG (ACTIVE EXIT)
+     * Ngăn chặn việc gồng lỗ khi AI đổi ý hoặc thị trường đảo chiều gấp
+     */
+    evaluateEarlyExit(position, history, aiWinProb) {
+        const current = history[history.length - 1];
 
-        for (let i = history.length - period; i < history.length; i++) {
-            const current = history[i];
-            const prev = history[i - 1];
-
-            const tr = Math.max(
-                current.high - current.low,
-                Math.abs(current.high - prev.close),
-                Math.abs(current.low - prev.close)
-            );
-            trSum += tr;
-
-            const upMove = current.high - prev.high;
-            const downMove = prev.low - current.low;
-
-            let plusDm = 0;
-            let minusDm = 0;
-
-            if (upMove > downMove && upMove > 0) plusDm = upMove;
-            if (downMove > upMove && downMove > 0) minusDm = downMove;
-
-            plusDmSum += plusDm;
-            minusDmSum += minusDm;
+        // 1. EXIT THEO AI REVERSAL (AI quay xe)
+        if (position.side === 'LONG' && aiWinProb < 0.40) {
+            return { shouldExit: true, reason: "AI_REVERSAL_BEARISH" };
+        }
+        if (position.side === 'SHORT' && aiWinProb > 0.60) {
+            return { shouldExit: true, reason: "AI_REVERSAL_BULLISH" };
         }
 
-        if (trSum === 0) return 0;
+        // 2. EXIT THEO VOLUME CLIMAX (Xả hàng hoặc FOMO quá mức)
+        let sumVol = 0;
+        for (let i = history.length - 6; i < history.length - 1; i++) sumVol += history[i].volume;
+        const momentum = current.volume / ((sumVol / 5) + 1e-8);
 
-        const plusDI = (plusDmSum / trSum) * 100;
-        const minusDI = (minusDmSum / trSum) * 100;
+        // Nếu volume vọt lên gấp 5 lần trung bình nến trước -> Dễ là đỉnh/đáy tạm thời
+        if (momentum > 5.0) {
+            return { shouldExit: true, reason: "VOLUME_CLIMAX_DETECTED" };
+        }
 
-        // Tính DX (Directional Index) làm proxy cho ADX giúp giảm tải cho CPU
-        const dx = (Math.abs(plusDI - minusDI) / (plusDI + minusDI + 1e-8)) * 100;
-        return dx;
+        return { shouldExit: false };
+    }
+
+    /**
+     * Tính toán ADX Proxy để xác định sức mạnh xu hướng
+     */
+    calculateADXProxy(history, period = 14) {
+        if (history.length < period * 2) return 20;
+
+        let plusDM = 0;
+        let minusDM = 0;
+        let trSum = 0;
+
+        for (let i = history.length - period; i < history.length; i++) {
+            const curr = history[i];
+            const prev = history[i - 1];
+
+            const moveUp = curr.high - prev.high;
+            const moveDown = prev.low - curr.low;
+
+            if (moveUp > 0 && moveUp > moveDown) plusDM += moveUp;
+            if (moveDown > 0 && moveDown > moveUp) minusDM += moveDown;
+
+            const tr = Math.max(
+                curr.high - curr.low,
+                Math.abs(curr.high - prev.close),
+                Math.abs(curr.low - prev.close)
+            );
+            trSum += tr;
+        }
+
+        const plusDI = 100 * (plusDM / (trSum + 1e-8));
+        const minusDI = 100 * (minusDM / (trSum + 1e-8));
+        
+        // Trả về giá trị đơn giản đại diện cho sức mạnh xu hướng
+        return Math.abs(plusDI - minusDI) / (plusDI + minusDI + 1e-8) * 100;
     }
 }
 
