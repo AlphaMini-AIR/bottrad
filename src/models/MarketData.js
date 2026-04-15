@@ -29,6 +29,13 @@ const marketDataSchema = new mongoose.Schema({
     funding_rate: { type: Number, default: null },
     next_funding_time: { type: Number, default: null },
 
+    // --- BỔ SUNG VI CẤU TRÚC (V5.3) ---
+    vpin: { type: Number, default: 0 },
+    ob_imb: { type: Number, default: 1.0 },
+    liq_long: { type: Number, default: 0 },
+    liq_short: { type: Number, default: 0 },
+    mark_close: { type: Number, default: 0 },
+
     // --- CỜ BẢO VỆ (DevOps / Ops) ---
     // Đánh dấu true nếu phút này bị rớt mạng và phải dùng Forward-fill đắp nến
     isStaleData: { type: Boolean, default: false }

@@ -9,7 +9,7 @@ class AiEngine {
     constructor() {
         this.sessions = {};
         this.watchers = {};
-        this.isReloading = {}; 
+        this.isReloading = {};
     }
 
     async init(symbol) {
@@ -40,15 +40,15 @@ class AiEngine {
         try {
             this.watchers[symbol] = fs.watch(dir, async (eventType, triggerName) => {
                 if (eventType === 'rename' && triggerName === filename) {
-                    if (this.isReloading[symbol]) return; 
+                    if (this.isReloading[symbol]) return;
                     this.isReloading[symbol] = true;
                     setTimeout(async () => {
                         await this.loadModelSafe(symbol, modelPath);
-                        setTimeout(() => { this.isReloading[symbol] = false; }, 2000); 
+                        setTimeout(() => { this.isReloading[symbol] = false; }, 2000);
                     }, 100);
                 }
             });
-        } catch (error) {}
+        } catch (error) { }
     }
 
     // Lấy Sentiment với thuật toán Time Decay
@@ -72,11 +72,11 @@ class AiEngine {
 
     async predict(historyCandles, symbol) {
         await this.init(symbol);
-        
+
         // Trả về 11 số 0 nếu chưa đủ nến
-        const defaultFeatures = [0,0,0,0,0,0,0,0,0,0,0]; 
+        const defaultFeatures = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         if (!this.sessions[symbol] || historyCandles.length < 721) {
-            return { winProb: 0.5, features: defaultFeatures }; 
+            return { winProb: 0.5, features: defaultFeatures };
         }
 
         const current = historyCandles[historyCandles.length - 1];
@@ -129,7 +129,7 @@ class AiEngine {
         // --- NHÓM VI CẤU TRÚC (MICROSTRUCTURE) ---
         // 7. VPIN
         const vpin = current.vpin || 0;
-        
+
         // 8. Orderbook Imbalance (Chuẩn hóa về [-1, 1])
         const ob_raw = current.ob_imb || 1.0;
         const ob_imb_norm = (ob_raw - 1) / (ob_raw + 1);
@@ -149,9 +149,9 @@ class AiEngine {
             hurst, vwap, wick_body, vol_accel, sentiment, atr_norm, rsi, // 7 Cũ
             vpin, ob_imb_norm, liq_press, prem_idx                       // 4 Mới
         ]);
-        
+
         // ⚔️ FEATURE MASKING: Dùng .subarray(0, 7) tránh GC, đánh lừa não cũ
-        const tensor = new ort.Tensor('float32', features11.subarray(0, 7), [1, 7]); 
+        const tensor = new ort.Tensor('float32', features11.subarray(0, 7), [1, 7]);
 
         let winProb = 0.5;
         try {
@@ -159,9 +159,11 @@ class AiEngine {
             if (results.probabilities && results.probabilities.data) {
                 winProb = results.probabilities.data[1] !== undefined ? results.probabilities.data[1] : 0;
             } else if (results.output_probability && results.output_probability.data) {
-                 winProb = results.output_probability.data[1]; 
+                winProb = results.output_probability.data[1];
             }
-        } catch (err) {}
+        } catch (err) {
+            console.error(`❌ [AI ERROR] ${symbol} ONNX inference failed:`, err.message);
+        }
 
         // Trả về full 11 biến để DeepThinker dùng và File JSON lưu lại
         return { winProb: winProb, features: features11 };
