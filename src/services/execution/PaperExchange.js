@@ -1,156 +1,138 @@
+src/services/execution/PaperExchange.js
+
 /**
- * src/services/execution/PaperExchange.js
+ * src/services/execution/PaperExchange.js - Version 4.5 (Hoàn tất Vòng lặp Học tập)
  */
 const PaperAccount = require('../../models/PaperAccount');
+const AutoRetrainScheduler = require('../ops/AutoRetrainScheduler'); // [THÊM MỚI]: Nạp trạm thu thập kinh nghiệm
 
 class PaperExchange {
-    TAKER_FEE_RATE = 0.0005;
+    constructor() {
+        this.accountId = 'main_paper';
+    }
 
-    // Cập nhật hàm mở lệnh (thêm hardSl và takeProfit)
-    async openPosition(symbol, side, price, size, mode, hardSl, takeProfit) {
-        try {
-            const account = await PaperAccount.findOne({ account_id: 'main_paper' });
-            if (!account) return false;
-
-            if (account.open_positions.some(p => p.symbol === symbol)) return false;
-
-            // --- FIXED: Giả lập Slippage (Trượt giá 0.05%) cho lệnh Market ---
-            const slippage = 0.0005;
-            const executedPrice = side === 'LONG' ? price * (1 + slippage) : price * (1 - slippage);
-
-            const leverage = 10;
-            const notionalValue = executedPrice * size;
-            const marginRequired = notionalValue / leverage;
-            const fee = notionalValue * this.TAKER_FEE_RATE;
-
-            if (account.balance < marginRequired + fee) return false;
-
-            account.balance -= fee;
-
-            account.open_positions.push({
-                symbol,
-                side,
-                entry_price: executedPrice, // Ghi nhận giá đã trượt
-                margin: marginRequired,
-                leverage,
-                size,
-                mode,
-                hard_sl: hardSl,
-                take_profit: takeProfit
+    /**
+     * Hàm lấy dữ liệu tài khoản
+     */
+    async getAccount() {
+        let acc = await PaperAccount.findOne({ account_id: this.accountId });
+        if (!acc) {
+            acc = await PaperAccount.create({
+                account_id: this.accountId,
+                balance: 1000, // Vốn giả lập ban đầu
+                open_positions: [],
+                history: []
             });
-
-            await account.save();
-
-            console.log(`\n💸 [MỞ LỆNH] ${side} ${symbol.toUpperCase()}`);
-            console.log(`   - Chế độ: ${mode}`);
-            console.log(`   - Giá vào: ${price.toFixed(2)}`);
-            console.log(`   - Cắt lỗ (SL): ${hardSl.toFixed(2)} | Chốt lời (TP): ${takeProfit.toFixed(2)}`);
-            console.log(`   - Số dư ví: ${account.balance.toFixed(2)} USDT\n`);
-            return true;
-        } catch (error) {
-            console.error('❌ [PAPER] Lỗi mở lệnh:', error.message);
-            return false;
         }
+        return acc;
     }
 
-    // HÀM MỚI: Xử lý đóng lệnh và tính toán Lợi nhuận (PnL)
-    async closePosition(account, positionIndex, closePrice, reason) {
-        const p = account.open_positions[positionIndex];
-        const notional = closePrice * p.size;
-        const closeFee = notional * this.TAKER_FEE_RATE;
+    /**
+     * [MẮT XÍCH CUỐI CÙNG 1/2]: Nhận bối cảnh (entryFeatures) và lưu vào lệnh
+     */
+    async openPosition(symbol, side, currentPrice, size, mode, hardSl, takeProfit, entryFeatures = []) {
+        const acc = await this.getAccount();
+        
+        // Trừ phí giả lập (0.05% Taker fee để test cho khắc nghiệt)
+        const fee = (size * currentPrice) * 0.0005;
+        acc.balance -= fee;
 
-        // Tính PnL
-        let pnl = 0;
-        if (p.side === 'LONG') pnl = (closePrice - p.entry_price) * p.size;
-        if (p.side === 'SHORT') pnl = (p.entry_price - closePrice) * p.size;
+        const newPosition = {
+            symbol,
+            side,
+            size,
+            entryPrice: currentPrice,
+            sl: hardSl,
+            tp: takeProfit,
+            mode,
+            openedAt: new Date(),
+            features: entryFeatures // 💾 LƯU TRỮ BỨC TRANH THỊ TRƯỜNG VÀO DATABASE
+        };
 
-        const netPnl = pnl - closeFee;
-        account.balance += netPnl;
-
-        // Xóa lệnh khỏi sổ
-        const closedSymbol = p.symbol;
-        account.open_positions.splice(positionIndex, 1);
-        await account.save();
-
-        console.log(`\n🔔 [ĐÓNG LỆNH] ${p.side} ${closedSymbol.toUpperCase()} | Lý do: ${reason}`);
-        console.log(`   - Giá đóng: ${closePrice.toFixed(2)}`);
-        console.log(`   - Lợi nhuận (PnL): ${pnl > 0 ? '+' : ''}${pnl.toFixed(4)} USDT`);
-        console.log(`   - Phí đóng: -${closeFee.toFixed(4)} USDT`);
-        console.log(`   - Ròng: ${netPnl > 0 ? '+' : ''}${netPnl.toFixed(4)} USDT`);
-        console.log(`   - Số dư mới: ${account.balance.toFixed(2)} USDT\n`);
+        acc.open_positions.push(newPosition);
+        await acc.save();
+        
+        console.log(`✅ [PAPER] Đã mở ${side} ${symbol} | Giá: ${currentPrice} | Phí: ${fee.toFixed(3)}$`);
     }
 
-    // HÀM MỚI: Radar theo dõi giá liên tục
-    async monitorPrices(livePrices) {
-        const account = await PaperAccount.findOne({ account_id: 'main_paper' });
-        if (!account || account.open_positions.length === 0) return;
+    /**
+     * [MẮT XÍCH CUỐI CÙNG 2/2]: Radar dò giá và Chốt lệnh -> Xuất bài học
+     */
+    async monitorPrices(currentPrices) {
+        const acc = await this.getAccount();
+        if (!acc || acc.open_positions.length === 0) return;
 
-        for (let i = account.open_positions.length - 1; i >= 0; i--) {
-            const p = account.open_positions[i];
-            const currentPrice = livePrices[p.symbol];
+        let isModified = false;
+
+        // Quét từng lệnh đang mở
+        for (let i = acc.open_positions.length - 1; i >= 0; i--) {
+            const pos = acc.open_positions[i];
+            const currentPrice = currentPrices[pos.symbol];
+            
             if (!currentPrice) continue;
 
-            // --- THÊM LOGIC TRAILING STOP (DỜI SL VỀ HÒA VỐN) ---
-            const entry = p.entry_price;
-            const tp = p.take_profit;
-            const sl = p.hard_sl;
+            let isClosed = false;
+            let exitReason = '';
+            
+            // Kiểm tra SL / TP
+            if (pos.side === 'LONG') {
+                if (currentPrice >= pos.tp) { isClosed = true; exitReason = 'TAKE_PROFIT'; }
+                else if (currentPrice <= pos.sl) { isClosed = true; exitReason = 'STOP_LOSS'; }
+            } else if (pos.side === 'SHORT') {
+                if (currentPrice <= pos.tp) { isClosed = true; exitReason = 'TAKE_PROFIT'; }
+                else if (currentPrice >= pos.sl) { isClosed = true; exitReason = 'STOP_LOSS'; }
+            }
 
-            // Tính toán giá trị lợi nhuận kỳ vọng
-            const expectedProfitDistance = Math.abs(tp - entry);
-            const currentDistance = Math.abs(currentPrice - entry);
+            // Nếu chạm cản, tiến hành đóng lệnh
+            if (isClosed) {
+                // Trừ phí đóng lệnh (0.05%)
+                const closeFee = (pos.size * currentPrice) * 0.0005;
+                
+                // Tính PnL (Lợi nhuận gộp)
+                let grossPnl = 0;
+                if (pos.side === 'LONG') grossPnl = (currentPrice - pos.entryPrice) * pos.size;
+                if (pos.side === 'SHORT') grossPnl = (pos.entryPrice - currentPrice) * pos.size;
+                
+                // Lợi nhuận ròng
+                const netPnl = grossPnl - closeFee;
+                
+                // Cập nhật số dư
+                acc.balance += (pos.size * pos.entryPrice) + netPnl; 
 
-            if (p.side === 'LONG') {
-                // Nếu giá đã đi được hơn 50% quãng đường tới TP, dời SL lên điểm Entry (Hòa vốn)
-                if (currentPrice > entry && currentDistance >= expectedProfitDistance * 0.5) {
-                    if (p.hard_sl < entry) {
-                        p.hard_sl = entry;
-                        console.log(`🛡️ [TRAILING STOP] ${p.symbol} - Dời SL lên điểm hòa vốn: ${entry}`);
-                        await account.save();
-                    }
-                }
+                console.log(`\n🔔 [PAPER CHỐT LỆNH] ${pos.side} ${pos.symbol} chạm ${exitReason}!`);
+                console.log(`💵 PnL: ${netPnl.toFixed(3)}$ | Số dư mới: ${acc.balance.toFixed(2)}$`);
 
-                // Xử lý chốt lệnh
-                if (currentPrice <= p.hard_sl) await this.closePosition(account, i, currentPrice, 'Chạm Cắt Lỗ (SL)');
-                else if (currentPrice >= p.take_profit) await this.closePosition(account, i, currentPrice, 'Chạm Chốt Lời (TP)');
+                // =========================================================
+                // 🚀 TRUYỀN DỮ LIỆU SANG TRẠM HỌC TẬP (AUTO RETRAIN)
+                // =========================================================
+                AutoRetrainScheduler.logCompletedTrade(
+                    pos.symbol, 
+                    pos.side, 
+                    pos.entryPrice, 
+                    currentPrice, 
+                    netPnl, 
+                    pos.features // Nộp lại mảng 7 biến số đã lưu lúc mở lệnh
+                );
 
-            } else if (p.side === 'SHORT') {
-                // Nếu giá đi đúng hướng (giảm) hơn 50%, dời SL xuống điểm Entry
-                if (currentPrice < entry && currentDistance >= expectedProfitDistance * 0.5) {
-                    if (p.hard_sl > entry) {
-                        p.hard_sl = entry;
-                        console.log(`🛡️ [TRAILING STOP] ${p.symbol} - Dời SL xuống điểm hòa vốn: ${entry}`);
-                        await account.save();
-                    }
-                }
+                // =========================================================
+                // 🧠 BÁO CÁO CHO DEEP THINKER ĐỂ RÚT KINH NGHIỆM NGAY LẬP TỨC
+                // =========================================================
+                const DeepThinker = require('../ai/DeepThinker'); // Gọi trực tiếp để tránh circular require
+                const isWin = netPnl > 0;
+                const riskRewardActual = isWin ? (grossPnl / Math.abs(pos.entryPrice - pos.sl)) : 0; 
+                DeepThinker.learnFromTrade(isWin, riskRewardActual);
 
-                // Xử lý chốt lệnh
-                if (currentPrice >= p.hard_sl) await this.closePosition(account, i, currentPrice, 'Chạm Cắt Lỗ (SL)');
-                else if (currentPrice <= p.take_profit) await this.closePosition(account, i, currentPrice, 'Chạm Chốt Lời (TP)');
+                // Xóa lệnh khỏi mảng
+                acc.open_positions.splice(i, 1);
+                isModified = true;
             }
         }
-    }
-    
-    async processFunding(fundingRateMap, currentPrices) {
-        const account = await PaperAccount.findOne({ account_id: 'main_paper' });
-        if (!account || account.open_positions.length === 0) return;
 
-        for (let i = 0; i < account.open_positions.length; i++) {
-            const p = account.open_positions[i];
-            const fRate = fundingRateMap[p.symbol] || 0;
-            const positionValue = p.size * currentPrices[p.symbol];
-
-            // Tính toán ai trả tiền cho ai
-            let fundingFee = 0;
-            if (p.side === 'LONG') fundingFee = positionValue * fRate;
-            if (p.side === 'SHORT') fundingFee = positionValue * -fRate;
-
-            account.balance -= fundingFee;
-            console.log(`⏰ [FUNDING] ${p.symbol.toUpperCase()} | Thay đổi số dư: ${-fundingFee > 0 ? '+' : ''}${-fundingFee.toFixed(4)} USDT | Ví: ${account.balance.toFixed(2)} USDT`);
+        if (isModified) {
+            await acc.save();
         }
-
-        account.last_funding_charged = new Date();
-        await account.save();
     }
 }
 
 module.exports = new PaperExchange();
+
