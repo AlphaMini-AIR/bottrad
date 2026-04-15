@@ -5,16 +5,16 @@
             "tp_mult": 3.75,
             "time_limit": 240,
             "fee_buffer": 0.0015,
-            "strategy": "RANGE",
-            "aucpr": 0.5036
+            "strategy": "SWING",
+            "aucpr": 0.252
         },
         "SOLUSDT": {
-            "sl_mult": 1.5,
-            "tp_mult": 3.75,
-            "time_limit": 240,
-            "fee_buffer": 0.0015,
-            "strategy": "RANGE",
-            "aucpr": 0.4811
+            "sl_mult": 3.0,
+            "tp_mult": 7.5,
+            "time_limit": 720,
+            "fee_buffer": 0.002,
+            "strategy": "SWING",
+            "aucpr": 0.2414
         },
         "TAOUSDT": {
             "sl_mult": 3.0,
@@ -22,7 +22,7 @@
             "time_limit": 720,
             "fee_buffer": 0.002,
             "strategy": "SWING",
-            "aucpr": 0.5145
+            "aucpr": 0.2579
         }
     }
 }

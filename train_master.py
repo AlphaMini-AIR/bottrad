@@ -1,7 +1,7 @@
 """
-train_master_v8.py - AI Quant Sniper V5.3
-Huấn luyện mô hình XGBoost 8 đặc trưng (7 kỹ thuật + VPIN) 
-và chọn chiến lược tối ưu (SCALP/RANGE/SWING) cho từng coin.
+train_master_v8_fixed.py - AI Quant Sniper V5.3 (BALANCED LABELS)
+Sửa lỗi thiên lệch nhãn: mỗi thời điểm tạo 2 mẫu LONG và SHORT riêng biệt.
+Huấn luyện mô hình XGBoost 8 đặc trưng và chọn chiến lược tối ưu.
 """
 
 import pandas as pd
@@ -19,23 +19,23 @@ from onnxmltools.convert.common.data_types import FloatTensorType
 
 warnings.filterwarnings('ignore')
 
-# --- CẤU HÌNH CHIẾN LƯỢC (Khớp với StrategyRouter.js) ---
+# --- CẤU HÌNH CHIẾN LƯỢC (Khớp với white_list.json) ---
 STRATEGY_PROFILES = {
     "SCALP": {"sl_mult": 1.0, "tp_mult": 2.5, "time_limit": 60,  "fee_buffer": 0.0012},
     "RANGE": {"sl_mult": 1.5, "tp_mult": 3.75, "time_limit": 240, "fee_buffer": 0.0015},
     "SWING": {"sl_mult": 3.0, "tp_mult": 7.5, "time_limit": 720, "fee_buffer": 0.0020}
 }
 
-# 🚀 8 ĐẶC TRƯNG THEO ĐÚNG THỨ TỰ AiEngine.js V5.3
+# 8 ĐẶC TRƯNG THEO ĐÚNG THỨ TỰ AiEngine.js
 FEATURES = [
-    'hurst_proxy',        # 1
-    'dist_vwap',          # 2
-    'wick_to_body',       # 3
-    'vol_acceleration',   # 4
-    'funding_delta_12h',  # 5
-    'atr_norm',           # 6
-    'rsi',                # 7
-    'vpin'                # 8 - từ dữ liệu aggTrades
+    'hurst_proxy',
+    'dist_vwap',
+    'wick_to_body',
+    'vol_acceleration',
+    'funding_delta_12h',
+    'atr_norm',
+    'rsi',
+    'vpin'
 ]
 
 # ------------------------------------------------------------
@@ -44,13 +44,10 @@ FEATURES = [
 def calculate_quant_features(df):
     """Tính 7 đặc trưng đầu tiên từ dữ liệu nến (VPIN sẽ merge sau)"""
     df = df.copy()
-    
-    # Đảm bảo có cột symbol để groupby
     if 'symbol' not in df.columns:
         df['symbol'] = 'DEFAULT'
-    
     df = df.sort_values(by=['symbol', 'timestamp'])
-    
+
     all_groups = []
     for symbol, group in df.groupby('symbol'):
         group = group.copy()
@@ -96,54 +93,64 @@ def calculate_quant_features(df):
     return pd.concat(all_groups).dropna()
 
 # ------------------------------------------------------------
-# 2. GÁN NHÃN BẰNG PHƯƠNG PHÁP TRIPLE BARRIER (CÓ HAI CHIỀU)
+# 2. GÁN NHÃN CÂN BẰNG: MỖI THỜI ĐIỂM TẠO 2 MẪU (LONG & SHORT)
 # ------------------------------------------------------------
-def apply_triple_barrier(df, config):
+def apply_triple_barrier_balanced(df, config):
     """
-    Gán nhãn 1 (Win) nếu TP chạm trước SL trong khoảng time_limit.
-    Hỗ trợ cả LONG và SHORT.
+    Tạo DataFrame với mỗi hàng là một cặp (thời điểm, hướng).
+    Nhãn = 1 nếu TP chạm trước SL cho hướng đó.
     """
     closes = df['close'].values
     highs = df['high'].values
     lows = df['low'].values
-    atr = (df['atr_norm'] * closes).values  # ATR tuyệt đối
-
-    labels = np.zeros(len(closes))
+    atr = (df['atr_norm'] * closes).values
     limit = config['time_limit']
+    fee_buffer = config['fee_buffer']
+    tp_mult = config['tp_mult']
+    sl_mult = config['sl_mult']
 
-    for i in range(len(closes) - limit):
-        # LONG TP & SL
-        tp_price_long = closes[i] + atr[i] * config['tp_mult'] + closes[i] * config['fee_buffer']
-        sl_price_long = closes[i] - atr[i] * config['sl_mult']
+    rows = []
+    n = len(closes)
+    for i in range(n - limit):
+        # ---- LONG ----
+        tp_long = closes[i] + atr[i] * tp_mult + closes[i] * fee_buffer
+        sl_long = closes[i] - atr[i] * sl_mult
 
-        # SHORT TP & SL
-        tp_price_short = closes[i] - atr[i] * config['tp_mult'] - closes[i] * config['fee_buffer']
-        sl_price_short = closes[i] + atr[i] * config['sl_mult']
+        # ---- SHORT ----
+        tp_short = closes[i] - atr[i] * tp_mult - closes[i] * fee_buffer
+        sl_short = closes[i] + atr[i] * sl_mult
 
-        window_highs = highs[i+1 : i+limit+1]
-        window_lows = lows[i+1 : i+limit+1]
+        window_h = highs[i+1 : i+limit+1]
+        window_l = lows[i+1 : i+limit+1]
 
-        # Kiểm tra LONG
-        tp_hit_long = np.where(window_highs >= tp_price_long)[0]
-        sl_hit_long = np.where(window_lows <= sl_price_long)[0]
-        first_tp_long = tp_hit_long[0] if len(tp_hit_long) > 0 else 999
-        first_sl_long = sl_hit_long[0] if len(sl_hit_long) > 0 else 999
+        # LONG
+        tp_idx_long = np.where(window_h >= tp_long)[0]
+        sl_idx_long = np.where(window_l <= sl_long)[0]
+        first_tp = tp_idx_long[0] if len(tp_idx_long) > 0 else limit+1
+        first_sl = sl_idx_long[0] if len(sl_idx_long) > 0 else limit+1
+        long_win = 1 if first_tp < first_sl else 0
 
-        if first_tp_long < first_sl_long and first_tp_long != 999:
-            labels[i] = 1
-        else:
-            # Kiểm tra SHORT
-            tp_hit_short = np.where(window_lows <= tp_price_short)[0]
-            sl_hit_short = np.where(window_highs >= sl_price_short)[0]
-            first_tp_short = tp_hit_short[0] if len(tp_hit_short) > 0 else 999
-            first_sl_short = sl_hit_short[0] if len(sl_hit_short) > 0 else 999
+        # SHORT
+        tp_idx_short = np.where(window_l <= tp_short)[0]
+        sl_idx_short = np.where(window_h >= sl_short)[0]
+        first_tp_s = tp_idx_short[0] if len(tp_idx_short) > 0 else limit+1
+        first_sl_s = sl_idx_short[0] if len(sl_idx_short) > 0 else limit+1
+        short_win = 1 if first_tp_s < first_sl_s else 0
 
-            if first_tp_short < first_sl_short and first_tp_short != 999:
-                labels[i] = 1
+        base_row = df.iloc[i].to_dict()
+        # Dòng LONG
+        row_long = base_row.copy()
+        row_long['target'] = long_win
+        row_long['side'] = 'LONG'
+        rows.append(row_long)
 
-    df['target'] = labels
-    # Loại bỏ limit cuối cùng vì không đủ dữ liệu để gán nhãn
-    return df.iloc[:-limit]
+        # Dòng SHORT
+        row_short = base_row.copy()
+        row_short['target'] = short_win
+        row_short['side'] = 'SHORT'
+        rows.append(row_short)
+
+    return pd.DataFrame(rows)
 
 # ------------------------------------------------------------
 # 3. HUẤN LUYỆN & XUẤT ONNX CHO TỪNG COIN
@@ -161,10 +168,11 @@ def train_and_export(df):
         best_params = None
 
         for name, config in STRATEGY_PROFILES.items():
-            labeled_df = apply_triple_barrier(coin_data.copy(), config)
+            # Sử dụng hàm balanced mới
+            labeled_df = apply_triple_barrier_balanced(coin_data.copy(), config)
             
-            # Yêu cầu tối thiểu 1000 mẫu và tỷ lệ win không quá thấp
-            if len(labeled_df) < 1000 or labeled_df['target'].sum() < 50:
+            # Yêu cầu tối thiểu 2000 mẫu (do đã nhân đôi) và tỷ lệ win không quá thấp
+            if len(labeled_df) < 2000 or labeled_df['target'].sum() < 100:
                 continue
 
             X = labeled_df[FEATURES].values
@@ -194,7 +202,7 @@ def train_and_export(df):
                 return np.mean(scores)
 
             study = optuna.create_study(direction='maximize')
-            optuna.logging.set_verbosity(optuna.logging.WARNING)  # Tắt log của Optuna
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
             study.optimize(objective, n_trials=20, show_progress_bar=False)
 
             if study.best_value > best_score:
@@ -206,7 +214,7 @@ def train_and_export(df):
             print(f"🔥 {symbol} CHỐT: {best_profile} | AUC-PR: {best_score:.4f}")
             
             # Huấn luyện mô hình cuối cùng
-            final_df = apply_triple_barrier(coin_data.copy(), STRATEGY_PROFILES[best_profile])
+            final_df = apply_triple_barrier_balanced(coin_data.copy(), STRATEGY_PROFILES[best_profile])
             final_model = xgb.XGBClassifier(**best_params)
             final_model.fit(final_df[FEATURES].values, final_df['target'].values)
             
@@ -227,7 +235,6 @@ def train_and_export(df):
         else:
             print(f"⚠️ {symbol} LOẠI BỎ (AUC-PR <= 0.20).")
 
-    # Ghi white_list.json
     with open("white_list.json", "w") as f:
         json.dump({"active_coins": white_list_metadata}, f, indent=4)
     print(f"\n📄 Đã cập nhật white_list.json với {len(white_list_metadata)} coin.")
@@ -236,55 +243,42 @@ def train_and_export(df):
 # 4. MAIN PIPELINE
 # ------------------------------------------------------------
 if __name__ == "__main__":
-    # --- BƯỚC 1: Đọc dữ liệu nến OHLCV ---
     if not os.path.exists('dataset_multi_3months.csv'):
         print("❌ Không tìm thấy file dataset_multi_3months.csv")
         exit(1)
         
     print("📂 Đang nạp file Nến thô...")
     df_raw = pd.read_csv('dataset_multi_3months.csv')
-    
-    # Chuẩn hóa timestamp (đảm bảo là số nguyên)
     df_raw['timestamp'] = df_raw['timestamp'].astype(int)
     
     print("🧮 Đang tính toán 7 Đặc trưng kỹ thuật...")
     df_feat = calculate_quant_features(df_raw)
     
-    # --- BƯỚC 2: Nạp và gộp dữ liệu VPIN ---
-    print("🔗 Đang tìm và ghép nối dữ liệu VPIN (Đặc trưng số 8)...")
+    print("🔗 Đang tìm và ghép nối dữ liệu VPIN...")
     vpin_files = glob.glob('./vpin_cleaned/*_VPIN_Cleaned.csv')
-    
     if vpin_files:
         vpin_dfs = []
         for f in vpin_files:
             symbol = os.path.basename(f).split('_')[0]
             vdf = pd.read_csv(f)
-            vdf['timestamp'] = vdf['timestamp'].astype(int)  # đồng bộ kiểu
+            vdf['timestamp'] = vdf['timestamp'].astype(int)
             vdf['symbol'] = symbol
             vpin_dfs.append(vdf)
-            
         all_vpin_df = pd.concat(vpin_dfs, ignore_index=True)
-        
-        # Merge theo timestamp và symbol
         df_feat = pd.merge(df_feat, all_vpin_df, on=['symbol', 'timestamp'], how='left')
-        
-        # Điền VPIN = 0 cho những phút không có giao dịch
         df_feat['vpin'] = df_feat['vpin'].fillna(0.0)
         print("✅ Đã ghép VPIN thành công!")
     else:
         print("⚠️ CẢNH BÁO: Không tìm thấy thư mục 'vpin_cleaned'. Gán VPIN = 0 tạm thời.")
         df_feat['vpin'] = 0.0
 
-    # --- BƯỚC 3: Loại bỏ các dòng còn NaN (nếu có) ---
     before_drop = len(df_feat)
     df_feat = df_feat.dropna(subset=FEATURES).reset_index(drop=True)
     print(f"🧹 Đã loại bỏ {before_drop - len(df_feat)} dòng chứa giá trị NaN.")
     
     if len(df_feat) == 0:
-        print("❌ Không còn dữ liệu sau khi lọc NaN. Kiểm tra lại dữ liệu đầu vào.")
+        print("❌ Không còn dữ liệu sau khi lọc NaN.")
         exit(1)
 
-    # --- BƯỚC 4: Huấn luyện và xuất kết quả ---
     train_and_export(df_feat)
-    
     print("\n🎉 Hoàn tất huấn luyện! Hãy kiểm tra các file model_*.onnx và white_list.json.")
