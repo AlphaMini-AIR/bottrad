@@ -247,11 +247,11 @@ class AiEngine {
 
     async predict(historyCandles, symbol) {
         await this.init(symbol);
-
-        // Trả về 11 số 0 nếu chưa đủ nến
-        const defaultFeatures = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        
+        // Trả về mặc định nếu chưa đủ nến (Yêu cầu 721 nến do tính VWAP và Funding)
+        const defaultFeatures = [0,0,0,0,0,0,0,0,0,0,0]; 
         if (!this.sessions[symbol] || historyCandles.length < 721) {
-            return { winProb: 0.5, features: defaultFeatures };
+            return { winProb: 0.5, features: defaultFeatures }; 
         }
 
         const current = historyCandles[historyCandles.length - 1];
@@ -262,7 +262,8 @@ class AiEngine {
             return Math.sqrt(Math.max(0, variance));
         };
 
-        // --- TÍNH TOÁN 11 ĐẶC TRƯNG ---
+        // --- TÍNH TOÁN CÁC ĐẶC TRƯNG ---
+        
         // 0. Hurst
         let ret1m_arr = [], ret20m_arr = [];
         for (let i = historyCandles.length - 20; i < historyCandles.length; i++) {
@@ -287,8 +288,11 @@ class AiEngine {
         for (let i = historyCandles.length - 15; i < historyCandles.length; i++) sum_vol_15 += historyCandles[i].volume;
         const vol_accel = current.volume / ((sum_vol_15 / 15) + 1e-8);
 
-        // 4. Sentiment Divergence (Cá Voi vs Đám đông)
-        const sentiment = this.getTopTraderSentiment(symbol);
+        // 4. Funding Delta 12h (MỚI - KHỚP VỚI PYTHON)
+        let funding_delta = 0;
+        if (historyCandles.length >= 720) {
+            funding_delta = (current.funding_rate || 0) - (historyCandles[historyCandles.length - 720].funding_rate || 0);
+        }
 
         // 5 & 6. ATR Norm & RSI
         let sumTr = 0, gains = 0, losses = 0;
@@ -304,7 +308,7 @@ class AiEngine {
         // --- NHÓM VI CẤU TRÚC (MICROSTRUCTURE) ---
         // 7. VPIN
         const vpin = current.vpin || 0;
-
+        
         // 8. Orderbook Imbalance (Chuẩn hóa về [-1, 1])
         const ob_raw = current.ob_imb || 1.0;
         const ob_imb_norm = (ob_raw - 1) / (ob_raw + 1);
@@ -318,15 +322,15 @@ class AiEngine {
         const prem_idx = currentMark === 0 ? 0 : (currentMark - current.close) / currentMark;
 
         // ==========================================
-        // TẠO MẢNG 11 ĐẶC TRƯNG & SHADOW MODE
+        // TẠO MẢNG ĐẶC TRƯNG & NẠP VÀO AI V5.3 (8 Biến)
         // ==========================================
         const features11 = Float32Array.from([
-            hurst, vwap, wick_body, vol_accel, sentiment, atr_norm, rsi, // 7 Cũ
-            vpin, ob_imb_norm, liq_press, prem_idx                       // 4 Mới
+            hurst, vwap, wick_body, vol_accel, funding_delta, atr_norm, rsi, 
+            vpin, ob_imb_norm, liq_press, prem_idx                       
         ]);
-
-        // ⚔️ FEATURE MASKING: Cắt chính xác 8 phần tử (7 cũ + vpin) để đưa vào ONNX
-        const tensor = new ort.Tensor('float32', features11.subarray(0, 8), [1, 8]);
+        
+        // MỞ KHÓA 8 CỔNG TENSOR CHO MÔ HÌNH XGBoost MỚI
+        const tensor = new ort.Tensor('float32', features11.subarray(0, 8), [1, 8]); 
 
         let winProb = 0.5;
         try {
@@ -334,13 +338,13 @@ class AiEngine {
             if (results.probabilities && results.probabilities.data) {
                 winProb = results.probabilities.data[1] !== undefined ? results.probabilities.data[1] : 0;
             } else if (results.output_probability && results.output_probability.data) {
-                winProb = results.output_probability.data[1];
+                 winProb = results.output_probability.data[1]; 
             }
         } catch (err) {
-            console.error(`❌ [AI ERROR] ${symbol} ONNX inference failed:`, err.message);
+            console.error(`[AI ERROR] Lỗi khi chạy mô hình cho ${symbol}:`, err.message);
         }
 
-        // Trả về full 11 biến để DeepThinker dùng và File JSON lưu lại
+        // Trả về full biến để DeepThinker dùng và File JSON lưu lại
         return { winProb: winProb, features: features11 };
     }
 }
