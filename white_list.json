@@ -5,8 +5,8 @@
             "tp_mult": 3.75,
             "time_limit": 240,
             "fee_buffer": 0.0015,
-            "strategy": "SWING",
-            "aucpr": 0.252
+            "strategy": "RANGE",
+            "aucpr": 0.2515
         },
         "SOLUSDT": {
             "sl_mult": 3.0,
@@ -14,7 +14,7 @@
             "time_limit": 720,
             "fee_buffer": 0.002,
             "strategy": "SWING",
-            "aucpr": 0.2414
+            "aucpr": 0.2426
         },
         "TAOUSDT": {
             "sl_mult": 3.0,
@@ -22,7 +22,7 @@
             "time_limit": 720,
             "fee_buffer": 0.002,
             "strategy": "SWING",
-            "aucpr": 0.2579
+            "aucpr": 0.2588
         }
     }
 }

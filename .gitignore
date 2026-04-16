@@ -5,6 +5,7 @@
 /.pnp
 .pnp.*
 .yarn/*
+*.csv
 !.yarn/patches
 !.yarn/plugins
 !.yarn/releases
@@ -32,7 +33,7 @@ yarn-error.log*
 
 # vercel
 .vercel
-
+.csv
 # typescript
 *.tsbuildinfo
 next-env.d.ts

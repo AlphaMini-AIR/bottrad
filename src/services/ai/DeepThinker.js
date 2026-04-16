@@ -1,42 +1,38 @@
 /**
- * src/services/ai/DeepThinker.js 
+ * src/services/ai/DeepThinker.js - V12 (Volatility Mismatch Fix)
+ * Áp dụng "Khoảng Thở Cá Voi": Ép SL tối thiểu 0.5% để ôm lệnh 4H thực thụ.
  */
 class DeepThinker {
     constructor() {
-        this.MAX_HARD_RISK = 0.015; // Rủi ro tối đa 1.5% tài khoản
+        this.BASE_RISK_USD = 1.5; 
+        this.MAX_RISK_USD = 4.0;  
+        this.MIN_RISK_USD = 0.5;  
         this.STREAK_PENALTY_THRESHOLD = 3;
         this.consecutiveLosses = {};
-    }
-
-    preTradeValidate(signal, features) {
-        const ob_imb_norm = features[8] !== undefined ? features[8] : 0;
-        const liq_press = features[9] !== undefined ? features[9] : 0;
-        const prem_idx = features[10] !== undefined ? features[10] : 0;
-
-        if (signal === 'LONG') {
-            if (prem_idx < -0.005) return { allowed: false, reason: 'REJECT: Premium < -0.5%' };
-            if (ob_imb_norm < -0.2) return { allowed: false, reason: 'REJECT: OB < -0.2' };
-            if (liq_press > 0.6) return { allowed: false, reason: 'REJECT: Liq Cascade' };
-        } else if (signal === 'SHORT') {
-            if (prem_idx > 0.005) return { allowed: false, reason: 'REJECT: Premium > 0.5%' };
-            if (ob_imb_norm > 0.2) return { allowed: false, reason: 'REJECT: OB > 0.2' };
-            if (liq_press < -0.6) return { allowed: false, reason: 'REJECT: Liq Cascade' };
-        }
-        return { allowed: true };
     }
 
     evaluateLogic(symbol, history, winProb, currentPrice, currentObi = 0, features = [], meta = null) {
         let side = null;
 
-        // 1. CHẤP NHẬN SỐ LƯỢNG LỆNH NHIỀU HƠN MỘT CHÚT ĐỂ BÙ CHO BỘ LỌC PHÍ DÀY
-        if (winProb > 0.65) side = 'LONG';
-        else if (winProb < 0.35) side = 'SHORT';
+        if (winProb > 0.70) side = 'LONG';
+        else if (winProb < 0.30) side = 'SHORT';
 
-        if (!side) return { approved: false, reason: `AI_UNCERTAIN (${(winProb * 100).toFixed(1)}%)` };
+        if (!side) return { approved: false, reason: `AI_UNCERTAIN` };
 
-        // 2. LỌC VI CẤU TRÚC
-        const validation = this.preTradeValidate(side, features);
-        if (!validation.allowed) return { approved: false, reason: validation.reason };
+        const trend_4h = features[8];
+        const is_dead_zone = features[10];
+        const is_london_open = features[11];
+        const is_ny_open = features[12];
+        const exhaustion_ratio = features[13];
+        const spoofing_index = features[14];
+
+        if (side === 'LONG' && trend_4h === -1) return { approved: false, reason: `REJECT: Ngược Trend 4H` };
+        if (side === 'SHORT' && trend_4h === 1) return { approved: false, reason: `REJECT: Ngược Trend 4H` };
+        if (exhaustion_ratio > 2.0) return { approved: false, reason: `REJECT: Kiệt sức Volume` };
+        if (spoofing_index > 0.5) return { approved: false, reason: `REJECT: Bị Spoofing Sổ lệnh` };
+
+        const sweepCandle = history[history.length - 1];
+        let limitEntryPrice, dynamicSL, dynamicTP;
 
         let sumTr = 0;
         for (let i = history.length - 14; i < history.length; i++) {
@@ -45,57 +41,72 @@ class DeepThinker {
         }
         const atr = sumTr / 14;
 
-        // 3. THÔNG SỐ SWING GỐC
-        const sl_mult = 3.0;
-        const tp_mult = 7.5;
+        const recent20 = history.slice(-21, -1);
+        const swingHigh = Math.max(...recent20.map(c => c.high));
+        const swingLow = Math.min(...recent20.map(c => c.low));
 
-        const dynamicSL = atr * sl_mult;
-        const dynamicTP = atr * tp_mult;
+        // BẢN VÁ V12: KHOẢNG THỞ TỐI THIỂU 0.5% (Tránh bị nhiễu 1m quét)
+        const minSLDistance = currentPrice * 0.005; // Mức SL nhỏ nhất là 0.5% giá
 
-        // ========================================================
-        // 🚀 4. BỘ LỌC CHỐNG BẪY PHÍ SÀN (NET R:R FILTER)
-        // ========================================================
-        const roundTripFee = currentPrice * 0.001; // Phí 2 chiều (0.1%)
+        if (side === 'LONG') {
+            const wickTop = Math.min(sweepCandle.open, sweepCandle.close);
+            const wickBot = sweepCandle.low;
+            limitEntryPrice = wickBot + (wickTop - wickBot) * 0.4;
+            limitEntryPrice = Math.min(limitEntryPrice, currentPrice - (atr * 0.2));
 
-        // Rủi ro ròng = SL + Phí | Lợi nhuận ròng = TP - Phí
-        const netSL = dynamicSL + roundTripFee;
-        const netTP = dynamicTP - roundTripFee;
+            const hardSLPrice = Math.min(swingLow, sweepCandle.low) - (atr * 0.3);
+            dynamicSL = limitEntryPrice - hardSLPrice; 
 
-        // Nếu phí lớn hơn cả TP thì vứt luôn
-        if (netTP <= 0) return { approved: false, reason: 'REJECT: Phí sàn lớn hơn cả tiền lãi dự kiến' };
+            // XÓA BỎ GIỚI HẠN ATR NHỎ, ÉP SL PHẢI ĐỦ RỘNG
+            dynamicSL = Math.max(minSLDistance, dynamicSL); 
 
-        // Tính Tỷ lệ Cược Thực tế (True Net R:R)
-        const trueRR = netTP / netSL;
+            // TP linh động, tối thiểu bằng 2 lần SL
+            dynamicTP = Math.max((swingHigh - limitEntryPrice) * 1.1, dynamicSL * 2.0); 
 
-        // LUẬT THÉP: Nếu Lãi thực không lớn hơn 1.8 lần Lỗ thực -> TỪ CHỐI BẮN!
-        if (trueRR < 1.8) {
-            return { approved: false, reason: `REJECT: Net R:R quá thấp (${trueRR.toFixed(2)}) do nhiễu sóng ngắn` };
+        } else {
+            const wickBot = Math.max(sweepCandle.open, sweepCandle.close);
+            const wickTop = sweepCandle.high;
+            limitEntryPrice = wickBot + (wickTop - wickBot) * 0.6;
+            limitEntryPrice = Math.max(limitEntryPrice, currentPrice + (atr * 0.2));
+
+            const hardSLPrice = Math.max(swingHigh, sweepCandle.high) + (atr * 0.3);
+            dynamicSL = hardSLPrice - limitEntryPrice;
+
+            // XÓA BỎ GIỚI HẠN ATR NHỎ, ÉP SL PHẢI ĐỦ RỘNG
+            dynamicSL = Math.max(minSLDistance, dynamicSL);
+
+            // TP linh động, tối thiểu bằng 2 lần SL
+            dynamicTP = Math.max((limitEntryPrice - swingLow) * 1.1, dynamicSL * 2.0);
         }
 
-        // ========================================================
-        // 5. TÍNH TOÁN KELLY DỰA TRÊN TỶ LỆ THỰC (TRUE R:R)
-        // ========================================================
-        const realTimeEdge = side === 'LONG' ? winProb : (1 - winProb);
-        const q = 1 - realTimeEdge;
-        let kellyFraction = (realTimeEdge * trueRR - q) / trueRR; // Đã đổi sang trueRR
+        if (dynamicTP / dynamicSL < 2.0) {
+            return { approved: false, reason: `REJECT: R:R Không đạt 1:2.0` };
+        }
 
-        if (kellyFraction <= 0.02) return { approved: false, reason: `KELLY_TOO_LOW` };
+        let riskUsd = this.BASE_RISK_USD;
+        if (is_dead_zone === 1) riskUsd = this.MIN_RISK_USD;
+        if (is_london_open === 1 || is_ny_open === 1) riskUsd = this.MAX_RISK_USD;
+        if ((this.consecutiveLosses[symbol] || 0) >= this.STREAK_PENALTY_THRESHOLD) {
+            riskUsd = Math.max(this.MIN_RISK_USD, riskUsd * 0.5);
+        }
 
-        let safeKelly = kellyFraction * 0.25;
-        if ((this.consecutiveLosses[symbol] || 0) >= this.STREAK_PENALTY_THRESHOLD) safeKelly *= 0.5;
+        const slPercent = dynamicSL / limitEntryPrice; 
+        let maxSafeLeverage = Math.floor(1 / (slPercent * 1.2));
 
         return {
-            approved: true, symbol, side,
-            suggestedRiskRatio: Math.min(safeKelly, this.MAX_HARD_RISK),
-            slDistance: dynamicSL, tpDistance: dynamicTP,
-            reason: `EDGE_${(realTimeEdge * 100).toFixed(1)}%_NET-RR_${trueRR.toFixed(1)}`,
+            approved: true, 
+            symbol, side,
+            suggestedRiskUSD: riskUsd, 
+            suggestedLeverage: Math.max(3, Math.min(maxSafeLeverage, 20)), 
+            limitEntryPrice: limitEntryPrice, 
+            slDistance: dynamicSL, 
+            tpDistance: dynamicTP,
+            reason: `SWING_${side}_Vol$${riskUsd}`,
             features: features
         };
     }
-    evaluateEarlyExit(position, history, aiWinProb) {
-        return { shouldExit: false }; // Tắt Early Exit trong Backtest
-    }
 
+    evaluateEarlyExit() { return { shouldExit: false }; }
     reportTradeResult(symbol, isWin) {
         if (!this.consecutiveLosses[symbol]) this.consecutiveLosses[symbol] = 0;
         if (isWin) this.consecutiveLosses[symbol] = 0;
@@ -103,3 +114,4 @@ class DeepThinker {
     }
 }
 module.exports = new DeepThinker();
+

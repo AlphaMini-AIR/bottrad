@@ -1,179 +1,6 @@
-// /**
-//  * src/services/ai/AiEngine.js - Version 5.3 (11 Features & Shadow Mode)
-//  */
-// const ort = require('onnxruntime-node');
-// const path = require('path');
-// const fs = require('fs');
-
-// class AiEngine {
-//     constructor() {
-//         this.sessions = {};
-//         this.watchers = {};
-//         this.isReloading = {};
-//     }
-
-//     async init(symbol) {
-//         const modelPath = path.join(__dirname, `../../../model_${symbol}.onnx`);
-//         if (!this.sessions[symbol]) {
-//             await this.loadModelSafe(symbol, modelPath);
-//             this.setupAtomicWatcher(symbol, modelPath);
-//         }
-//     }
-
-//     async loadModelSafe(symbol, modelPath) {
-//         if (!fs.existsSync(modelPath)) return false;
-//         try {
-//             const newSession = await ort.InferenceSession.create(modelPath);
-//             this.sessions[symbol] = newSession;
-//             console.log(`🧠 [AI ENGINE] Nạp thành công bộ não cho ${symbol}! (Input Size: 7)`);
-//             return true;
-//         } catch (err) {
-//             console.error(`❌ [AI FATAL] File model lỗi! Giữ não cũ.`, err.message);
-//             return false;
-//         }
-//     }
-
-//     setupAtomicWatcher(symbol, modelPath) {
-//         if (this.watchers[symbol]) return;
-//         const dir = path.dirname(modelPath);
-//         const filename = path.basename(modelPath);
-//         try {
-//             this.watchers[symbol] = fs.watch(dir, async (eventType, triggerName) => {
-//                 if (eventType === 'rename' && triggerName === filename) {
-//                     if (this.isReloading[symbol]) return;
-//                     this.isReloading[symbol] = true;
-//                     setTimeout(async () => {
-//                         await this.loadModelSafe(symbol, modelPath);
-//                         setTimeout(() => { this.isReloading[symbol] = false; }, 2000);
-//                     }, 100);
-//                 }
-//             });
-//         } catch (error) { }
-//     }
-
-//     // Lấy Sentiment với thuật toán Time Decay
-//     getTopTraderSentiment(symbol) {
-//         if (!global.topTraderRatios) return 0;
-//         const data = global.topTraderRatios[symbol];
-//         if (!data) return 0;
-
-//         const ageMinutes = (Date.now() - data.timestamp) / 60000;
-//         let trust = 1.0;
-
-//         if (data.isStale) {
-//             trust = Math.max(0, 1 - (ageMinutes / 60)); // Giảm mạnh về 0 sau 1 tiếng nếu rớt mạng
-//         } else {
-//             trust = Math.max(0.5, 1 - (ageMinutes / 120)); // Giảm nhẹ nếu dữ liệu cũ
-//         }
-
-//         const rawRatio = data.longRatio / (data.shortRatio + 1e-12);
-//         return (rawRatio - 1.0) * trust; // > 0 là Cá voi Long, < 0 là Cá voi Short
-//     }
-
-//     async predict(historyCandles, symbol) {
-//         await this.init(symbol);
-
-//         // Trả về 11 số 0 nếu chưa đủ nến
-//         const defaultFeatures = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-//         if (!this.sessions[symbol] || historyCandles.length < 721) {
-//             return { winProb: 0.5, features: defaultFeatures };
-//         }
-
-//         const current = historyCandles[historyCandles.length - 1];
-//         const calcStd = (arr) => {
-//             if (arr.length <= 1) return 0;
-//             const mean = arr.reduce((a, b) => a + b) / arr.length;
-//             const variance = arr.map(x => Math.pow(x - mean, 2)).reduce((a, b) => a + b) / (arr.length - 1);
-//             return Math.sqrt(Math.max(0, variance));
-//         };
-
-//         // --- TÍNH TOÁN 11 ĐẶC TRƯNG ---
-//         // 0. Hurst
-//         let ret1m_arr = [], ret20m_arr = [];
-//         for (let i = historyCandles.length - 20; i < historyCandles.length; i++) {
-//             ret1m_arr.push((historyCandles[i].close - historyCandles[i - 1].close) / historyCandles[i - 1].close);
-//             ret20m_arr.push((historyCandles[i].close - historyCandles[i - 20].close) / historyCandles[i - 20].close);
-//         }
-//         const hurst = (calcStd(ret20m_arr) || 0) / (Math.sqrt(20) * (calcStd(ret1m_arr) || 1e-8) + 1e-8);
-
-//         // 1. VWAP (Sử dụng Mark Price để chống làm giá)
-//         let sum_pv = 0, sum_vol = 0;
-//         for (let i = historyCandles.length - 240; i < historyCandles.length; i++) {
-//             const mPrice = historyCandles[i].mark_close || historyCandles[i].close;
-//             sum_pv += mPrice * historyCandles[i].volume;
-//             sum_vol += historyCandles[i].volume;
-//         }
-//         const currentMark = current.mark_close || current.close;
-//         const vwap = (currentMark - (sum_pv / (sum_vol + 1e-8))) / (sum_pv / (sum_vol + 1e-8));
-
-//         // 2 & 3. Wick/Body & Vol Accel
-//         const wick_body = (current.high - current.low) / (Math.abs(current.close - current.open) + 1e-8);
-//         let sum_vol_15 = 0;
-//         for (let i = historyCandles.length - 15; i < historyCandles.length; i++) sum_vol_15 += historyCandles[i].volume;
-//         const vol_accel = current.volume / ((sum_vol_15 / 15) + 1e-8);
-
-//         // 4. Sentiment Divergence (Cá Voi vs Đám đông)
-//         const sentiment = this.getTopTraderSentiment(symbol);
-
-//         // 5 & 6. ATR Norm & RSI
-//         let sumTr = 0, gains = 0, losses = 0;
-//         for (let i = historyCandles.length - 14; i < historyCandles.length; i++) {
-//             let h = historyCandles[i].high, l = historyCandles[i].low, pc = historyCandles[i - 1].close;
-//             sumTr += Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
-//             let diff = historyCandles[i].close - historyCandles[i - 1].close;
-//             if (diff > 0) gains += diff; else losses -= diff;
-//         }
-//         const atr_norm = (sumTr / 14) / current.close;
-//         const rsi = 100 - (100 / (1 + ((gains / 14) / ((losses / 14) + 1e-8))));
-
-//         // --- NHÓM VI CẤU TRÚC (MICROSTRUCTURE) ---
-//         // 7. VPIN
-//         const vpin = current.vpin || 0;
-
-//         // 8. Orderbook Imbalance (Chuẩn hóa về [-1, 1])
-//         const ob_raw = current.ob_imb || 1.0;
-//         const ob_imb_norm = (ob_raw - 1) / (ob_raw + 1);
-
-//         // 9. Liquidation Pressure
-//         const liq_l = current.liq_long || 0;
-//         const liq_s = current.liq_short || 0;
-//         const liq_press = (liq_l + liq_s) === 0 ? 0 : (liq_l - liq_s) / (liq_l + liq_s);
-
-//         // 10. Premium Index
-//         const prem_idx = currentMark === 0 ? 0 : (currentMark - current.close) / currentMark;
-
-//         // ==========================================
-//         // TẠO MẢNG 11 ĐẶC TRƯNG & SHADOW MODE
-//         // ==========================================
-//         const features11 = Float32Array.from([
-//             hurst, vwap, wick_body, vol_accel, sentiment, atr_norm, rsi, // 7 Cũ
-//             vpin, ob_imb_norm, liq_press, prem_idx                       // 4 Mới
-//         ]);
-
-//         // ⚔️ FEATURE MASKING: Dùng .subarray(0, 7) tránh GC, đánh lừa não cũ
-//         const tensor = new ort.Tensor('float32', features11.subarray(0, 7), [1, 7]);
-
-//         let winProb = 0.5;
-//         try {
-//             const results = await this.sessions[symbol].run({ float_input: tensor });
-//             if (results.probabilities && results.probabilities.data) {
-//                 winProb = results.probabilities.data[1] !== undefined ? results.probabilities.data[1] : 0;
-//             } else if (results.output_probability && results.output_probability.data) {
-//                 winProb = results.output_probability.data[1];
-//             }
-//         } catch (err) {
-//             console.error(`❌ [AI ERROR] ${symbol} ONNX inference failed:`, err.message);
-//         }
-
-//         // Trả về full 11 biến để DeepThinker dùng và File JSON lưu lại
-//         return { winProb: winProb, features: features11 };
-//     }
-// }
-// module.exports = new AiEngine();
-
-
 /**
- * src/services/ai/AiEngine.js - Version 5.3 (11 Features & Shadow Mode)
+ * src/services/ai/AiEngine.js - V8.2 (20 Features & Multi-Class Classification)
+ * Nhận diện 3 trạng thái: Long Đẹp (1), Short Đẹp (0), và Thị trường Rác/Nhiễu (2)
  */
 const ort = require('onnxruntime-node');
 const path = require('path');
@@ -199,8 +26,7 @@ class AiEngine {
         try {
             const newSession = await ort.InferenceSession.create(modelPath);
             this.sessions[symbol] = newSession;
-            // Đổi log thành 8 để đúng với mô hình thực tế
-            console.log(`🧠 [AI ENGINE] Nạp thành công bộ não cho ${symbol}! (Input Size: 8)`);
+            console.log(`🧠 [AI ENGINE V8.2] Nạp thành công bộ não Đa Lớp cho ${symbol}! (Input: 20)`);
             return true;
         } catch (err) {
             console.error(`❌ [AI FATAL] File model lỗi! Giữ não cũ.`, err.message);
@@ -226,126 +52,161 @@ class AiEngine {
         } catch (error) { }
     }
 
-    // Lấy Sentiment với thuật toán Time Decay
-    getTopTraderSentiment(symbol) {
-        if (!global.topTraderRatios) return 0;
-        const data = global.topTraderRatios[symbol];
-        if (!data) return 0;
-
-        const ageMinutes = (Date.now() - data.timestamp) / 60000;
-        let trust = 1.0;
-
-        if (data.isStale) {
-            trust = Math.max(0, 1 - (ageMinutes / 60)); // Giảm mạnh về 0 sau 1 tiếng nếu rớt mạng
-        } else {
-            trust = Math.max(0.5, 1 - (ageMinutes / 120)); // Giảm nhẹ nếu dữ liệu cũ
-        }
-
-        const rawRatio = data.longRatio / (data.shortRatio + 1e-12);
-        return (rawRatio - 1.0) * trust; // > 0 là Cá voi Long, < 0 là Cá voi Short
-    }
-
     async predict(historyCandles, symbol) {
         await this.init(symbol);
-        
-        // Trả về mặc định nếu chưa đủ nến (Yêu cầu 721 nến do tính VWAP và Funding)
-        const defaultFeatures = [0,0,0,0,0,0,0,0,0,0,0]; 
-        if (!this.sessions[symbol] || historyCandles.length < 721) {
-            return { winProb: 0.5, features: defaultFeatures }; 
+
+        // Mặc định trả về 20 số 0 nếu chưa đủ dữ liệu (Cần ít nhất 240 nến cho khung 4H)
+        const defaultFeatures = new Array(20).fill(0);
+        if (!this.sessions[symbol] || historyCandles.length < 240) {
+            return { winProb: 0.5, features: defaultFeatures };
         }
 
         const current = historyCandles[historyCandles.length - 1];
-        const calcStd = (arr) => {
-            if (arr.length <= 1) return 0;
-            const mean = arr.reduce((a, b) => a + b) / arr.length;
-            const variance = arr.map(x => Math.pow(x - mean, 2)).reduce((a, b) => a + b) / (arr.length - 1);
-            return Math.sqrt(Math.max(0, variance));
-        };
+        const len = historyCandles.length;
 
-        // --- TÍNH TOÁN CÁC ĐẶC TRƯNG ---
-        
-        // 0. Hurst
-        let ret1m_arr = [], ret20m_arr = [];
-        for (let i = historyCandles.length - 20; i < historyCandles.length; i++) {
-            ret1m_arr.push((historyCandles[i].close - historyCandles[i - 1].close) / historyCandles[i - 1].close);
-            ret20m_arr.push((historyCandles[i].close - historyCandles[i - 20].close) / historyCandles[i - 20].close);
+        // ========================================================
+        // 1. VÙNG THỜI GIAN VÀNG (KILL ZONES UTC+7)
+        // ========================================================
+        const date = new Date(current.timestamp);
+        const utc7Hours = (date.getUTCHours() + 7) % 24;
+        const timeFloat = utc7Hours + (date.getUTCMinutes() / 60.0);
+
+        const is_dead_zone = (timeFloat >= 7.0 && timeFloat < 13.0) ? 1 : 0;
+        const is_london_open = (timeFloat >= 13.5 && timeFloat <= 16.5) ? 1 : 0;
+        const is_ny_open = (timeFloat >= 19.0 && timeFloat <= 22.5) ? 1 : 0;
+
+        // ========================================================
+        // 2. MTFA: XU HƯỚNG 15M & 4H
+        // ========================================================
+        const open15m = historyCandles[Math.max(0, len - 15)].open;
+        const trend_15m = current.close > open15m ? 1 : -1;
+
+        const open4h = historyCandles[Math.max(0, len - 240)].open;
+        const trend_4h = current.close > open4h ? 1 : -1;
+
+        let sum_close_240 = 0;
+        for (let i = Math.max(0, len - 240); i < len; i++) sum_close_240 += historyCandles[i].close;
+        const ema20_4h_proxy = sum_close_240 / Math.min(240, len);
+        const dist_to_4h_ema = (current.close - ema20_4h_proxy) / (ema20_4h_proxy + 1e-8);
+
+        // ========================================================
+        // 3. FVG 15M MITIGATION (LẤP ĐẦY KHOẢNG TRỐNG)
+        // ========================================================
+        let fvg_bull_mitigation = 0;
+        let fvg_bear_mitigation = 0;
+
+        if (len >= 45) {
+            const candle1_high = Math.max(...historyCandles.slice(len - 45, len - 30).map(c => c.high));
+            const candle1_low = Math.min(...historyCandles.slice(len - 45, len - 30).map(c => c.low));
+            const candle3_high = Math.max(...historyCandles.slice(len - 15, len).map(c => c.high));
+            const candle3_low = Math.min(...historyCandles.slice(len - 15, len).map(c => c.low));
+
+            if (candle3_low > candle1_high) {
+                const fvg_size = candle3_low - candle1_high;
+                fvg_bull_mitigation = Math.max(0, Math.min(1, (candle3_low - current.low) / (fvg_size + 1e-8)));
+            }
+            if (candle3_high < candle1_low) {
+                const fvg_size = candle1_low - candle3_high;
+                fvg_bear_mitigation = Math.max(0, Math.min(1, (current.high - candle3_high) / (fvg_size + 1e-8)));
+            }
         }
-        const hurst = (calcStd(ret20m_arr) || 0) / (Math.sqrt(20) * (calcStd(ret1m_arr) || 1e-8) + 1e-8);
 
-        // 1. VWAP (Sử dụng Mark Price để chống làm giá)
-        let sum_pv = 0, sum_vol = 0;
-        for (let i = historyCandles.length - 240; i < historyCandles.length; i++) {
-            const mPrice = historyCandles[i].mark_close || historyCandles[i].close;
-            sum_pv += mPrice * historyCandles[i].volume;
-            sum_vol += historyCandles[i].volume;
-        }
-        const currentMark = current.mark_close || current.close;
-        const vwap = (currentMark - (sum_pv / (sum_vol + 1e-8))) / (sum_pv / (sum_vol + 1e-8));
-
-        // 2 & 3. Wick/Body & Vol Accel
-        const wick_body = (current.high - current.low) / (Math.abs(current.close - current.open) + 1e-8);
-        let sum_vol_15 = 0;
-        for (let i = historyCandles.length - 15; i < historyCandles.length; i++) sum_vol_15 += historyCandles[i].volume;
-        const vol_accel = current.volume / ((sum_vol_15 / 15) + 1e-8);
-
-        // 4. Funding Delta 12h (MỚI - KHỚP VỚI PYTHON)
-        let funding_delta = 0;
-        if (historyCandles.length >= 720) {
-            funding_delta = (current.funding_rate || 0) - (historyCandles[historyCandles.length - 720].funding_rate || 0);
-        }
-
-        // 5 & 6. ATR Norm & RSI
-        let sumTr = 0, gains = 0, losses = 0;
-        for (let i = historyCandles.length - 14; i < historyCandles.length; i++) {
-            let h = historyCandles[i].high, l = historyCandles[i].low, pc = historyCandles[i - 1].close;
-            sumTr += Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
-            let diff = historyCandles[i].close - historyCandles[i - 1].close;
-            if (diff > 0) gains += diff; else losses -= diff;
-        }
-        const atr_norm = (sumTr / 14) / current.close;
-        const rsi = 100 - (100 / (1 + ((gains / 14) / ((losses / 14) + 1e-8))));
-
-        // --- NHÓM VI CẤU TRÚC (MICROSTRUCTURE) ---
-        // 7. VPIN
+        // ========================================================
+        // 4. DÒNG TIỀN & BẪY SỔ LỆNH (SPOOFING)
+        // ========================================================
         const vpin = current.vpin || 0;
-        
-        // 8. Orderbook Imbalance (Chuẩn hóa về [-1, 1])
-        const ob_raw = current.ob_imb || 1.0;
-        const ob_imb_norm = (ob_raw - 1) / (ob_raw + 1);
+        const funding_rate = current.funding_rate || 0;
+        const ob_imb_norm = current.ob_imb_norm || 0;
+        const spoofing_index = Math.abs(ob_imb_norm) * (1 - Math.abs(vpin));
 
-        // 9. Liquidation Pressure
-        const liq_l = current.liq_long || 0;
-        const liq_s = current.liq_short || 0;
-        const liq_press = (liq_l + liq_s) === 0 ? 0 : (liq_l - liq_s) / (liq_l + liq_s);
+        const price_roc_5 = (current.close - historyCandles[Math.max(0, len - 5)].close) / (historyCandles[Math.max(0, len - 5)].close + 1e-8);
+        let vpin_sum_5 = 0;
+        for (let i = Math.max(0, len - 5); i < len; i++) vpin_sum_5 += (historyCandles[i].vpin || 0);
 
-        // 10. Premium Index
-        const prem_idx = currentMark === 0 ? 0 : (currentMark - current.close) / currentMark;
+        let cum_delta_div = 0;
+        if (price_roc_5 >= -0.001 && vpin_sum_5 < -0.5) cum_delta_div = -1;
+        if (price_roc_5 <= 0.001 && vpin_sum_5 > 0.5) cum_delta_div = 1;
+
+        // ========================================================
+        // 5. CẤU TRÚC (SWING) & TÂM LÝ (EXHAUSTION, TRAP)
+        // ========================================================
+        const recent20 = historyCandles.slice(-21, -1);
+        const swing_high = Math.max(...recent20.map(c => c.high));
+        const swing_low = Math.min(...recent20.map(c => c.low));
+
+        const dist_to_swing_high = (swing_high - current.close) / (current.close + 1e-8);
+        const dist_to_swing_low = (current.close - swing_low) / (current.close + 1e-8);
+
+        const bear_trap = (current.low < swing_low && current.close > swing_low) ? 1 : 0;
+        const bull_trap = (current.high > swing_high && current.close < swing_high) ? 1 : 0;
+
+        const body = Math.abs(current.close - current.open) + 1e-8;
+        const prev = historyCandles[len - 2];
+        const prev_body = Math.abs(prev.close - prev.open);
+        const upper_wick = current.high - Math.max(current.open, current.close);
+        const lower_wick = Math.min(current.open, current.close) - current.low;
+
+        let vol_sum_20 = 0;
+        for (let i = Math.max(0, len - 20); i < len; i++) vol_sum_20 += historyCandles[i].volume;
+        const vol_avg_20 = vol_sum_20 / 20 + 1e-8;
+
+        const bull_rejection = (lower_wick / body) * (current.volume / vol_avg_20);
+        const bear_rejection = (upper_wick / body) * (current.volume / vol_avg_20);
+
+        let exhaustion_ratio = 1.0;
+        if (prev_body < 1e-6) {
+            exhaustion_ratio = (current.volume > vol_avg_20 * 1.5) ? 999.0 : 1.0;
+        } else {
+            exhaustion_ratio = (body / prev_body) * (current.volume / vol_avg_20);
+        }
 
         // ==========================================
-        // TẠO MẢNG ĐẶC TRƯNG & NẠP VÀO AI V5.3 (8 Biến)
+        // 6. ĐÓNG GÓI TENSOR VÀ CHẠY AI MULTI-CLASS
         // ==========================================
-        const features11 = Float32Array.from([
-            hurst, vwap, wick_body, vol_accel, funding_delta, atr_norm, rsi, 
-            vpin, ob_imb_norm, liq_press, prem_idx                       
+        const features20 = Float32Array.from([
+            vpin, funding_rate, ob_imb_norm,
+            bull_rejection, bear_rejection, bear_trap, bull_trap,
+            trend_15m, trend_4h, dist_to_4h_ema,
+            is_dead_zone, is_london_open, is_ny_open,
+            exhaustion_ratio, spoofing_index,
+            fvg_bull_mitigation, fvg_bear_mitigation,
+            dist_to_swing_high, dist_to_swing_low, cum_delta_div
         ]);
-        
-        // MỞ KHÓA 8 CỔNG TENSOR CHO MÔ HÌNH XGBoost MỚI
-        const tensor = new ort.Tensor('float32', features11.subarray(0, 8), [1, 8]); 
 
-        let winProb = 0.5;
+        const tensor = new ort.Tensor('float32', features20, [1, 20]);
+
+        let winProb = 0.5; // Mặc định là 0.5 (Tức là AI_UNCERTAIN / Thị trường Nhiễu)
+        
         try {
             const results = await this.sessions[symbol].run({ float_input: tensor });
+            let probs;
+            
             if (results.probabilities && results.probabilities.data) {
-                winProb = results.probabilities.data[1] !== undefined ? results.probabilities.data[1] : 0;
+                probs = results.probabilities.data;
             } else if (results.output_probability && results.output_probability.data) {
-                 winProb = results.output_probability.data[1]; 
+                probs = results.output_probability.data;
+            }
+
+            if (probs && probs.length >= 3) {
+                const prob_short = probs[0]; // Xác suất là Lệnh Short chuẩn
+                const prob_long = probs[1];  // Xác suất là Lệnh Long chuẩn
+                const prob_noise = probs[2]; // Xác suất là Thị trường Rác
+
+                // Nếu xác suất Long áp đảo cả rác và short
+                if (prob_long > 0.6 && prob_long > prob_noise) {
+                    winProb = prob_long; // Truyền nguyên gốc (Vd: 0.75 -> Sẽ kích hoạt Long)
+                } 
+                // Nếu xác suất Short áp đảo
+                else if (prob_short > 0.6 && prob_short > prob_noise) {
+                    winProb = 1 - prob_short; // Đảo ngược để < 0.4 (Vd: 1 - 0.75 = 0.25 -> Sẽ kích hoạt Short)
+                }
+                // Còn lại: winProb giữ nguyên 0.5 (Báo động cho DeepThinker khóa cò)
             }
         } catch (err) {
-            console.error(`[AI ERROR] Lỗi khi chạy mô hình cho ${symbol}:`, err.message);
+            console.error(`❌ [AI ERROR] ${symbol}:`, err.message);
         }
 
-        // Trả về full biến để DeepThinker dùng và File JSON lưu lại
-        return { winProb: winProb, features: features11 };
+        return { winProb: winProb, features: Array.from(features20) };
     }
 }
 module.exports = new AiEngine();
