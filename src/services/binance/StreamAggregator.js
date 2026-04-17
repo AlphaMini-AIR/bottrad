@@ -192,7 +192,8 @@ class StreamAggregator {
                 macro: {
                     funding_rate: global.liveMicroData[symbol].funding_rate,
                     open_interest: 0 // Lưu ý: Binance WS không hỗ trợ OI real-time chuẩn. Sẽ kéo bằng REST API ở tầng khác nếu cần, tạm để 0.
-                }
+                },
+                isStaleData: false
             };
 
             // BƯỚC B: LƯU VÀO FILE JSONL (Nạp đạn cho lò tự học ban đêm)
