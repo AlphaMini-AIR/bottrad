@@ -9,8 +9,8 @@ const readline = require('readline');
 const cron = require('node-cron');
 const { MongoClient } = require('mongodb');
 
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017';
-const DB_NAME = 'bottrad';
+const MONGO_URI = 'mongodb+srv://assistantsupdev_db_user:rCp0BrUushhwIKR8@binance.bjmukc0.mongodb.net/?appName=Binance';
+const DB_NAME = 'Binance';
 const COLLECTION_NAME = 'market_data_live';
 
 const LIVE_DATA_DIR = path.join(__dirname, '../../../data/live_buffer');
