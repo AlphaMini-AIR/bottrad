@@ -1,27 +1,39 @@
 /**
- * src/services/binance/StreamAggregator.js - Version 5.3 (Microstructure Ears)
+ * src/services/binance/StreamAggregator.js - Version 15.0 (Ultimate Data Harvester)
  */
 const WebSocket = require('ws');
-const InMemoryBuffer = require('../data/InMemoryBuffer'); 
+const fs = require('fs');
+const path = require('path');
+const InMemoryBuffer = require('../data/InMemoryBuffer'); // Buffer giữ data cho AI đánh Live
+
+// Đảm bảo thư mục lưu dữ liệu jsonl tồn tại
+const LIVE_DATA_DIR = path.join(__dirname, '../../../data/live_buffer');
+if (!fs.existsSync(LIVE_DATA_DIR)) fs.mkdirSync(LIVE_DATA_DIR, { recursive: true });
 
 class StreamAggregator {
     constructor() {
         this.ws = null;
-        this.symbols = []; // Chứa danh sách coin dạng UPPERCASE (VD: 'BTCUSDT')
-        this.vpinBuffer = {}; 
+        this.symbols = []; // VD: ['SOLUSDT', 'BTCUSDT']
     }
 
-    // Khởi tạo các biến Global để chứa dữ liệu tạm thời trên RAM
+    // Khởi tạo các biến Global để chứa dữ liệu Vi cấu trúc tạm thời trong 60 giây
     initGlobals(symbol) {
-        if (!global.orderbookImbalanceRaw) global.orderbookImbalanceRaw = {};
-        if (!global.liqLong1mSum) global.liqLong1mSum = {};
-        if (!global.liqShort1mSum) global.liqShort1mSum = {};
-        if (!global.currentMarkPrice) global.currentMarkPrice = {};
-
-        if (global.orderbookImbalanceRaw[symbol] === undefined) global.orderbookImbalanceRaw[symbol] = 1.0;
-        if (global.liqLong1mSum[symbol] === undefined) global.liqLong1mSum[symbol] = 0;
-        if (global.liqShort1mSum[symbol] === undefined) global.liqShort1mSum[symbol] = 0;
-        if (global.currentMarkPrice[symbol] === undefined) global.currentMarkPrice[symbol] = null;
+        if (!global.liveMicroData) global.liveMicroData = {};
+        
+        // Cấu trúc tạm RAM chuẩn bị cho JSON cuối cùng
+        if (!global.liveMicroData[symbol]) {
+            global.liveMicroData[symbol] = {
+                ob_imb_top20: 0.5,
+                spread_close: 0,
+                bid_vol_1pct: 0,
+                ask_vol_1pct: 0,
+                max_buy_trade: 0,
+                max_sell_trade: 0,
+                liq_long_vol: 0,
+                liq_short_vol: 0,
+                funding_rate: 0
+            };
+        }
     }
 
     start() {
@@ -30,47 +42,41 @@ class StreamAggregator {
         let streamPaths = [];
         this.symbols.forEach(sym => {
             const s = sym.toLowerCase();
-            this.initGlobals(sym); // Khởi tạo biến RAM cho coin này
+            this.initGlobals(sym);
             
-            // 4 luồng cục bộ cho từng đồng coin
-            streamPaths.push(`${s}@kline_1m`);
-            streamPaths.push(`${s}@aggTrade`);
-            streamPaths.push(`${s}@depth20@1000ms`); // Sổ lệnh update 1 giây/lần
-            streamPaths.push(`${s}@markPrice@1s`);    // Mark price update 1 giây/lần
+            // Cắm 4 đầu dò cho từng coin
+            streamPaths.push(`${s}@kline_1m`);         // Nến 1 phút
+            streamPaths.push(`${s}@aggTrade`);         // Từng lệnh khớp (Bắt cá mập)
+            streamPaths.push(`${s}@depth20@100ms`);    // Sổ lệnh ĐỘ TRỄ SIÊU THẤP 100ms
+            streamPaths.push(`${s}@markPrice@1s`);     // Giá Mark & Funding Rate
         });
 
-        // Thêm 1 luồng Global (Toàn thị trường) để bắt lệnh thanh lý
+        // 1 đầu dò Global bắt toàn bộ lệnh cháy tài khoản của thị trường
         streamPaths.push('!forceOrder@arr');
 
         const wsUrl = `wss://fstream.binance.com/stream?streams=${streamPaths.join('/')}`;
         
-        console.log(`📡 [WEBSOCKET] Đang kết nối 5 luồng Vi Cấu Trúc cho ${this.symbols.length} coins...`);
+        console.log(`📡 [WS] Đang thả lưới thu thập Vi Cấu Trúc cho ${this.symbols.length} coins...`);
         this.ws = new WebSocket(wsUrl);
 
-        this.ws.on('open', () => {
-            console.log('🟢 [WEBSOCKET] Đã kết nối thành công tới Binance Futures (Microstructure Enabled)!');
-        });
+        this.ws.on('open', () => console.log('🟢 [WS] Kết nối Binance Futures thành công (Ultimate Mode)!'));
 
         this.ws.on('message', (msg) => {
             try {
                 const data = JSON.parse(msg);
-                if (data.data) {
-                    this.routeMessage(data.data);
-                }
-            } catch (err) {
-                // Nuốt lỗi parse JSON để không crash bot
-            }
+                if (data.data) this.routeMessage(data.data);
+            } catch (err) {} // Bỏ qua lỗi parse
         });
 
-        this.ws.on('error', (err) => console.error('❌ [WEBSOCKET] Lỗi:', err.message));
+        this.ws.on('error', (err) => console.error('❌ [WS] Lỗi:', err.message));
         
         this.ws.on('close', () => {
-            console.warn('⚠️ [WEBSOCKET] Bị ngắt kết nối. Đang thử lại sau 5s...');
+            console.warn('⚠️ [WS] Đứt cáp Binance. Tự động nối lại sau 5s...');
             setTimeout(() => this.start(), 5000);
         });
     }
 
-    // Phân luồng sự kiện siêu tốc
+    // Phân luồng dữ liệu về đúng hàm xử lý
     routeMessage(data) {
         const e = data.e;
         if (e === 'kline') this.handleKline(data);
@@ -80,85 +86,137 @@ class StreamAggregator {
         else if (e === 'forceOrder') this.handleForceOrder(data);
     }
 
-    // 1. TÍNH VPIN (Dòng tiền Tick)
+    // 1. TAI NGHE KHỚP LỆNH: Tìm lệnh Đơn Lẻ Lớn Nhất (Cá mập)
     handleAggTrade(data) {
         const symbol = data.s.toUpperCase();
-        if (!this.vpinBuffer[symbol]) this.vpinBuffer[symbol] = { buyVol: 0, sellVol: 0 };
+        const tradeValue = parseFloat(data.q) * parseFloat(data.p); // Quy ra USDT
 
-        const qty = parseFloat(data.q);
-        if (data.m) this.vpinBuffer[symbol].sellVol += qty; // Taker Sell
-        else this.vpinBuffer[symbol].buyVol += qty;         // Taker Buy
-    }
-
-    // 2. TÍNH ORDERBOOK IMBALANCE (Cân bằng Sổ lệnh)
-    handleDepth(data) {
-        const symbol = data.s.toUpperCase();
-        let bidVol = 0, askVol = 0;
-        
-        // Cộng dồn 20 mức giá đầu tiên. Chi phí vòng lặp: cực thấp (O(20))
-        for (let i = 0; i < data.b.length; i++) bidVol += parseFloat(data.b[i][1]);
-        for (let i = 0; i < data.a.length; i++) askVol += parseFloat(data.a[i][1]);
-        
-        // Lưu thẳng vào RAM Global
-        global.orderbookImbalanceRaw[symbol] = bidVol / (askVol + 1e-8); 
-    }
-
-    // 3. THEO DÕI MARK PRICE
-    handleMarkPrice(data) {
-        const symbol = data.s.toUpperCase();
-        global.currentMarkPrice[symbol] = parseFloat(data.p);
-    }
-
-    // 4. BẮT THANH LÝ (Cháy tài khoản)
-    handleForceOrder(data) {
-        const order = data.o;
-        const symbol = order.s.toUpperCase();
-        
-        // Chỉ quan tâm các coin trong White-list của bot
-        if (global.liqLong1mSum[symbol] !== undefined) {
-            const value = parseFloat(order.p) * parseFloat(order.q); // Giá trị USD bị cháy
-            
-            // Nếu sàn BUY để đóng vị thế -> Lệnh Long đã bị cháy (Force Sell)
-            if (order.S === 'BUY') {
-                global.liqLong1mSum[symbol] += value;
-                console.log(`🔥 [LIQUIDATION] ${symbol} Long Squeeze: ${value.toFixed(0)}$`);
-            } else {
-                global.liqShort1mSum[symbol] += value;
-                console.log(`🔥 [LIQUIDATION] ${symbol} Short Squeeze: ${value.toFixed(0)}$`);
+        if (data.m) { 
+            // Taker Sell (Người bán chủ động)
+            if (tradeValue > global.liveMicroData[symbol].max_sell_trade) {
+                global.liveMicroData[symbol].max_sell_trade = tradeValue;
+            }
+        } else { 
+            // Taker Buy (Người mua chủ động)
+            if (tradeValue > global.liveMicroData[symbol].max_buy_trade) {
+                global.liveMicroData[symbol].max_buy_trade = tradeValue;
             }
         }
     }
 
-    // 5. CHỐT SỔ (Khi Nến 1 phút đóng)
+    // 2. TAI NGHE SỔ LỆNH: Tính Spread, Lệch Pha, và Tường Cản 1%
+    handleDepth(data) {
+        const symbol = data.s.toUpperCase();
+        const bids = data.b; // [[price, qty], ...]
+        const asks = data.a;
+        if (!bids.length || !asks.length) return;
+
+        const bestBid = parseFloat(bids[0][0]);
+        const bestAsk = parseFloat(asks[0][0]);
+        
+        // Tính độ giãn chênh lệch (Spread)
+        global.liveMicroData[symbol].spread_close = bestAsk - bestBid;
+
+        let bidVolTop20 = 0, askVolTop20 = 0;
+        let bidVol1Pct = 0, askVol1Pct = 0;
+
+        // Quét phe Mua (Bids)
+        for (let i = 0; i < bids.length; i++) {
+            const p = parseFloat(bids[i][0]);
+            const vol = p * parseFloat(bids[i][1]); // Tính bằng USDT
+            bidVolTop20 += vol;
+            if (p >= bestBid * 0.99) bidVol1Pct += vol; // Lệnh nằm trong vùng 1%
+        }
+
+        // Quét phe Bán (Asks)
+        for (let i = 0; i < asks.length; i++) {
+            const p = parseFloat(asks[i][0]);
+            const vol = p * parseFloat(asks[i][1]); // Tính bằng USDT
+            askVolTop20 += vol;
+            if (p <= bestAsk * 1.01) askVol1Pct += vol; // Lệnh nằm trong vùng 1%
+        }
+
+        // Cập nhật Snapshot vào RAM
+        global.liveMicroData[symbol].ob_imb_top20 = bidVolTop20 / ((bidVolTop20 + askVolTop20) || 1);
+        global.liveMicroData[symbol].bid_vol_1pct = bidVol1Pct;
+        global.liveMicroData[symbol].ask_vol_1pct = askVol1Pct;
+    }
+
+    // 3. TAI NGHE MARK PRICE: Cập nhật Funding Rate
+    handleMarkPrice(data) {
+        const symbol = data.s.toUpperCase();
+        if (data.r) {
+            global.liveMicroData[symbol].funding_rate = parseFloat(data.r);
+        }
+    }
+
+    // 4. TAI NGHE THANH LÝ: Bắt tổng lượng cháy tài khoản
+    handleForceOrder(data) {
+        const order = data.o;
+        const symbol = order.s.toUpperCase();
+        
+        if (global.liveMicroData[symbol]) {
+            const value = parseFloat(order.p) * parseFloat(order.q); // Giá trị cháy (USDT)
+            
+            if (order.S === 'BUY') {
+                // Sàn thanh lý bằng cách bắt BUY -> Tức là lệnh SHORT bị cháy
+                global.liveMicroData[symbol].liq_short_vol += value;
+            } else {
+                // Sàn thanh lý bằng cách bắt SELL -> Tức là lệnh LONG bị cháy
+                global.liveMicroData[symbol].liq_long_vol += value;
+            }
+        }
+    }
+
+    // 5. THỜI KHẮC ĐÓNG NẾN: Gói dữ liệu & Lưu Ổ Cứng
     handleKline(data) {
-        if (data.k.x) { 
+        if (data.k.x) { // k.x = true nghĩa là nến 1 phút đã đóng hoàn toàn
             const symbol = data.s.toUpperCase();
             
-            // -- Lấy và tính VPIN --
-            const vpinData = this.vpinBuffer[symbol] || { buyVol: 0, sellVol: 0 };
-            const totalVol = vpinData.buyVol + vpinData.sellVol;
-            const vpin = totalVol > 0 ? (vpinData.buyVol - vpinData.sellVol) / totalVol : 0; 
-            
-            // -- Đọc các chỉ số Vi Cấu Trúc từ RAM --
-            const ob_imb = global.orderbookImbalanceRaw[symbol] || 1.0;
-            const liq_long = global.liqLong1mSum[symbol] || 0;
-            const liq_short = global.liqShort1mSum[symbol] || 0;
-            const mark_close = global.currentMarkPrice[symbol] || data.k.c;
+            // BƯỚC A: TẠO CẤU TRÚC JSON HOÀN CHỈNH (Như Master Plan)
+            const payload = {
+                symbol: symbol,
+                openTime: data.k.t,
+                ohlcv: {
+                    open: parseFloat(data.k.o),
+                    high: parseFloat(data.k.h),
+                    low: parseFloat(data.k.l),
+                    close: parseFloat(data.k.c),
+                    volume: parseFloat(data.k.v),
+                    quoteVolume: parseFloat(data.k.q),
+                    trades: data.k.n,
+                    takerBuyBase: parseFloat(data.k.V),
+                    takerBuyQuote: parseFloat(data.k.Q)
+                },
+                micro: { ...global.liveMicroData[symbol] }, // Lấy bản sao từ RAM
+                macro: {
+                    funding_rate: global.liveMicroData[symbol].funding_rate,
+                    open_interest: 0 // Lưu ý: Binance WS không hỗ trợ OI real-time chuẩn. Sẽ kéo bằng REST API ở tầng khác nếu cần, tạm để 0.
+                }
+            };
 
-            // -- Đẩy toàn bộ 11 tham số vào Lõi Bộ Nhớ (InMemoryBuffer) --
-            InMemoryBuffer.push(symbol, data.k, vpin, ob_imb, liq_long, liq_short, mark_close);
-            
-            // -- 🧹 RESET BỘ ĐẾM CHO PHÚT TIẾP THEO --
-            this.vpinBuffer[symbol] = { buyVol: 0, sellVol: 0 };
-            global.liqLong1mSum[symbol] = 0;
-            global.liqShort1mSum[symbol] = 0;
-            // (Không reset Orderbook và Mark Price vì nó là ảnh chụp Snapshot tĩnh)
+            // BƯỚC B: LƯU VÀO FILE JSONL (Nạp đạn cho lò tự học ban đêm)
+            const filePath = path.join(LIVE_DATA_DIR, 'syncing.jsonl');
+            fs.appendFileSync(filePath, JSON.stringify(payload) + '\n');
 
-            console.log(`⏱️ [NẾN ĐÓNG] ${symbol} | VPIN: ${vpin.toFixed(2)} | OB_IMB: ${ob_imb.toFixed(2)} | Liq(L-S): ${liq_long.toFixed(0)}$ - ${liq_short.toFixed(0)}$`);
+            // BƯỚC C: GỬI LÊN BỘ NHỚ RAM ĐỂ BOT ĐÁNH LIVE
+            // Vẫn duy trì truyền data sang InMemoryBuffer để AiEngine nhận diện
+            const mData = payload.micro;
+            // Tính VPIN tương đối từ ohlcv để truyền vào Buffer cũ
+            const vpin = payload.ohlcv.quoteVolume > 0 ? ((payload.ohlcv.takerBuyQuote * 2) - payload.ohlcv.quoteVolume) / payload.ohlcv.quoteVolume : 0;
+            
+            InMemoryBuffer.push(symbol, data.k, vpin, mData.ob_imb_top20, mData.liq_long_vol, mData.liq_short_vol, data.k.c);
+
+            // BƯỚC D: RESET BỘ ĐẾM CHO PHÚT TIẾP THEO
+            global.liveMicroData[symbol].max_buy_trade = 0;
+            global.liveMicroData[symbol].max_sell_trade = 0;
+            global.liveMicroData[symbol].liq_long_vol = 0;
+            global.liveMicroData[symbol].liq_short_vol = 0;
+            // (Spread, Funding, Ob_imb giữ nguyên vì nó là snapshot liên tục)
+
+            console.log(`✅ [DATA VAULT] Đã lưu nến ${symbol} | Mập Mua: $${mData.max_buy_trade.toFixed(0)} | Spread: ${mData.spread_close.toFixed(4)}`);
         }
     }
 }
 
 module.exports = new StreamAggregator();
-
-

@@ -1,5 +1,5 @@
 /**
- * src/models/MarketData.js
+ * src/models/MarketData.js - V15 (Ultimate Data Schema)
  */
 const mongoose = require('mongoose');
 
@@ -9,39 +9,51 @@ const marketDataSchema = new mongoose.Schema({
         required: true,
         index: true // Đánh index để truy vấn nhanh theo coin
     },
-    timestamp: {
+    openTime: { // Đổi từ timestamp sang openTime để khớp với Binance API
         type: Number,
         required: true,
         index: true // Đánh index để truy vấn time-series
     },
 
-    // --- VI MÔ (Micro - Nến 1 phút) ---
-    open: { type: Number, required: true },
-    high: { type: Number, required: true },
-    low: { type: Number, required: true },
-    close: { type: Number, required: true },
-    volume: { type: Number, required: true },
-    taker_buy_base: { type: Number, required: true }, // Lực mua chủ động
+    // --- 1. NHÓM NẾN CƠ BẢN (Chuẩn 11 trường Binance) ---
+    ohlcv: {
+        open: { type: Number, required: true },
+        high: { type: Number, required: true },
+        low: { type: Number, required: true },
+        close: { type: Number, required: true },
+        volume: { type: Number, required: true },
+        quoteVolume: { type: Number, required: true },
+        trades: { type: Number, required: true },
+        takerBuyBase: { type: Number, required: true },
+        takerBuyQuote: { type: Number, required: true }
+    },
 
-    // --- VĨ MÔ (Macro - Cập nhật từ nến 5m/Funding) ---
-    open_interest: { type: Number, default: null },
-    long_short_ratio: { type: Number, default: null },
-    funding_rate: { type: Number, default: null },
-    next_funding_time: { type: Number, default: null },
+    // --- 2. NHÓM VI CẤU TRÚC (Dữ liệu Live độc quyền) ---
+    micro: {
+        ob_imb_top20: { type: Number, default: 0.5 },
+        spread_close: { type: Number, default: 0 },
+        bid_vol_1pct: { type: Number, default: 0 },
+        ask_vol_1pct: { type: Number, default: 0 },
+        max_buy_trade: { type: Number, default: 0 },
+        max_sell_trade: { type: Number, default: 0 },
+        liq_long_vol: { type: Number, default: 0 },
+        liq_short_vol: { type: Number, default: 0 }
+    },
 
-    // --- BỔ SUNG VI CẤU TRÚC (V5.3) ---
-    vpin: { type: Number, default: 0 },
-    ob_imb: { type: Number, default: 1.0 },
-    liq_long: { type: Number, default: 0 },
-    liq_short: { type: Number, default: 0 },
-    mark_close: { type: Number, default: 0 },
+    // --- 3. NHÓM VĨ MÔ ---
+    macro: {
+        funding_rate: { type: Number, default: 0 },
+        open_interest: { type: Number, default: 0 }
+    },
 
-    // --- CỜ BẢO VỆ (DevOps / Ops) ---
-    // Đánh dấu true nếu phút này bị rớt mạng và phải dùng Forward-fill đắp nến
+    // --- CỜ BẢO VỆ (Cơ chế tự chữa lành) ---
+    // Đánh dấu true nếu nến này được kéo bù từ API do VPS sập (thiếu dữ liệu micro thật)
     isStaleData: { type: Boolean, default: false }
 });
 
 // Tạo compound index để đảm bảo không lưu trùng 1 phút của 1 coin
-marketDataSchema.index({ symbol: 1, timestamp: 1 }, { unique: true });
+marketDataSchema.index({ symbol: 1, openTime: 1 }, { unique: true });
 
-module.exports = mongoose.model('MarketData', marketDataSchema);
+// LƯU Ý QUAN TRỌNG: Ép Mongoose lưu chính xác vào collection 'market_data_live' 
+// để khớp với luồng của syncToMongo.js
+module.exports = mongoose.model('MarketDataLive', marketDataSchema, 'market_data_live');
