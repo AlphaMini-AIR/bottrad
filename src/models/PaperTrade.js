@@ -1,26 +1,53 @@
+/**
+ * src/models/PaperTrade.js
+ * Lưu trữ Lịch sử giao dịch để thống kê Win Rate và Phân tích AI
+ */
 const mongoose = require('mongoose');
 
 const paperTradeSchema = new mongoose.Schema({
-    symbol: { type: String, required: true, index: true },
-    side: { type: String, enum: ['LONG', 'SHORT'], required: true },
-    entryPrice: { type: Number, required: true },
-    entryTime: { type: Date, default: Date.now },
-
-    // Các thông số tại thời điểm vào lệnh
-    winProb: { type: Number },
-    slPrice: { type: Number },
-    tpPrice: { type: Number },
-    riskRatio: { type: Number }, // Suggested Risk Ratio
-    reason: { type: String },
-    featuresAtEntry: [Number], // Lưu lại 11 features để nghiên cứu tại sao AI vào lệnh này
-
-    // Kết quả (Sẽ cập nhật khi đóng lệnh)
-    status: { type: String, enum: ['OPEN', 'CLOSED'], default: 'OPEN' },
-    exitPrice: { type: Number },
-    exitTime: { type: Date },
-    pnlPercent: { type: Number, default: 0 }, // % ROI
-    pnlUsdt: { type: Number, default: 0 },    // Lợi nhuận giả định (ví dụ tính trên 100$ vốn)
-    outcome: { type: String, enum: ['WIN', 'LOSS', 'BREAKEVEN', 'PENDING'], default: 'PENDING' }
+    symbol: { 
+        type: String, 
+        required: true,
+        index: true // Đánh index để truy vấn nhanh sau này
+    },
+    side: { 
+        type: String, 
+        required: true, 
+        enum: ['LONG', 'SHORT'] 
+    },
+    entryPrice: { 
+        type: Number, 
+        required: true 
+    },
+    closePrice: { 
+        type: Number, 
+        required: true 
+    },
+    margin: { 
+        type: Number, 
+        required: true // Số vốn đi lệnh (Ví dụ: 2$)
+    },
+    netPnl: { 
+        type: Number, 
+        required: true // Lợi nhuận sau khi đã trừ phí sàn
+    },
+    outcome: { 
+        type: String, 
+        required: true, 
+        enum: ['WIN', 'LOSS'] 
+    },
+    closeReason: { 
+        type: String, 
+        required: true // HARD_SL, HARD_TP, hoặc TRAILING_STOP
+    },
+    openTime: { 
+        type: Date, 
+        required: true 
+    },
+    closeTime: { 
+        type: Date, 
+        default: Date.now 
+    }
 });
 
 module.exports = mongoose.model('PaperTrade', paperTradeSchema);

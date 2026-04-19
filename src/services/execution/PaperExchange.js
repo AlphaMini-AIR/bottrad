@@ -1,137 +1,171 @@
-
 /**
- * src/services/execution/PaperExchange.js - Version 4.5 (Hoàn tất Vòng lặp Học tập)
+ * src/services/execution/PaperExchange.js - V16.1 (Sniper Execution)
+ * Vòng lặp 500ms: Quản lý vị thế ảo, tính PnL và kích hoạt Trailing Stop.
  */
-const PaperAccount = require('../../models/PaperAccount');
-const AutoRetrainScheduler = require('../ops/AutoRetrainScheduler'); // [THÊM MỚI]: Nạp trạm thu thập kinh nghiệm
+const PaperTrade = require('../../models/PaperTrade'); // Cấu trúc Mongoose của bạn
+const PaperAccount = require('../../models/PaperAccount'); // Lưu số dư 1000$
 
 class PaperExchange {
     constructor() {
-        this.accountId = 'main_paper';
+        this.activeTrades = new Map(); // Lưu lệnh đang chạy trên RAM để truy xuất siêu tốc (O(1))
+        this.TRADE_AMOUNT = 2.0; // Đánh đều tay 2$ mỗi lệnh theo yêu cầu của bạn
+        this.FEE_RATE = 0.0004; // Phí taker Binance (0.04%)
     }
 
-    /**
-     * Hàm lấy dữ liệu tài khoản
-     */
-    async getAccount() {
-        let acc = await PaperAccount.findOne({ account_id: this.accountId });
+    async initAccount() {
+        // Khởi tạo tài khoản ảo 1000$ nếu chưa có
+        let acc = await PaperAccount.findOne({ accountId: 'MAIN_PAPER' });
         if (!acc) {
-            acc = await PaperAccount.create({
-                account_id: this.accountId,
-                balance: 1000, // Vốn giả lập ban đầu
-                open_positions: [],
-                history: []
-            });
+            acc = new PaperAccount({ accountId: 'MAIN_PAPER', balance: 1000.0, initialBalance: 1000.0 });
+            await acc.save();
+            console.log('💰 [PaperExchange] Đã cấp vốn 1000$ cho Bot đánh thử.');
+        } else {
+            console.log(`💰 [PaperExchange] Vốn hiện tại: ${acc.balance.toFixed(2)}$`);
         }
-        return acc;
     }
 
-    /**
-     * [MẮT XÍCH CUỐI CÙNG 1/2]: Nhận bối cảnh (entryFeatures) và lưu vào lệnh
-     */
-    async openPosition(symbol, side, currentPrice, size, mode, hardSl, takeProfit, entryFeatures = []) {
-        const acc = await this.getAccount();
-        
-        // Trừ phí giả lập (0.05% Taker fee để test cho khắc nghiệt)
-        const fee = (size * currentPrice) * 0.0005;
-        acc.balance -= fee;
+    // Hàm này được gọi từ main.js mỗi khi DeepThinker duyệt lệnh
+    async openTrade(symbol, side, limitPrice, slPrice, tpPrice, trailingParams, prob, reason) {
+        // Chỉ cho phép 1 coin có 1 lệnh tại 1 thời điểm
+        if (this.activeTrades.has(symbol)) return;
 
-        const newPosition = {
+        const tradeSize = this.TRADE_AMOUNT / limitPrice; // Số lượng coin mua được
+
+        const newTrade = {
             symbol,
             side,
-            size,
-            entryPrice: currentPrice,
-            sl: hardSl,
-            tp: takeProfit,
-            mode,
-            openedAt: new Date(),
-            features: entryFeatures // 💾 LƯU TRỮ BỨC TRANH THỊ TRƯỜNG VÀO DATABASE
+            entryPrice: limitPrice,
+            slPrice,
+            tpPrice,
+            trailingParams,
+            size: tradeSize,
+            margin: this.TRADE_AMOUNT,
+            status: 'OPEN',
+            isTrailingActive: false,
+            extremePrice: limitPrice, // Giá cao nhất/thấp nhất từ lúc mở lệnh
+            prob,
+            reason,
+            openTime: Date.now()
         };
 
-        acc.open_positions.push(newPosition);
-        await acc.save();
-        
-        console.log(`✅ [PAPER] Đã mở ${side} ${symbol} | Giá: ${currentPrice} | Phí: ${fee.toFixed(3)}$`);
+        this.activeTrades.set(symbol, newTrade);
+        console.log(`🔫 [BẮN TỈA] MỞ LỆNH ${side} ${symbol} | Giá: ${limitPrice} | SL: ${slPrice} | TP: ${tpPrice}`);
     }
 
-    /**
-     * [MẮT XÍCH CUỐI CÙNG 2/2]: Radar dò giá và Chốt lệnh -> Xuất bài học
-     */
-    async monitorPrices(currentPrices) {
-        const acc = await this.getAccount();
-        if (!acc || acc.open_positions.length === 0) return;
+    // VÒNG LẶP 500ms SẼ GỌI HÀM NÀY LIÊN TỤC
+    async monitorTrades() {
+        if (this.activeTrades.size === 0) return;
 
-        let isModified = false;
-
-        // Quét từng lệnh đang mở
-        for (let i = acc.open_positions.length - 1; i >= 0; i--) {
-            const pos = acc.open_positions[i];
-            const currentPrice = currentPrices[pos.symbol];
-            
+        for (const [symbol, trade] of this.activeTrades.entries()) {
+            const currentPrice = global.liveMicroData?.[symbol]?.close || global.currentMarkPrice?.[symbol];
             if (!currentPrice) continue;
 
             let isClosed = false;
-            let exitReason = '';
-            
-            // Kiểm tra SL / TP
-            if (pos.side === 'LONG') {
-                if (currentPrice >= pos.tp) { isClosed = true; exitReason = 'TAKE_PROFIT'; }
-                else if (currentPrice <= pos.sl) { isClosed = true; exitReason = 'STOP_LOSS'; }
-            } else if (pos.side === 'SHORT') {
-                if (currentPrice <= pos.tp) { isClosed = true; exitReason = 'TAKE_PROFIT'; }
-                else if (currentPrice >= pos.sl) { isClosed = true; exitReason = 'STOP_LOSS'; }
+            let closePrice = 0;
+            let closeReason = '';
+
+            // 1. CẬP NHẬT ĐỈNH/ĐÁY CHO TRAILING STOP
+            if (trade.side === 'LONG') {
+                if (currentPrice > trade.extremePrice) trade.extremePrice = currentPrice;
+            } else {
+                if (currentPrice < trade.extremePrice && currentPrice > 0) trade.extremePrice = currentPrice;
             }
 
-            // Nếu chạm cản, tiến hành đóng lệnh
+            // 2. KÍCH HOẠT TRAILING STOP NẾU VƯỢT VẠCH ĐÍCH 50%
+            if (!trade.isTrailingActive) {
+                if (trade.side === 'LONG' && currentPrice >= trade.trailingParams.activationPrice) {
+                    trade.isTrailingActive = true;
+                    console.log(`🔥 [TRAILING] ${symbol} đã kích hoạt bám đuổi chốt lời!`);
+                } else if (trade.side === 'SHORT' && currentPrice <= trade.trailingParams.activationPrice) {
+                    trade.isTrailingActive = true;
+                    console.log(`🔥 [TRAILING] ${symbol} đã kích hoạt bám đuổi chốt lời!`);
+                }
+            }
+
+            // 3. LOGIC CHỐT LỜI / CẮT LỖ SIÊU TỐC
+            if (trade.side === 'LONG') {
+                // Rớt xuống SL cứng -> Cắt lỗ
+                if (currentPrice <= trade.slPrice) {
+                    isClosed = true; closePrice = currentPrice; closeReason = 'HARD_SL';
+                }
+                // Bơm mạnh qua TP cứng -> Chốt lời ngay nếu chưa bật Trailing
+                else if (currentPrice >= trade.tpPrice && !trade.isTrailingActive) {
+                    isClosed = true; closePrice = currentPrice; closeReason = 'HARD_TP';
+                }
+                // Nếu đang Trailing: Tụi 0.5% từ Đỉnh -> Chốt Lời Động (Râu nến)
+                else if (trade.isTrailingActive) {
+                    const dynamicSL = trade.extremePrice * (1 - trade.trailingParams.callbackRate / 100);
+                    if (currentPrice <= dynamicSL) {
+                        isClosed = true; closePrice = currentPrice; closeReason = 'TRAILING_STOP';
+                    }
+                }
+            } 
+            else if (trade.side === 'SHORT') {
+                // Bơm lên cắn SL cứng -> Cắt lỗ
+                if (currentPrice >= trade.slPrice) {
+                    isClosed = true; closePrice = currentPrice; closeReason = 'HARD_SL';
+                }
+                // Rớt qua TP cứng -> Chốt lời
+                else if (currentPrice <= trade.tpPrice && !trade.isTrailingActive) {
+                    isClosed = true; closePrice = currentPrice; closeReason = 'HARD_TP';
+                }
+                // Nếu đang Trailing: Giật lên 0.5% từ Đáy -> Chốt Lời Động
+                else if (trade.isTrailingActive) {
+                    const dynamicSL = trade.extremePrice * (1 + trade.trailingParams.callbackRate / 100);
+                    if (currentPrice >= dynamicSL) {
+                        isClosed = true; closePrice = currentPrice; closeReason = 'TRAILING_STOP';
+                    }
+                }
+            }
+
+            // 4. XỬ LÝ KHI ĐÓNG LỆNH
             if (isClosed) {
-                // Trừ phí đóng lệnh (0.05%)
-                const closeFee = (pos.size * currentPrice) * 0.0005;
-                
-                // Tính PnL (Lợi nhuận gộp)
-                let grossPnl = 0;
-                if (pos.side === 'LONG') grossPnl = (currentPrice - pos.entryPrice) * pos.size;
-                if (pos.side === 'SHORT') grossPnl = (pos.entryPrice - currentPrice) * pos.size;
-                
-                // Lợi nhuận ròng
-                const netPnl = grossPnl - closeFee;
-                
-                // Cập nhật số dư
-                acc.balance += (pos.size * pos.entryPrice) + netPnl; 
-
-                console.log(`\n🔔 [PAPER CHỐT LỆNH] ${pos.side} ${pos.symbol} chạm ${exitReason}!`);
-                console.log(`💵 PnL: ${netPnl.toFixed(3)}$ | Số dư mới: ${acc.balance.toFixed(2)}$`);
-
-                // =========================================================
-                // 🚀 TRUYỀN DỮ LIỆU SANG TRẠM HỌC TẬP (AUTO RETRAIN)
-                // =========================================================
-                AutoRetrainScheduler.logCompletedTrade(
-                    pos.symbol, 
-                    pos.side, 
-                    pos.entryPrice, 
-                    currentPrice, 
-                    netPnl, 
-                    pos.features // Nộp lại mảng 7 biến số đã lưu lúc mở lệnh
-                );
-
-                // =========================================================
-                // 🧠 BÁO CÁO CHO DEEP THINKER ĐỂ RÚT KINH NGHIỆM NGAY LẬP TỨC
-                // =========================================================
-                const DeepThinker = require('../ai/DeepThinker'); // Gọi trực tiếp để tránh circular require
-                const isWin = netPnl > 0;
-                const riskRewardActual = isWin ? (grossPnl / Math.abs(pos.entryPrice - pos.sl)) : 0; 
-                DeepThinker.learnFromTrade(isWin, riskRewardActual);
-
-                // Xóa lệnh khỏi mảng
-                acc.open_positions.splice(i, 1);
-                isModified = true;
+                await this.closeTrade(symbol, trade, closePrice, closeReason);
             }
         }
+    }
 
-        if (isModified) {
-            await acc.save();
+    async closeTrade(symbol, trade, closePrice, closeReason) {
+        // Xóa khỏi RAM để vòng lặp 500ms không quét nữa
+        this.activeTrades.delete(symbol);
+
+        // Tính lợi nhuận (PnL)
+        let pnl = 0;
+        if (trade.side === 'LONG') {
+            pnl = (closePrice - trade.entryPrice) * trade.size;
+        } else {
+            pnl = (trade.entryPrice - closePrice) * trade.size;
         }
+
+        // Trừ phí giao dịch 2 đầu (Mở và Đóng lệnh)
+        const fee = (trade.entryPrice * trade.size * this.FEE_RATE) + (closePrice * trade.size * this.FEE_RATE);
+        const netPnl = pnl - fee;
+        const isWin = netPnl > 0;
+
+        // Lưu vào MongoDB để làm UI Báo cáo
+        const record = new PaperTrade({
+            symbol: trade.symbol,
+            side: trade.side,
+            entryPrice: trade.entryPrice,
+            closePrice: closePrice,
+            margin: trade.margin,
+            netPnl: netPnl,
+            outcome: isWin ? 'WIN' : 'LOSS',
+            closeReason: closeReason,
+            openTime: trade.openTime,
+            closeTime: Date.now()
+        });
+        await record.save();
+
+        // Cập nhật Số dư tài khoản 1000$
+        await PaperAccount.updateOne(
+            { accountId: 'MAIN_PAPER' },
+            { $inc: { balance: netPnl } }
+        );
+
+        const icon = isWin ? '✅' : '❌';
+        console.log(`${icon} [ĐÓNG LỆNH] ${symbol} | Lý do: ${closeReason} | PnL: ${netPnl.toFixed(4)}$`);
     }
 }
 
 module.exports = new PaperExchange();
-

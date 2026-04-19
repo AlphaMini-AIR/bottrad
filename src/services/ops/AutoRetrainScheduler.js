@@ -1,61 +1,65 @@
 /**
  * src/services/ops/AutoRetrainScheduler.js
+ * Quản lý tiến trình Tự Học tự động (Daily Retrain)
  */
+const { spawn } = require('child_process');
 const cron = require('node-cron');
-const { exec } = require('child_process');
 const path = require('path');
-const fs = require('fs');
 
 class AutoRetrainScheduler {
+    constructor() {
+        this.isTraining = false;
+    }
+
     init() {
-        console.log('📅 [SCHEDULER] Đã kích hoạt bộ lập lịch huấn luyện tự động.');
-
-        cron.schedule('0 2 * * 0', async () => {
-            console.log('\n🌅 [WEEKEND UPDATE] Bắt đầu quy trình huấn luyện và tuyển quân...');
-            this.runTrainingPipeline();
+        // Lên lịch chạy vào 2:00 Sáng mỗi ngày (Giờ hệ thống/VPS)
+        // Cú pháp cron: Phút Giờ Ngày Tháng Thứ ('0 2 * * *' = 2:00 AM)
+        cron.schedule('0 2 * * *', () => {
+            console.log('\n⏰ [CRON] Kích hoạt tiến trình Tự Học (Retrain) hàng ngày...');
+            this.runPythonTrainer();
         });
+        
+        console.log('✅ [SCHEDULER] Đã lên lịch tự động Retrain AI vào lúc 2:00 AM mỗi ngày.');
     }
 
-    // [THÊM MỚI]: Hàm hứng dữ liệu 11 biến và ghi vào file JSON
-    logCompletedTrade(symbol, side, entryPrice, closePrice, netPnl, features) {
-        try {
-            const today = new Date().toISOString().split('T')[0];
-            const fileName = `exp_${today}.json`;
-            const filePath = path.join(__dirname, '../../../', fileName);
-
-            // Nhãn (Label) cho AI học: Lãi > 0 là 1 (Thắng), ngược lại là 0 (Thua)
-            const tradeData = {
-                timestamp: Date.now(),
-                symbol: symbol,
-                side: side,
-                pnl: netPnl,
-                label: netPnl > 0 ? 1 : 0,
-                features: Array.from(features) // Chuyển Float32Array thành mảng Array thường để lưu JSON
-            };
-
-            let dataset = [];
-            if (fs.existsSync(filePath)) {
-                const fileContent = fs.readFileSync(filePath, 'utf8');
-                if (fileContent) dataset = JSON.parse(fileContent);
-            }
-
-            dataset.push(tradeData);
-            fs.writeFileSync(filePath, JSON.stringify(dataset, null, 2));
-            console.log(`💾 [DATA HARVEST] Đã ghi nhận 11 Đặc trưng của ${symbol} vào ${fileName}`);
-        } catch (error) {
-            console.error(`❌ [DATA HARVEST ERROR] Lỗi ghi file JSON:`, error.message);
+    runPythonTrainer() {
+        // Tránh tình trạng file cũ chưa chạy xong đã gọi file mới
+        if (this.isTraining) {
+            console.log('⚠️ [SCHEDULER] Luồng AI đang bận học, bỏ qua lượt này.');
+            return;
         }
-    }
 
-    runTrainingPipeline() {
-        console.log('⏳ Bước 1: Đang làm mới dữ liệu...');
-        exec('node prepare_dataset.js', (err, stdout, stderr) => {
-            if (err) return console.error(`❌ Lỗi prepare_dataset: ${err.message}`);
-            console.log('⏳ Bước 2: Đang kích hoạt Python...');
-            exec('python train_master.py', (pyErr, pyStdout, pyStderr) => {
-                if (pyErr) return console.error(`❌ Lỗi Python: ${pyErr.message}`);
-                console.log(pyStdout);
-            });
+        this.isTraining = true;
+        
+        // Trỏ đường dẫn chính xác ra file train_master.py nằm ở thư mục gốc
+        // Tùy vào tên file bạn lưu là gì (train_master.py hoặc train_master_v16.py)
+        const pythonScriptPath = path.join(__dirname, '../../../train_master.py'); 
+
+        console.log(`🚀 [SCHEDULER] Node.js đang gọi luồng Python: ${pythonScriptPath}`);
+
+        // Dùng 'spawn' để Node.js có thể đọc log của Python theo thời gian thực
+        const pythonProcess = spawn('python', [pythonScriptPath]);
+
+        // In các dòng chữ màu trắng (Log bình thường của Python)
+        pythonProcess.stdout.on('data', (data) => {
+            console.log(`[AI LEARNING]: ${data.toString().trim()}`);
+        });
+
+        // In các dòng chữ màu đỏ (Lỗi của Python)
+        pythonProcess.stderr.on('data', (data) => {
+            console.error(`[AI ERROR]: ${data.toString().trim()}`);
+        });
+
+        // Lắng nghe sự kiện khi Python chạy xong
+        pythonProcess.on('close', (code) => {
+            this.isTraining = false;
+            if (code === 0) {
+                console.log('🎉 [SCHEDULER] Tiến trình nâng cấp não bộ (Retrain) hoàn tất! Các file ONNX đã được cập nhật.');
+                // Lưu ý: Không cần viết code reload lại model ở đây.
+                // Bởi vì AiEngine.js đã có hàm fs.watch(), nó sẽ tự động phát hiện file ONNX bị thay đổi và load lại nóng!
+            } else {
+                console.log(`❌ [SCHEDULER] Tiến trình Retrain thất bại với mã lỗi: ${code}`);
+            }
         });
     }
 }

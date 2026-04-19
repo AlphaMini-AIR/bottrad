@@ -1,10 +1,11 @@
 /**
- * src/services/ai/AiEngine.js - V8.2 (20 Features & Multi-Class Classification)
- * Nhận diện 3 trạng thái: Long Đẹp (1), Short Đẹp (0), và Thị trường Rác/Nhiễu (2)
+ * src/services/ai/AiEngine.js - V16 (Microstructure & Macro Era)
+ * Nạp mô hình ONNX với 13 Features cốt lõi (Bao gồm BTC_Beta)
  */
 const ort = require('onnxruntime-node');
 const path = require('path');
 const fs = require('fs');
+const InMemoryBuffer = require('../data/InMemoryBuffer'); // Dùng để gọi data BTC
 
 class AiEngine {
     constructor() {
@@ -14,7 +15,8 @@ class AiEngine {
     }
 
     async init(symbol) {
-        const modelPath = path.join(__dirname, `../../../model_${symbol}.onnx`);
+        // Tìm file model_v16_<SYMBOL>.onnx
+        const modelPath = path.join(__dirname, `../../../model_v16_${symbol}.onnx`);
         if (!this.sessions[symbol]) {
             await this.loadModelSafe(symbol, modelPath);
             this.setupAtomicWatcher(symbol, modelPath);
@@ -26,10 +28,10 @@ class AiEngine {
         try {
             const newSession = await ort.InferenceSession.create(modelPath);
             this.sessions[symbol] = newSession;
-            console.log(`🧠 [AI ENGINE V8.2] Nạp thành công bộ não Đa Lớp cho ${symbol}! (Input: 20)`);
+            console.log(`🧠 [AI ENGINE V16] Nạp thành công bộ não Vi Cấu Trúc cho ${symbol}! (Input: 13 Features)`);
             return true;
         } catch (err) {
-            console.error(`❌ [AI FATAL] File model lỗi! Giữ não cũ.`, err.message);
+            console.error(`❌ [AI FATAL] File model lỗi! Giữ não cũ cho ${symbol}.`, err.message);
             return false;
         }
     }
@@ -55,158 +57,83 @@ class AiEngine {
     async predict(historyCandles, symbol) {
         await this.init(symbol);
 
-        // Mặc định trả về 20 số 0 nếu chưa đủ dữ liệu (Cần ít nhất 240 nến cho khung 4H)
-        const defaultFeatures = new Array(20).fill(0);
-        if (!this.sessions[symbol] || historyCandles.length < 240) {
+        // Mặc định trả về 13 số 0 nếu chưa có não ONNX hoặc thiếu data
+        const defaultFeatures = new Array(13).fill(0);
+        if (!this.sessions[symbol] || historyCandles.length < 2) {
             return { winProb: 0.5, features: defaultFeatures };
         }
 
+        // 1. LẤY DỮ LIỆU NẾN HIỆN TẠI (ALTCOIN)
         const current = historyCandles[historyCandles.length - 1];
-        const len = historyCandles.length;
+        const prev = historyCandles[historyCandles.length - 2];
 
-        // ========================================================
-        // 1. VÙNG THỜI GIAN VÀNG (KILL ZONES UTC+7)
-        // ========================================================
-        const date = new Date(current.timestamp);
-        const utc7Hours = (date.getUTCHours() + 7) % 24;
-        const timeFloat = utc7Hours + (date.getUTCMinutes() / 60.0);
+        // 2. KÉO DỮ LIỆU VI CẤU TRÚC (Từ StreamAggregator bắn sang RAM)
+        const micro = global.liveMicroData?.[symbol] || {};
+        const macro = global.liveMacroData?.[symbol] || {};
 
-        const is_dead_zone = (timeFloat >= 7.0 && timeFloat < 13.0) ? 1 : 0;
-        const is_london_open = (timeFloat >= 13.5 && timeFloat <= 16.5) ? 1 : 0;
-        const is_ny_open = (timeFloat >= 19.0 && timeFloat <= 22.5) ? 1 : 0;
+        // 3. TÍNH TOÁN CÁC FEATURE MỞ RỘNG (Giống hệt Python)
+        const taker_buy_ratio = current.quoteVolume > 0 
+            ? (current.takerBuyQuote / current.quoteVolume) 
+            : 0.5;
+        const body_size = Math.abs(current.close - current.open);
+        const wick_size = (current.high - current.low) - body_size;
+        
+        const coin_pct_change = (current.close - prev.close) / (prev.close + 1e-8);
 
-        // ========================================================
-        // 2. MTFA: XU HƯỚNG 15M & 4H
-        // ========================================================
-        const open15m = historyCandles[Math.max(0, len - 15)].open;
-        const trend_15m = current.close > open15m ? 1 : -1;
-
-        const open4h = historyCandles[Math.max(0, len - 240)].open;
-        const trend_4h = current.close > open4h ? 1 : -1;
-
-        let sum_close_240 = 0;
-        for (let i = Math.max(0, len - 240); i < len; i++) sum_close_240 += historyCandles[i].close;
-        const ema20_4h_proxy = sum_close_240 / Math.min(240, len);
-        const dist_to_4h_ema = (current.close - ema20_4h_proxy) / (ema20_4h_proxy + 1e-8);
-
-        // ========================================================
-        // 3. FVG 15M MITIGATION (LẤP ĐẦY KHOẢNG TRỐNG)
-        // ========================================================
-        let fvg_bull_mitigation = 0;
-        let fvg_bear_mitigation = 0;
-
-        if (len >= 45) {
-            const candle1_high = Math.max(...historyCandles.slice(len - 45, len - 30).map(c => c.high));
-            const candle1_low = Math.min(...historyCandles.slice(len - 45, len - 30).map(c => c.low));
-            const candle3_high = Math.max(...historyCandles.slice(len - 15, len).map(c => c.high));
-            const candle3_low = Math.min(...historyCandles.slice(len - 15, len).map(c => c.low));
-
-            if (candle3_low > candle1_high) {
-                const fvg_size = candle3_low - candle1_high;
-                fvg_bull_mitigation = Math.max(0, Math.min(1, (candle3_low - current.low) / (fvg_size + 1e-8)));
-            }
-            if (candle3_high < candle1_low) {
-                const fvg_size = candle1_low - candle3_high;
-                fvg_bear_mitigation = Math.max(0, Math.min(1, (current.high - candle3_high) / (fvg_size + 1e-8)));
+        // 4. KÉO DỮ LIỆU ÔNG TRÙM (BTCUSDT) ĐỂ SO SÁNH SỨC MẠNH
+        let btc_pct_change = 0;
+        if (symbol !== 'BTCUSDT') {
+            const btcHistory = InMemoryBuffer.getHistoryObjects('BTCUSDT');
+            if (btcHistory && btcHistory.length >= 2) {
+                const btcCurrent = btcHistory[btcHistory.length - 1];
+                const btcPrev = btcHistory[btcHistory.length - 2];
+                btc_pct_change = (btcCurrent.close - btcPrev.close) / (btcPrev.close + 1e-8);
             }
         }
+        const btc_relative_strength = coin_pct_change - btc_pct_change;
 
-        // ========================================================
-        // 4. DÒNG TIỀN & BẪY SỔ LỆNH (SPOOFING)
-        // ========================================================
-        const vpin = current.vpin || 0;
-        const funding_rate = current.funding_rate || 0;
-        const ob_imb_norm = current.ob_imb_norm || 0;
-        const spoofing_index = Math.abs(ob_imb_norm) * (1 - Math.abs(vpin));
-
-        const price_roc_5 = (current.close - historyCandles[Math.max(0, len - 5)].close) / (historyCandles[Math.max(0, len - 5)].close + 1e-8);
-        let vpin_sum_5 = 0;
-        for (let i = Math.max(0, len - 5); i < len; i++) vpin_sum_5 += (historyCandles[i].vpin || 0);
-
-        let cum_delta_div = 0;
-        if (price_roc_5 >= -0.001 && vpin_sum_5 < -0.5) cum_delta_div = -1;
-        if (price_roc_5 <= 0.001 && vpin_sum_5 > 0.5) cum_delta_div = 1;
-
-        // ========================================================
-        // 5. CẤU TRÚC (SWING) & TÂM LÝ (EXHAUSTION, TRAP)
-        // ========================================================
-        const recent20 = historyCandles.slice(-21, -1);
-        const swing_high = Math.max(...recent20.map(c => c.high));
-        const swing_low = Math.min(...recent20.map(c => c.low));
-
-        const dist_to_swing_high = (swing_high - current.close) / (current.close + 1e-8);
-        const dist_to_swing_low = (current.close - swing_low) / (current.close + 1e-8);
-
-        const bear_trap = (current.low < swing_low && current.close > swing_low) ? 1 : 0;
-        const bull_trap = (current.high > swing_high && current.close < swing_high) ? 1 : 0;
-
-        const body = Math.abs(current.close - current.open) + 1e-8;
-        const prev = historyCandles[len - 2];
-        const prev_body = Math.abs(prev.close - prev.open);
-        const upper_wick = current.high - Math.max(current.open, current.close);
-        const lower_wick = Math.min(current.open, current.close) - current.low;
-
-        let vol_sum_20 = 0;
-        for (let i = Math.max(0, len - 20); i < len; i++) vol_sum_20 += historyCandles[i].volume;
-        const vol_avg_20 = vol_sum_20 / 20 + 1e-8;
-
-        const bull_rejection = (lower_wick / body) * (current.volume / vol_avg_20);
-        const bear_rejection = (upper_wick / body) * (current.volume / vol_avg_20);
-
-        let exhaustion_ratio = 1.0;
-        if (prev_body < 1e-6) {
-            exhaustion_ratio = (current.volume > vol_avg_20 * 1.5) ? 999.0 : 1.0;
-        } else {
-            exhaustion_ratio = (body / prev_body) * (current.volume / vol_avg_20);
-        }
-
-        // ==========================================
-        // 6. ĐÓNG GÓI TENSOR VÀ CHẠY AI MULTI-CLASS
-        // ==========================================
-        const features20 = Float32Array.from([
-            vpin, funding_rate, ob_imb_norm,
-            bull_rejection, bear_rejection, bear_trap, bull_trap,
-            trend_15m, trend_4h, dist_to_4h_ema,
-            is_dead_zone, is_london_open, is_ny_open,
-            exhaustion_ratio, spoofing_index,
-            fvg_bull_mitigation, fvg_bear_mitigation,
-            dist_to_swing_high, dist_to_swing_low, cum_delta_div
+        // 5. ĐÓNG GÓI MẢNG 13 FEATURES (THỨ TỰ PHẢI KHỚP 100% VỚI PYTHON)
+        const features13 = Float32Array.from([
+            micro.ob_imb_top20 || 0,
+            micro.spread_close || 0,
+            micro.bid_vol_1pct || 0,
+            micro.ask_vol_1pct || 0,
+            micro.max_buy_trade || 0,
+            micro.max_sell_trade || 0,
+            micro.liq_long_vol || 0,
+            micro.liq_short_vol || 0,
+            macro.funding_rate || micro.funding_rate || 0,
+            taker_buy_ratio,
+            body_size,
+            wick_size,
+            btc_relative_strength
         ]);
 
-        const tensor = new ort.Tensor('float32', features20, [1, 20]);
+        const tensor = new ort.Tensor('float32', features13, [1, 13]);
 
-        let winProb = 0.5; // Mặc định là 0.5 (Tức là AI_UNCERTAIN / Thị trường Nhiễu)
+        let winProb = 0.5; // Mặc định là Nhãn 2 (Nhiễu)
         
         try {
             const results = await this.sessions[symbol].run({ float_input: tensor });
-            let probs;
-            
-            if (results.probabilities && results.probabilities.data) {
-                probs = results.probabilities.data;
-            } else if (results.output_probability && results.output_probability.data) {
-                probs = results.output_probability.data;
-            }
+            let probs = results.probabilities?.data || results.output_probability?.data;
 
             if (probs && probs.length >= 3) {
-                const prob_short = probs[0]; // Xác suất là Lệnh Short chuẩn
-                const prob_long = probs[1];  // Xác suất là Lệnh Long chuẩn
-                const prob_noise = probs[2]; // Xác suất là Thị trường Rác
+                const prob_short = probs[0]; // Xác suất giảm (Short)
+                const prob_long = probs[1];  // Xác suất tăng (Long)
+                const prob_noise = probs[2]; // Xác suất nhiễu
 
-                // Nếu xác suất Long áp đảo cả rác và short
-                if (prob_long > 0.6 && prob_long > prob_noise) {
-                    winProb = prob_long; // Truyền nguyên gốc (Vd: 0.75 -> Sẽ kích hoạt Long)
-                } 
-                // Nếu xác suất Short áp đảo
-                else if (prob_short > 0.6 && prob_short > prob_noise) {
-                    winProb = 1 - prob_short; // Đảo ngược để < 0.4 (Vd: 1 - 0.75 = 0.25 -> Sẽ kích hoạt Short)
+                // Truyền thẳng xác suất Long hoặc Short nếu nó vượt trội hơn tỷ lệ Nhiễu
+                if (prob_long > prob_noise && prob_long > prob_short) {
+                    winProb = prob_long; // (VD: 0.65 -> Sẽ kích hoạt Long ở DeepThinker)
+                } else if (prob_short > prob_noise && prob_short > prob_long) {
+                    winProb = 1 - prob_short; // Đảo ngược để < 0.5 (VD: 1 - 0.65 = 0.35 -> Kích hoạt Short)
                 }
-                // Còn lại: winProb giữ nguyên 0.5 (Báo động cho DeepThinker khóa cò)
             }
         } catch (err) {
-            console.error(`❌ [AI ERROR] ${symbol}:`, err.message);
+            console.error(`❌ [AI ERROR] Lỗi dự đoán Tensor ${symbol}:`, err.message);
         }
 
-        return { winProb: winProb, features: Array.from(features20) };
+        return { winProb: winProb, features: Array.from(features13) };
     }
 }
 module.exports = new AiEngine();
