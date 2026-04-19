@@ -1,29 +1,44 @@
 /**
- * src/services/ai/DeepThinker.js - V16.1 (Context-Aware Mastermind)
- * Tối ưu hóa: Ngưỡng bóp cò động (nhìn dòng tiền), Cấp phát thông số Trailing Stop.
+ * src/services/ai/DeepThinker.js - V16.1 (Context-Aware Mastermind + Tier Risk)
+ * Tối ưu hóa: Ngưỡng bóp cò động, Trailing Stop & Phân bổ rủi ro theo Tầng.
  */
 const fs = require('fs');
 const path = require('path');
 
 class DeepThinker {
     constructor() {
-        this.whitelist = {};
-        this.loadWhitelist();
+        this.coinConfigs = {};
+        this.loadTierConfig();
     }
 
-    loadWhitelist() {
+    // [CẬP NHẬT CHUẨN MỚI]: Đọc tier_list.json và cấp phát rủi ro động
+    loadTierConfig() {
         try {
-            const data = fs.readFileSync(path.join(__dirname, '../../../white_list.json'), 'utf8');
-            this.whitelist = JSON.parse(data).active_coins;
-            console.log('🧠 [DeepThinker] Đã nạp chiến thuật & Quản trị rủi ro từ white_list.json');
+            const data = fs.readFileSync(path.join(__dirname, '../../../tier_list.json'), 'utf8');
+            const tierData = JSON.parse(data);
+
+            const t1 = tierData.ranks.tier_1 || [];
+            const t2 = tierData.ranks.tier_2 || [];
+            const t3 = tierData.ranks.tier_3 || [];
+
+            // TẦNG 1: Tiền đạo chủ lực -> SL rộng (1.5 ATR), TP xa (3.0 ATR), Trailing gắt (0.5%)
+            t1.forEach(sym => this.coinConfigs[sym] = { sl_mult: 1.5, tp_mult: 3.0, time_limit: 60, trailing_callback: 0.5 });
+            
+            // TẦNG 2: Tầm trung -> SL vừa (1.2 ATR), TP vừa (2.5 ATR), Trailing nới lỏng (0.8%)
+            t2.forEach(sym => this.coinConfigs[sym] = { sl_mult: 1.2, tp_mult: 2.5, time_limit: 60, trailing_callback: 0.8 });
+            
+            // TẦNG 3: Thử việc -> SL cực ngắn (1.0 ATR) bảo vệ vốn, TP ngắn (2.0 ATR), Trailing lỏng (1.0%)
+            t3.forEach(sym => this.coinConfigs[sym] = { sl_mult: 1.0, tp_mult: 2.0, time_limit: 60, trailing_callback: 1.0 });
+
+            console.log('🧠 [DeepThinker] Đã nạp chiến thuật Đa Tầng từ tier_list.json');
         } catch (error) {
-            console.error('❌ [DeepThinker] Không đọc được white_list.json:', error.message);
+            console.error('❌ [DeepThinker] Lỗi đọc tier_list.json:', error.message);
         }
     }
 
     evaluate(symbol, winProb, historyCandles, features) {
-        const config = this.whitelist[symbol];
-        if (!config) return { approved: false, reason: 'N/A - Không có trong Whitelist' };
+        // Lấy config theo Tầng. Nếu coin mới (ScoutWorker vừa nạp) chưa load kịp, mặc định ép rủi ro Tầng 3
+        const config = this.coinConfigs[symbol] || { sl_mult: 1.0, tp_mult: 2.0, time_limit: 60, trailing_callback: 1.0 };
 
         // --- 1. GIẢI MÃ VI CẤU TRÚC (Từ AiEngine truyền sang) ---
         // Tham chiếu mảng features: [ob_imb(0), spread(1), bid_vol(2), ask_vol(3), max_buy(4), max_sell(5), liq_l(6), liq_s(7), funding(8), taker_buy(9), body(10), wick(11), btc_beta(12)]
@@ -36,7 +51,7 @@ class DeepThinker {
         let longThreshold = 0.60;
         let shortThreshold = 0.40;
 
-        // Nếu Altcoin đang khỏe hơn BTC (btc_beta > 0) và dòng tiền Mua mạnh -> Dễ dãi hơn với lệnh Long, khắt khe hơn với Short
+        // Nếu Altcoin đang khỏe hơn BTC (btc_beta > 0) và dòng tiền Mua mạnh -> Dễ dãi hơn với lệnh Long
         if (btc_relative_strength > 0.001 && taker_buy_ratio > 0.55) {
             longThreshold -= 0.03;  // Giảm còn 0.57 là bóp cò
             shortThreshold -= 0.05; // Giảm còn 0.35 mới dám đánh Short
@@ -72,7 +87,7 @@ class DeepThinker {
 
         if (currentAtr === 0) return { approved: false, reason: 'REJECT: Không có thanh khoản (ATR=0)' };
 
-        // --- 5. TỌA ĐỘ TÁC CHIẾN (SL, TP cứng) ---
+        // --- 5. TỌA ĐỘ TÁC CHIẾN (SL, TP cứng theo hệ số của Tầng) ---
         const currentPrice = historyCandles[historyCandles.length - 1].close;
         const slDistance = currentAtr * config.sl_mult;
         const tpDistance = currentAtr * config.tp_mult;
@@ -89,12 +104,14 @@ class DeepThinker {
         }
 
         // --- 6. CẤP PHÁT TỌA ĐỘ CHO BẮN TỈA BÁM ĐUỔI (TRAILING STOP) ---
-        // Tính năng mới: Khi giá đi được 50% quãng đường tới TP -> Bắt đầu Trailing Stop
+        // Khi giá đi được 50% quãng đường tới TP -> Bắt đầu Trailing Stop
         const trailingActivationDistance = tpDistance * 0.5; 
         const trailingActivationPrice = side === 'LONG' 
             ? limitPrice + trailingActivationDistance 
             : limitPrice - trailingActivationDistance;
-        const trailingCallbackRate = 0.5; // (0.5%) Nếu giá giật ngược lại 0.5% từ đỉnh -> Cắt chốt lời
+            
+        // Sử dụng Callback Rate được thiết lập theo từng Tầng ở loadTierConfig
+        const trailingCallbackRate = config.trailing_callback; 
 
         // --- 7. BỘ LỌC TỬ THẦN ---
         const riskPct = (slDistance / currentPrice) * 100;

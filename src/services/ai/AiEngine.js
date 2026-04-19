@@ -1,6 +1,6 @@
 /**
- * src/services/ai/AiEngine.js - V16 (Microstructure & Macro Era)
- * Nạp mô hình ONNX với 13 Features cốt lõi (Bao gồm BTC_Beta)
+ * src/services/ai/AiEngine.js - V16.1 (Production Ready)
+ * Tối ưu hóa mỏ neo BTC, Xử lý linh hoạt Output ONNX & Cache Missing Models
  */
 const ort = require('onnxruntime-node');
 const path = require('path');
@@ -12,14 +12,22 @@ class AiEngine {
         this.sessions = {};
         this.watchers = {};
         this.isReloading = {};
+        // Cache danh sách các coin CHƯA CÓ model để không bị check ổ cứng liên tục (Gây lag VPS)
+        this.missingModels = new Set(); 
     }
 
     async init(symbol) {
-        // Tìm file model_v16_<SYMBOL>.onnx
+        // Nếu đã xác nhận là không có model từ trước, bỏ qua luôn để tiết kiệm tài nguyên
+        if (this.sessions[symbol] || this.missingModels.has(symbol)) return;
+
         const modelPath = path.join(__dirname, `../../../model_v16_${symbol}.onnx`);
-        if (!this.sessions[symbol]) {
-            await this.loadModelSafe(symbol, modelPath);
+        const success = await this.loadModelSafe(symbol, modelPath);
+        
+        if (success) {
             this.setupAtomicWatcher(symbol, modelPath);
+        } else {
+            // Ghi nhớ coin này chưa có file .onnx (Đang ở Tầng 3 thử việc)
+            this.missingModels.add(symbol); 
         }
     }
 
@@ -28,7 +36,10 @@ class AiEngine {
         try {
             const newSession = await ort.InferenceSession.create(modelPath);
             this.sessions[symbol] = newSession;
-            console.log(`🧠 [AI ENGINE V16] Nạp thành công bộ não Vi Cấu Trúc cho ${symbol}! (Input: 13 Features)`);
+            
+            // Nếu model bỗng nhiên xuất hiện (do bạn vừa train xong copy vào), xóa nó khỏi danh sách thiếu
+            this.missingModels.delete(symbol); 
+            console.log(`🧠 [AI ENGINE V16.1] Nạp thành công bộ não Vi Cấu Trúc cho ${symbol}!`);
             return true;
         } catch (err) {
             console.error(`❌ [AI FATAL] File model lỗi! Giữ não cũ cho ${symbol}.`, err.message);
@@ -80,14 +91,19 @@ class AiEngine {
         
         const coin_pct_change = (current.close - prev.close) / (prev.close + 1e-8);
 
-        // 4. KÉO DỮ LIỆU ÔNG TRÙM (BTCUSDT) ĐỂ SO SÁNH SỨC MẠNH
+        // 4. KÉO DỮ LIỆU ÔNG TRÙM (BTCUSDT) ĐỂ SO SÁNH SỨC MẠNH (ĐÃ VÁ LỖI LỆCH THỜI GIAN)
         let btc_pct_change = 0;
         if (symbol !== 'BTCUSDT') {
             const btcHistory = InMemoryBuffer.getHistoryObjects('BTCUSDT');
             if (btcHistory && btcHistory.length >= 2) {
                 const btcCurrent = btcHistory[btcHistory.length - 1];
                 const btcPrev = btcHistory[btcHistory.length - 2];
-                btc_pct_change = (btcCurrent.close - btcPrev.close) / (btcPrev.close + 1e-8);
+                
+                // [QUAN TRỌNG] Chỉ dùng nến BTC nếu nó khớp thời gian với Altcoin (Độ lệch < 65 giây)
+                const timeDiff = Math.abs((btcCurrent.openTime || btcCurrent.t) - (current.openTime || current.t));
+                if (timeDiff < 65000) {
+                    btc_pct_change = (btcCurrent.close - btcPrev.close) / (btcPrev.close + 1e-8);
+                }
             }
         }
         const btc_relative_strength = coin_pct_change - btc_pct_change;
@@ -110,19 +126,21 @@ class AiEngine {
         ]);
 
         const tensor = new ort.Tensor('float32', features13, [1, 13]);
-
         let winProb = 0.5; // Mặc định là Nhãn 2 (Nhiễu)
         
         try {
             const results = await this.sessions[symbol].run({ float_input: tensor });
-            let probs = results.probabilities?.data || results.output_probability?.data;
+            
+            // [VÁ LỖI ONNX] Đôi khi Python XGBoost xuất ra tên mảng khác nhau. Tự động nhận diện mảng xác suất.
+            const outputName = this.sessions[symbol].outputNames[1] || 'probabilities';
+            let probs = results[outputName]?.data || results.probabilities?.data || results.output_probability?.data;
 
             if (probs && probs.length >= 3) {
                 const prob_short = probs[0]; // Xác suất giảm (Short)
                 const prob_long = probs[1];  // Xác suất tăng (Long)
                 const prob_noise = probs[2]; // Xác suất nhiễu
 
-                // Truyền thẳng xác suất Long hoặc Short nếu nó vượt trội hơn tỷ lệ Nhiễu
+                // Truyền thẳng xác suất Long/Short nếu nó vượt trội hơn tỷ lệ Nhiễu
                 if (prob_long > prob_noise && prob_long > prob_short) {
                     winProb = prob_long; // (VD: 0.65 -> Sẽ kích hoạt Long ở DeepThinker)
                 } else if (prob_short > prob_noise && prob_short > prob_long) {
@@ -136,4 +154,5 @@ class AiEngine {
         return { winProb: winProb, features: Array.from(features13) };
     }
 }
+
 module.exports = new AiEngine();
