@@ -50,4 +50,4 @@ const paperTradeSchema = new mongoose.Schema({
     }
 });
 
-module.exports = mongoose.model('PaperTrade', paperTradeSchema);
+module.exports = paperTradeSchema

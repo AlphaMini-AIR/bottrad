@@ -1,93 +1,124 @@
 /**
- * main.js - AI Quant Sniper V16.1 (Dual-Loop Architecture & Trailing Execution)
- * Nhạc trưởng điều phối Hệ thống Học máy & Giao dịch Tần suất cao.
+ * main.js - AI Quant Sniper V16.1 (Full League System Integration)
+ * Nhạc trưởng điều phối Hệ thống Học máy, Radar Scouter & API Gateway.
  */
-const connectDB = require('./src/config/db');
+require('dotenv').config();
+const { connectDB } = require('./src/config/db');
 const ExchangeInfo = require('./src/services/binance/ExchangeInfo');
 const InMemoryBuffer = require('./src/services/data/InMemoryBuffer');
 const StreamAggregator = require('./src/services/binance/StreamAggregator');
 const AiEngine = require('./src/services/ai/AiEngine');
 const DeepThinker = require('./src/services/ai/DeepThinker');
-const PaperExchange = require('./src/services/execution/PaperExchange'); // [V16.1] Module thực thi độc lập
+const PaperExchange = require('./src/services/execution/PaperExchange');
 const { healDataGaps } = require('./src/services/data/GapFiller_Startup');
-const AutoRetrainScheduler = require('./src/services/ops/AutoRetrainScheduler');
+const { startApiServer } = require('./src/api/server');
+
+// Kích hoạt các dịch vụ chạy ngầm (Cron Jobs)
 require('./src/services/data/syncToMongo');
+require('./src/services/ops/DataLifeCycle');
+require('./src/workers/ScoutWorker');
 
 const fs = require('fs');
 const path = require('path');
 
+const TIER_LIST_PATH = path.join(__dirname, 'tier_list.json');
+
+/**
+ * Hàm lấy danh sách tất cả coin đang hoạt động từ 3 tầng
+ */
+function getActiveSymbolList() {
+    try {
+        if (!fs.existsSync(TIER_LIST_PATH)) return [];
+        const data = JSON.parse(fs.readFileSync(TIER_LIST_PATH, 'utf8'));
+        return [
+            ...data.ranks.tier_1,
+            ...data.ranks.tier_2,
+            ...data.ranks.tier_3
+        ];
+    } catch (e) {
+        console.error('❌ Lỗi đọc danh sách coin:', e.message);
+        return [];
+    }
+}
+
 async function bootstrap() {
-    // 1. Khởi tạo Cơ sở dữ liệu và Thông tin Sàn
+    console.log('🦾 [SYSTEM] Đang khởi động AI Quant Sniper Core...');
+
+    // 1. Khởi tạo Cơ sở dữ liệu (Kết nối 3 Clusters)
     await connectDB();
+
+    // 2. Mở cổng API cho Dashboard Next.js
+    startApiServer();
+
+    // 3. Khởi tạo Thông tin Sàn & Danh sách Coin
     await ExchangeInfo.init();
+    let symbolList = getActiveSymbolList();
 
-    const whiteListData = JSON.parse(fs.readFileSync('./white_list.json', 'utf8'));
-    const activeCoins = whiteListData.active_coins;
-    const symbolList = Object.keys(activeCoins);
+    if (symbolList.length === 0) {
+        console.warn('⚠️ Tier List trống. Đợi ScoutWorker tìm coin...');
+        // Đợi 1 chút để ScoutWorker (đã require ở trên) kịp khởi tạo file nếu trống
+        await new Promise(resolve => setTimeout(resolve, 6000));
+        symbolList = getActiveSymbolList();
+    }
 
-    // 2. Tự chữa lành dữ liệu khuyết trước khi start
+    // 4. Tự chữa lành dữ liệu khuyết & Khởi tạo tài khoản giả lập
     await healDataGaps(symbolList);
-
-    // 3. Khởi tạo Tài khoản Quỹ 1000$ cho chế độ Giả lập
     await PaperExchange.initAccount();
 
-    // 4. Khởi động Tai Mắt (WebSocket Vi cấu trúc)
+    // 5. Khởi động Tai Mắt (WebSocket Vi cấu trúc)
     StreamAggregator.symbols = symbolList;
     StreamAggregator.start();
 
-    // 5. Kích hoạt Lò phản ứng Học máy lúc 2:00 AM mỗi ngày
-    AutoRetrainScheduler.init();
-
-    console.log('\n🚀 [SYSTEM] V16.1 MASTERMIND ONLINE | Dual-Loop Architecture Active\n');
+    console.log(`\n🚀 [SYSTEM] V16.1 MASTERMIND ONLINE`);
+    console.log(`📊 Đang giám sát: ${symbolList.length} đồng coin trên 3 Tầng.\n`);
 
     let lastProcessedMinute = -1;
 
     // ==========================================================
-    // VÒNG LẶP KÉP (DUAL-LOOP ARCHITECTURE) - TRÁI TIM HỆ THỐNG
+    // VÒNG LẶP KÉP (DUAL-LOOP ARCHITECTURE)
     // ==========================================================
     setInterval(async () => {
         const now = new Date();
         const currentMinute = now.getMinutes();
 
         // ------------------------------------------------------
-        // LUỒNG 1: LÍNH BẮN TỈA (Tốc độ: Nửa giây / lần)
-        // Chuyên xử lý râu nến, Trailing Stop và quản trị rủi ro
+        // LUỒNG 1: LÍNH BẮN TỈA (500ms/lần) - Quản trị lệnh đang chạy
         // ------------------------------------------------------
         await PaperExchange.monitorTrades();
 
         // ------------------------------------------------------
-        // LUỒNG 2: TƯỚNG QUÂN AI (Tốc độ: 1 phút / lần)
-        // Chuyên đọc Vi cấu trúc SMC và dự đoán Xu hướng
+        // LUỒNG 2: TƯỚNG QUÂN AI (1 phút/lần) - Dự đoán & Bóp cò
         // ------------------------------------------------------
         if (now.getSeconds() > 10 || currentMinute === lastProcessedMinute) return;
         lastProcessedMinute = currentMinute;
 
-        for (const symbol of symbolList) {
+        // Cập nhật lại danh sách coin (phòng trường hợp có coin mới từ ScoutWorker)
+        const currentSymbols = getActiveSymbolList();
+
+        for (const symbol of currentSymbols) {
             try {
                 if (!InMemoryBuffer.isReady(symbol)) continue;
 
-                const sortedHistory = InMemoryBuffer.getHistoryObjects(symbol);
-                if (!sortedHistory || sortedHistory.length < 16) continue; // Cần ít nhất 16 nến để tính ATR
+                // 🔍 KIỂM TRA SỰ TỒN TẠI CỦA MODEL TRƯỚC KHI DỰ ĐOÁN
+                const modelPath = path.join(__dirname, `model_v16_${symbol}.onnx`);
+                if (!fs.existsSync(modelPath)) {
+                    // Nếu không có model, chỉ log 1 lần để biết coin đang trong giai đoạn "vắt sữa data"
+                    if (now.getSeconds() < 1) console.log(`⏳ [AI] ${symbol} đang tích lũy data, chưa có model để dự đoán.`);
+                    continue;
+                }
 
-                // BƯỚC A: AI Engine tính toán 13 biến và dự đoán xác suất
+                const sortedHistory = InMemoryBuffer.getHistoryObjects(symbol);
+                if (!sortedHistory || sortedHistory.length < 16) continue;
+
+                // Chạy AI dự đoán dựa trên file ONNX có sẵn
                 const prediction = await AiEngine.predict(sortedHistory, symbol);
                 const { winProb, features } = prediction;
 
-                // BƯỚC B: DeepThinker bẻ cong rủi ro & Kiểm định tín hiệu
                 const decision = DeepThinker.evaluate(symbol, winProb, sortedHistory, features);
 
-                // BƯỚC C: Truyền Tọa độ Tác chiến cho Lính Bắn Tỉa
+                // THỰC THI GIẢ LẬP (PAPER ONLY)
                 if (decision.approved) {
-                    await PaperExchange.openTrade(
-                        symbol, 
-                        decision.side, 
-                        decision.limitPrice, 
-                        decision.slPrice, 
-                        decision.tpPrice, 
-                        decision.trailingParams, 
-                        decision.prob, 
-                        decision.reason
-                    );
+                    await PaperExchange.openTrade(symbol, decision.side, decision.limitPrice, decision.slPrice, decision.tpPrice, decision.trailingParams, decision.prob, decision.reason);
                 }
             } catch (error) {
                 console.error(`❌ [ERROR] Vòng lặp AI ${symbol}:`, error.message);

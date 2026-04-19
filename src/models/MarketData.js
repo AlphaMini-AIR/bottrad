@@ -56,4 +56,4 @@ marketDataSchema.index({ symbol: 1, openTime: 1 }, { unique: true });
 
 // LƯU Ý QUAN TRỌNG: Ép Mongoose lưu chính xác vào collection 'market_data_live' 
 // để khớp với luồng của syncToMongo.js
-module.exports = mongoose.model('MarketDataLive', marketDataSchema, 'market_data_live');
+module.exports = marketDataSchema
