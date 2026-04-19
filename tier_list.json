@@ -1,0 +1,55 @@
+{
+    "last_update": "2024-04-19T00:00:00Z",
+    "ranks": {
+        "tier_1": [
+            "BTCUSDT",
+            "SOLUSDT",
+            "TAOUSDT",
+            "NEARUSDT",
+            "SUIUSDT",
+            "APTUSDT",
+            "INJUSDT",
+            "FETUSDT",
+            "WLDUSDT",
+            "SEIUSDT",
+            "RENDERUSDT"
+        ],
+        "tier_2": [
+            "ETHUSDT",
+            "BNBUSDT",
+            "XRPUSDT",
+            "DOGEUSDT",
+            "AVAXUSDT",
+            "LINKUSDT",
+            "ADAUSDT",
+            "DOTUSDT",
+            "LTCUSDT",
+            "ARBUSDT"
+        ],
+        "tier_3": []
+    },
+    "storage_map": {
+        "BTCUSDT": "tier1",
+        "SOLUSDT": "tier1",
+        "TAOUSDT": "tier1",
+        "NEARUSDT": "tier1",
+        "SUIUSDT": "tier1",
+        "APTUSDT": "tier1",
+        "INJUSDT": "tier1",
+        "FETUSDT": "tier1",
+        "WLDUSDT": "tier1",
+        "SEIUSDT": "tier1",
+        "RENDERUSDT": "tier1",
+        "ETHUSDT": "tier2",
+        "BNBUSDT": "tier2",
+        "XRPUSDT": "tier2",
+        "DOGEUSDT": "tier2",
+        "AVAXUSDT": "tier2",
+        "LINKUSDT": "tier2",
+        "ADAUSDT": "tier2",
+        "DOTUSDT": "tier2",
+        "LTCUSDT": "tier2",
+        "ARBUSDT": "tier2"
+    },
+    "scout_tracking": {}
+}
