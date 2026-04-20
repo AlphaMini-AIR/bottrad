@@ -1,5 +1,5 @@
 /**
- * src/services/binance/StreamAggregator.js - Version 15.0 (Ultimate Data Harvester)
+ * src/services/binance/StreamAggregator.js - Version 15.0 (Ultimate Data Harvester) + AI Snapshot Patch
  */
 const WebSocket = require('ws');
 const fs = require('fs');
@@ -207,6 +207,13 @@ class StreamAggregator {
             const vpin = payload.ohlcv.quoteVolume > 0 ? ((payload.ohlcv.takerBuyQuote * 2) - payload.ohlcv.quoteVolume) / payload.ohlcv.quoteVolume : 0;
             
             InMemoryBuffer.push(symbol, data.k, vpin, mData.ob_imb_top20, mData.liq_long_vol, mData.liq_short_vol, data.k.c);
+
+            // ===================================================================
+            // 🟢 [BƯỚC C.2 - BẢN VÁ LỖI MÙ DỮ LIỆU]: CHỤP ẢNH SNAPSHOT CHO AI
+            // Bơm mData (chứa thông tin thanh lý chuẩn xác nhất trước khi bị reset) vào đệm
+            // ===================================================================
+            InMemoryBuffer.pushFullClosedCandle(symbol, data.k, mData);
+
 
             // BƯỚC D: RESET BỘ ĐẾM CHO PHÚT TIẾP THEO
             global.liveMicroData[symbol].max_buy_trade = 0;

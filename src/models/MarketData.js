@@ -49,7 +49,7 @@ const marketDataSchema = new mongoose.Schema({
     // --- CỜ BẢO VỆ (Cơ chế tự chữa lành) ---
     // Đánh dấu true nếu nến này được kéo bù từ API do VPS sập (thiếu dữ liệu micro thật)
     isStaleData: { type: Boolean, default: false }
-});
+}, { collection: 'market_data_clean' });
 
 // Tạo compound index để đảm bảo không lưu trùng 1 phút của 1 coin
 marketDataSchema.index({ symbol: 1, openTime: 1 }, { unique: true });

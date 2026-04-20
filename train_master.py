@@ -1,6 +1,7 @@
 """
 train_master_v16.py - PRODUCTION READY (MICROSTRUCTURE ERA)
 [CẬP NHẬT PHASE 1]: Hỗ trợ Multi-Cluster MongoDB (Định tuyến 3 Tầng)
+[CẬP NHẬT PHASE 2]: Custom Asymmetric Loss & Black Swan Sample Weighting
 """
 
 import pandas as pd
@@ -13,7 +14,7 @@ from sklearn.metrics import classification_report
 import warnings
 import json
 import os
-from dotenv import load_dotenv # <--- Thêm thư viện đọc .env
+from dotenv import load_dotenv 
 
 warnings.filterwarnings('ignore')
 
@@ -28,7 +29,7 @@ MONGO_URIS = {
 }
 
 DB_NAME = 'Binance'
-COLLECTION_NAME = 'market_data_live'
+COLLECTION_NAME = 'market_data_clean'
 
 FEATURES = [
     'ob_imb_top20', 'spread_close', 'bid_vol_1pct', 'ask_vol_1pct', 
@@ -118,9 +119,8 @@ def fetch_data_from_mongo(symbol, btc_dict, storage_node):
     
     return df
 
-# ... KHÔNG THAY ĐỔI CÁC HÀM LABELING & TRAIN ...
+# --- GIỮ NGUYÊN HOÀN TOÀN CƠ CHẾ LABELING CỦA BẠN ---
 def create_microstructure_labels(df):
-    # [Giữ nguyên 100% code cũ của bạn]
     print(f"🎓 Người Thầy Ảo đang gán nhãn 3 rào cản (Triple-Barrier)...")
     targets = np.full(len(df), 2)
     closes = df['close'].values
@@ -165,6 +165,88 @@ def create_microstructure_labels(df):
     df['expert_target'] = targets
     return df
 
+# =====================================================================
+# 🟢 BƯỚC 2: HÀM CÀI ĐẶT TRỌNG SỐ THIÊN NGA ĐEN (BLACK SWAN WEIGHTING)
+# =====================================================================
+def apply_black_swan_weights(df_train, y_train):
+    """ Ép AI học thuộc lòng các nến có thanh lý (Liquidation) khổng lồ """
+    # 1. Trọng số Time-decay (Nến càng gần hiện tại, trọng số càng cao từ 0.8 đến 1.5)
+    time_weight = np.linspace(0.8, 1.5, len(df_train))
+    
+    # 2. Tính tổng Thanh lý (Khối lượng quét lệnh)
+    liq_total = df_train['liq_long_vol'] + df_train['liq_short_vol']
+    
+    # 3. Tìm ngưỡng Black Swan (Top 5% nến có lượng thanh lý lớn nhất)
+    black_swan_threshold = np.percentile(liq_total, 95) if len(liq_total) > 0 else 0
+    
+    # Cân bằng Class cơ bản (Bản gốc của bạn)
+    weights = np.ones(len(y_train))
+    count_1 = sum(y_train == 1) + 1
+    count_0 = sum(y_train == 0) + 1
+    count_2 = sum(y_train == 2) + 1
+    
+    weights[y_train == 1] = min(count_2 / count_1, 15.0)
+    weights[y_train == 0] = min(count_2 / count_0, 15.0)
+    weights[y_train == 2] = 0.5  # Nhiễu (Ép AI bớt đánh)
+    
+    # Áp dụng Time-decay
+    weights = weights * time_weight
+    
+    # KÍCH HOẠT BLACK SWAN: Nhân 10 lần trọng số cho nến Cực trị
+    if black_swan_threshold > 0:
+        black_swan_mask = liq_total >= black_swan_threshold
+        weights[black_swan_mask] *= 10.0
+        
+    return weights
+
+# =====================================================================
+# 🟢 BƯỚC 3: HÀM MỤC TIÊU TỐI ƯU LỢI NHUẬN (CUSTOM ASYMMETRIC LOSS)
+# =====================================================================
+def asymmetric_profit_loss(y_true, y_pred):
+    """
+    Hàm tính Gradient và Hessian ép AI sợ những lệnh ngược sóng.
+    y_pred: Raw margin scores từ XGBoost (N * 3)
+    y_true: Labels (N,)
+    """
+    if y_pred.ndim == 1:
+        y_pred = y_pred.reshape(-1, 3)
+        
+    # Tính Softmax (Xác suất % cho từng nhãn)
+    y_pred = np.clip(y_pred, -15.0, 15.0) # Chống tràn số học
+    exp_preds = np.exp(y_pred)
+    probs = exp_preds / np.sum(exp_preds, axis=1, keepdims=True)
+    
+    # Chuyển Labels thành dạng One-hot [0, 1, 0]
+    y_true_onehot = np.zeros_like(probs)
+    for i, label in enumerate(y_true):
+        y_true_onehot[i, int(label)] = 1.0
+        
+    # Bậc 1 (Gradient) và Bậc 2 (Hessian) mặc định
+    grad = probs - y_true_onehot
+    hess = probs * (1.0 - probs)
+    
+    # ⚔️ THI THIẾT QUÂN LUẬT: TRỪNG PHẠT BẤT ĐỐI XỨNG ⚔️
+    for i in range(len(y_true)):
+        true_label = int(y_true[i])
+        
+        # ÁN TỬ HÌNH 1: Thực tế nến LONG (1), mà AI lỡ nhả xác suất SHORT (0) > 40%
+        if true_label == 1 and probs[i, 0] > 0.4:
+            grad[i, :] *= 15.0  # Phạt x15 điểm âm Gradient
+            hess[i, :] *= 15.0
+            
+        # ÁN TỬ HÌNH 2: Thực tế nến SHORT (0), mà AI lỡ nhả xác suất LONG (1) > 40%
+        elif true_label == 0 and probs[i, 1] > 0.4:
+            grad[i, :] *= 15.0
+            hess[i, :] *= 15.0
+            
+        # ÁN PHẠT NHẸ: Thực tế Nhiễu (2), nhưng AI tự tin Long/Short > 60% (Dễ dính Stoploss)
+        elif true_label == 2 and (probs[i, 0] > 0.6 or probs[i, 1] > 0.6):
+            grad[i, :] *= 5.0
+            hess[i, :] *= 5.0
+
+    return grad.flatten(), hess.flatten()
+
+# --- TÍCH HỢP TOÀN BỘ VÀO LUỒNG TRAIN ---
 def train_and_evaluate(symbol, btc_dict, storage_node):
     df_raw = fetch_data_from_mongo(symbol, btc_dict, storage_node)
     if df_raw is None or len(df_raw) < 50:
@@ -183,19 +265,24 @@ def train_and_evaluate(symbol, btc_dict, storage_node):
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
     
-    weights = np.ones(len(y_train))
-    count_1, count_0, count_2 = sum(y_train == 1) + 1, sum(y_train == 0) + 1, sum(y_train == 2) + 1
-    weights[y_train == 1] = min(count_2 / count_1, 15.0)
-    weights[y_train == 0] = min(count_2 / count_0, 15.0)
-    weights[y_train == 2] = 0.5 
+    # Kéo df_train để tính toán các chỉ số thanh lý (Black Swan)
+    df_train = df_clean.iloc[:split_idx].copy()
+    
+    # 🟢 1. CÀI ĐẶT TRỌNG SỐ THIÊN NGA ĐEN
+    weights = apply_black_swan_weights(df_train, y_train)
 
+    # 🟢 2. KHAI BÁO MODEL VỚI HÀM MỤC TIÊU TỐI ƯU LỢI NHUẬN (CUSTOM LOSS)
     model = xgb.XGBClassifier(
-        objective='multi:softprob', num_class=3, n_estimators=250,
-        max_depth=5, learning_rate=0.03, subsample=0.8,
-        colsample_bytree=0.8, eval_metric='mlogloss', random_state=42
+        n_estimators=250,
+        max_depth=5, 
+        learning_rate=0.03, 
+        subsample=0.8,
+        colsample_bytree=0.8, 
+        random_state=42
+        # Đã lược bỏ objective và eval_metric để AI tự động nhận diện
     )
     
-    print("🧠 Đang luyện não XGBoost...")
+    print("🧠 Đang luyện não XGBoost (Tích hợp Asymmetric Custom Loss & Black Swan)...")
     model.fit(X_train, y_train, sample_weight=weights)
     
     print("\n" + "="*45)
@@ -204,15 +291,19 @@ def train_and_evaluate(symbol, btc_dict, storage_node):
     y_pred = model.predict(X_test)
     print(classification_report(y_test, y_pred, target_names=['Short(0)', 'Long(1)', 'Nhiễu(2)'], zero_division=0))
     
+    # 🟢 3. ÉP ONNX GẮN LỚP SOFTMAX VÀO ĐẦU RA MÔ HÌNH
+    # (Vì Custom Loss làm XGBoost quên mất nó là một Classifier sinh ra Softmax)
+    model.set_params(objective='multi:softprob')
+    
     initial_type = [('float_input', FloatTensorType([None, len(FEATURES)]))]
     onnx_model = onnxmltools.convert_xgboost(model, initial_types=initial_type)
     model_path = f"model_v16_{symbol}.onnx"
     with open(model_path, "wb") as f:
         f.write(onnx_model.SerializeToString())
-    print(f"✅ Đã chốt file ONNX: {model_path}\n")
+    print(f"✅ Đã chốt file ONNX (Mới): {model_path}\n")
 
 if __name__ == "__main__":
-    print("🚀 KHỞI ĐỘNG HỆ THỐNG QUANT V16 - MULTI-CLUSTER MODE")
+    print("🚀 KHỞI ĐỘNG HỆ THỐNG QUANT V16 - MULTI-CLUSTER MODE & ASYMMETRIC PNL")
     
     # 1. Đọc danh sách và Tọa độ từ tier_list.json
     tierlist_path = os.path.join(os.path.dirname(__file__), 'tier_list.json')

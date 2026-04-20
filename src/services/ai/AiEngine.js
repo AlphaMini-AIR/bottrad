@@ -1,11 +1,11 @@
 /**
- * src/services/ai/AiEngine.js - V16.1 (Production Ready)
- * Tối ưu hóa mỏ neo BTC, Xử lý linh hoạt Output ONNX & Cache Missing Models
+ * src/services/ai/AiEngine.js - V16.2 (Production Ready + Snapshot Guard)
+ * Tối ưu hóa mỏ neo BTC, Xử lý linh hoạt Output ONNX & Vá lỗi Mù Dữ Liệu
  */
 const ort = require('onnxruntime-node');
 const path = require('path');
 const fs = require('fs');
-const InMemoryBuffer = require('../data/InMemoryBuffer'); // Dùng để gọi data BTC
+const InMemoryBuffer = require('../data/InMemoryBuffer'); // Dùng để gọi data BTC và Snapshot Micro
 
 class AiEngine {
     constructor() {
@@ -32,106 +32,107 @@ class AiEngine {
     }
 
     async loadModelSafe(symbol, modelPath) {
-        if (!fs.existsSync(modelPath)) return false;
+        if (this.isReloading[symbol]) return false;
+        this.isReloading[symbol] = true;
+
         try {
-            const newSession = await ort.InferenceSession.create(modelPath);
-            this.sessions[symbol] = newSession;
-            
-            // Nếu model bỗng nhiên xuất hiện (do bạn vừa train xong copy vào), xóa nó khỏi danh sách thiếu
-            this.missingModels.delete(symbol); 
-            console.log(`🧠 [AI ENGINE V16.1] Nạp thành công bộ não Vi Cấu Trúc cho ${symbol}!`);
-            return true;
+            if (fs.existsSync(modelPath)) {
+                // Dùng CPU backend để đảm bảo tương thích đa nền tảng VPS
+                const session = await ort.InferenceSession.create(modelPath, { executionProviders: ['cpu'] });
+                this.sessions[symbol] = session;
+                console.log(`🤖 [AiEngine] Đã nạp Model V16 cho ${symbol}`);
+                return true;
+            }
         } catch (err) {
-            console.error(`❌ [AI FATAL] File model lỗi! Giữ não cũ cho ${symbol}.`, err.message);
-            return false;
+            console.error(`❌ [AiEngine] Lỗi nạp Model ${symbol}:`, err.message);
+        } finally {
+            this.isReloading[symbol] = false;
         }
+        return false;
     }
 
     setupAtomicWatcher(symbol, modelPath) {
         if (this.watchers[symbol]) return;
-        const dir = path.dirname(modelPath);
-        const filename = path.basename(modelPath);
-        try {
-            this.watchers[symbol] = fs.watch(dir, async (eventType, triggerName) => {
-                if (eventType === 'rename' && triggerName === filename) {
-                    if (this.isReloading[symbol]) return;
-                    this.isReloading[symbol] = true;
-                    setTimeout(async () => {
-                        await this.loadModelSafe(symbol, modelPath);
-                        setTimeout(() => { this.isReloading[symbol] = false; }, 2000);
-                    }, 100);
-                }
-            });
-        } catch (error) { }
+        
+        let debounceTimer;
+        this.watchers[symbol] = fs.watch(path.dirname(modelPath), (eventType, filename) => {
+            if (filename === path.basename(modelPath)) {
+                clearTimeout(debounceTimer);
+                debounceTimer = setTimeout(async () => {
+                    console.log(`🔄 [AiEngine] Phát hiện Model ${symbol} mới. Đang nạp lại (Hot-Reload)...`);
+                    await this.loadModelSafe(symbol, modelPath);
+                }, 2000); // Trì hoãn 2s để file copy hoàn tất tránh lỗi gián đoạn
+            }
+        });
     }
 
-    async predict(historyCandles, symbol) {
-        await this.init(symbol);
+    async predict(symbol, historyCandles) {
+        // Cần ít nhất 2 nến để so sánh (current và prev)
+        if (!this.sessions[symbol] || !historyCandles || historyCandles.length < 2) return null;
 
-        // Mặc định trả về 13 số 0 nếu chưa có não ONNX hoặc thiếu data
-        const defaultFeatures = new Array(13).fill(0);
-        if (!this.sessions[symbol] || historyCandles.length < 2) {
-            return { winProb: 0.5, features: defaultFeatures };
-        }
+        try {
+            const current = historyCandles[historyCandles.length - 1];
+            const prev = historyCandles[historyCandles.length - 2];
 
-        // 1. LẤY DỮ LIỆU NẾN HIỆN TẠI (ALTCOIN)
-        const current = historyCandles[historyCandles.length - 1];
-        const prev = historyCandles[historyCandles.length - 2];
+            // =========================================================================
+            // 🟢 [BẢN VÁ LỖI MÙ DỮ LIỆU]: Lấy Snapshot chốt sổ từ InMemoryBuffer
+            // =========================================================================
+            const closedData = InMemoryBuffer.getLatestClosedCandle(symbol);
+            if (!closedData || !closedData.micro) {
+                // Chưa có cây nến nào đóng hoàn toàn kể từ khi bật Bot
+                return null; 
+            }
 
-        // 2. KÉO DỮ LIỆU VI CẤU TRÚC (Từ StreamAggregator bắn sang RAM)
-        const micro = global.liveMicroData?.[symbol] || {};
-        const macro = global.liveMacroData?.[symbol] || {};
+            const micro = closedData.micro;
+            const macro = closedData.macro || { funding_rate: 0 };
 
-        // 3. TÍNH TOÁN CÁC FEATURE MỞ RỘNG (Giống hệt Python)
-        const taker_buy_ratio = current.quoteVolume > 0 
-            ? (current.takerBuyQuote / current.quoteVolume) 
-            : 0.5;
-        const body_size = Math.abs(current.close - current.open);
-        const wick_size = (current.high - current.low) - body_size;
-        
-        const coin_pct_change = (current.close - prev.close) / (prev.close + 1e-8);
+            // 🟢 1. Feature Engineering cơ bản
+            current.body_size = (Math.abs(current.close - current.open) / current.open) * 100;
+            current.wick_size = (((current.high - current.low) - Math.abs(current.close - current.open)) / current.open) * 100;
 
-        // 4. KÉO DỮ LIỆU ÔNG TRÙM (BTCUSDT) ĐỂ SO SÁNH SỨC MẠNH (ĐÃ VÁ LỖI LỆCH THỜI GIAN)
-        let btc_pct_change = 0;
-        if (symbol !== 'BTCUSDT') {
-            const btcHistory = InMemoryBuffer.getHistoryObjects('BTCUSDT');
-            if (btcHistory && btcHistory.length >= 2) {
-                const btcCurrent = btcHistory[btcHistory.length - 1];
-                const btcPrev = btcHistory[btcHistory.length - 2];
+            // 🟢 2. Tính toán BTC Relative Strength (Dùng cache chống Look-ahead)
+            let btc_relative_strength = 0;
+            const btcData = InMemoryBuffer.getHistoryObjects('BTCUSDT');
+            
+            if (btcData && btcData.length >= 2) {
+                const btcCurrent = btcData[btcData.length - 1];
+                const btcPrev = btcData[btcData.length - 2];
                 
-                // [QUAN TRỌNG] Chỉ dùng nến BTC nếu nó khớp thời gian với Altcoin (Độ lệch < 65 giây)
-                const timeDiff = Math.abs((btcCurrent.openTime || btcCurrent.t) - (current.openTime || current.t));
-                if (timeDiff < 65000) {
-                    btc_pct_change = (btcCurrent.close - btcPrev.close) / (btcPrev.close + 1e-8);
+                const timeDiff = Math.abs(current.openTime - btcCurrent.openTime);
+                // CHỐNG NHÌN TRỘM: Đảm bảo nến BTCUSDT kéo ra khớp hoàn toàn về Timestamp
+                if (timeDiff < 65000) { 
+                    const altcoin_pct = ((current.close - prev.close) / prev.close) * 100;
+                    const btc_pct = ((btcCurrent.close - btcPrev.close) / btcPrev.close) * 100;
+                    btc_relative_strength = altcoin_pct - btc_pct;
+                } else {
+                    console.warn(`⚠️ [AiEngine] ${symbol} lệch nhịp BTC (${timeDiff}ms). Tạm bỏ qua RS.`);
                 }
             }
-        }
-        const btc_relative_strength = coin_pct_change - btc_pct_change;
 
-        // 5. ĐÓNG GÓI MẢNG 13 FEATURES (THỨ TỰ PHẢI KHỚP 100% VỚI PYTHON)
-        const features13 = Float32Array.from([
-            micro.ob_imb_top20 || 0,
-            micro.spread_close || 0,
-            micro.bid_vol_1pct || 0,
-            micro.ask_vol_1pct || 0,
-            micro.max_buy_trade || 0,
-            micro.max_sell_trade || 0,
-            micro.liq_long_vol || 0,
-            micro.liq_short_vol || 0,
-            macro.funding_rate || micro.funding_rate || 0,
-            taker_buy_ratio,
-            body_size,
-            wick_size,
-            btc_relative_strength
-        ]);
+            // 🟢 3. Xây dựng Mảng Đặc Trưng (Features) KHỚP 100% VỚI PYTHON
+            const features13 = [
+                current.body_size,
+                current.wick_size,
+                current.volume,
+                macro.funding_rate,
+                current.vpin || 0,            // Lấy từ current vì đã được tính ở luồng mảng Float32Array
+                micro.ob_imb_top20 || 0,      // Lấy từ Snapshot
+                micro.liq_long_vol || 0,      // 🚀 Lấy từ Snapshot: Lượng Long bị cháy
+                micro.liq_short_vol || 0,     // 🚀 Lấy từ Snapshot: Lượng Short bị cháy
+                micro.max_buy_trade || 0,     // 🚀 Lấy từ Snapshot: Lệnh Taker Buy lớn nhất
+                micro.max_sell_trade || 0,    // 🚀 Lấy từ Snapshot: Lệnh Taker Sell lớn nhất
+                btc_relative_strength,
+                micro.spread_close || 0,      // Lấy từ Snapshot
+                current.close
+            ];
 
-        const tensor = new ort.Tensor('float32', features13, [1, 13]);
-        let winProb = 0.5; // Mặc định là Nhãn 2 (Nhiễu)
-        
-        try {
+            // 🟢 4. Biên dịch sang Tensor và chạy suy luận (Inference)
+            const tensor = new ort.Tensor('float32', features13, [1, 13]);
+            let winProb = 0.5; // Mặc định là Nhãn 2 (Nhiễu)
+            
             const results = await this.sessions[symbol].run({ float_input: tensor });
             
-            // [VÁ LỖI ONNX] Đôi khi Python XGBoost xuất ra tên mảng khác nhau. Tự động nhận diện mảng xác suất.
+            // Tự động nhận diện output (Xử lý tùy biến của ONNX do Sklearn sinh ra)
             const outputName = this.sessions[symbol].outputNames[1] || 'probabilities';
             let probs = results[outputName]?.data || results.probabilities?.data || results.output_probability?.data;
 
@@ -146,12 +147,23 @@ class AiEngine {
                 } else if (prob_short > prob_noise && prob_short > prob_long) {
                     winProb = 1 - prob_short; // Đảo ngược để < 0.5 (VD: 1 - 0.65 = 0.35 -> Kích hoạt Short)
                 }
+            } else {
+                console.warn(`⚠️ [AiEngine] ONNX trả về mảng xác suất bất thường cho ${symbol}`);
             }
-        } catch (err) {
-            console.error(`❌ [AI ERROR] Lỗi dự đoán Tensor ${symbol}:`, err.message);
-        }
 
-        return { winProb: winProb, features: Array.from(features13) };
+            // 🟢 5. Gọi bộ não Quản Trị Rủi Ro (DeepThinker)
+            const DeepThinker = require('./DeepThinker'); // Import trễ để tránh vòng lặp tham chiếu nếu có
+            const deepThinkerResult = DeepThinker.evaluate(symbol, current.close, winProb, micro);
+
+            return {
+                prob: winProb,
+                thinker: deepThinkerResult
+            };
+
+        } catch (err) {
+            console.error(`❌ [AiEngine] Lỗi suy luận ${symbol}:`, err);
+            return null;
+        }
     }
 }
 
