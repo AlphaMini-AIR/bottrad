@@ -1,7 +1,7 @@
 /**
- * universal_tester.js - Đấu trường Sinh tử (Sandbox Forward Testing)
- * Chạy độc lập hoàn toàn, không dùng MongoDB.
- * Vốn 100$, Ký quỹ 1$, Đòn bẩy Động từ x1 đến x20.
+ * universal_tester_pro.js - PRO RESEARCH EDITION (Z-Score & Correlation Sync)
+ * Tái tạo chính xác 100% logic tiền xử lý của UniversalFurnacePro (Python).
+ * Chạy độc lập, không cần MongoDB.
  */
 require('dotenv').config();
 const fs = require('fs');
@@ -11,105 +11,136 @@ const ort = require('onnxruntime-node');
 
 // --- CẤU HÌNH THỬ NGHIỆM ---
 const TEST_COINS = ['NEARUSDT', 'FETUSDT', 'INJUSDT', 'RENDERUSDT', 'SUIUSDT', 'SEIUSDT', 'APTUSDT', 'ARBUSDT'];
-const WALLET_FILE = path.join(__dirname, 'sandbox_wallet.json');
-const TRADES_FILE = path.join(__dirname, 'sandbox_trades.json');
-const MODEL_PATH = path.join(__dirname, 'model_universal_pro.onnx'); // Trỏ đến file não dùng chung của bạn
+const DATA_DIR = path.join(__dirname, 'data');
+const WALLET_FILE = path.join(DATA_DIR, 'sandbox_wallet.json');
+const TRADES_FILE = path.join(DATA_DIR, 'trade_performance.json');
+const MARKET_LOG_FILE = path.join(DATA_DIR, 'market_experience.jsonl'); 
+const MODEL_PATH = path.join(__dirname, 'model_universal_pro.onnx'); // File ONNX 11 Features
 
-const FIXED_MARGIN = 1.0; // 1 USD mỗi lệnh
-const TAKER_FEE = 0.0004; // 0.04% phí sàn Binance
+const FIXED_MARGIN = 1.0; 
+const TAKER_FEE = 0.0004; // 0.04%
 
-class UniversalTester {
+// --- HÀM TOÁN HỌC (Giả lập Pandas trong Python) ---
+const getMean = (arr) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+const getStd = (arr, mean) => {
+    if (arr.length < 2) return 1e-8; // Tránh chia cho 0
+    const variance = arr.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / (arr.length - 1);
+    return Math.sqrt(variance) + 1e-8;
+};
+const getPearsonCorr = (xs, ys) => {
+    if (xs.length !== ys.length || xs.length === 0) return 0;
+    const meanX = getMean(xs), meanY = getMean(ys);
+    let num = 0, denX = 0, denY = 0;
+    for (let i = 0; i < xs.length; i++) {
+        const dx = xs[i] - meanX;
+        const dy = ys[i] - meanY;
+        num += dx * dy;
+        denX += dx * dx;
+        denY += dy * dy;
+    }
+    if (denX === 0 || denY === 0) return 0;
+    return num / Math.sqrt(denX * denY);
+};
+
+class UniversalTesterProMax {
     constructor() {
         this.wallet = 100.0;
         this.activeTrades = new Map();
-        this.marketBuffer = {}; // Lưu nến và micro data
+        this.marketBuffer = {};
         this.session = null;
-        
         this.initStorage();
     }
 
     initStorage() {
-        // Load hoặc tạo ví ảo 100$
+        if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
+
         if (fs.existsSync(WALLET_FILE)) {
             this.wallet = JSON.parse(fs.readFileSync(WALLET_FILE)).balance;
         } else {
             fs.writeFileSync(WALLET_FILE, JSON.stringify({ balance: this.wallet }));
         }
 
-        // Tạo file lịch sử nếu chưa có
-        if (!fs.existsSync(TRADES_FILE)) {
-            fs.writeFileSync(TRADES_FILE, '[]');
-        }
+        if (!fs.existsSync(TRADES_FILE)) fs.writeFileSync(TRADES_FILE, '[]');
 
-        // Khởi tạo buffer cho các coin + mỏ neo BTCUSDT
         ['BTCUSDT', ...TEST_COINS].forEach(sym => {
             this.marketBuffer[sym] = {
-                candles: [],
-                micro: { ob_imb: 0.5, spread: 0, liq_l: 0, liq_s: 0, max_b: 0, max_s: 0 }
+                candles: [], // Lưu trữ lịch sử 25 nến để tính Rolling
+                micro: { ob_imb_top20: 0.5, spread_close: 0, bid_vol_1pct: 0, ask_vol_1pct: 0, liq_long_vol: 0, liq_short_vol: 0 }
             };
         });
     }
 
     async loadModel() {
         if (!fs.existsSync(MODEL_PATH)) {
-            console.error(`❌ Không tìm thấy bộ não dùng chung tại ${MODEL_PATH}`);
+            console.error(`❌ Không tìm thấy model tại: ${MODEL_PATH}`);
             process.exit(1);
         }
-        this.session = await ort.InferenceSession.create(MODEL_PATH, { executionProviders: ['cpu'] });
-        console.log(`🧠 [AI] Đã nạp thành công bộ não Universal! Vốn hiện tại: $${this.wallet.toFixed(2)}`);
+        this.session = await ort.InferenceSession.create(MODEL_PATH);
+        console.log(`🧠 [AI] Đã nạp Model Tương quan Động (11 Features). Vốn: $${this.wallet.toFixed(2)}`);
+    }
+
+    logMarketExperience(symbol, features, label = 2) {
+        const entry = { timestamp: Date.now(), symbol, features, suggested_label: label };
+        fs.appendFileSync(MARKET_LOG_FILE, JSON.stringify(entry) + '\n');
     }
 
     startWebsocket() {
         const streams = [];
         ['BTCUSDT', ...TEST_COINS].forEach(sym => {
             const s = sym.toLowerCase();
-            streams.push(`${s}@kline_1m`);
-            streams.push(`${s}@aggTrade`);
-            streams.push(`${s}@bookTicker`); // Lấy Spread và Orderbook Imbalance nhẹ
+            streams.push(`${s}@kline_1m`, `${s}@aggTrade`, `${s}@depth20@100ms`);
         });
-        streams.push('!forceOrder@arr'); // Lấy thanh lý toàn thị trường
+        streams.push('!forceOrder@arr');
 
         const wsUrl = `wss://fstream.binance.com/stream?streams=${streams.join('/')}`;
         const ws = new WebSocket(wsUrl);
 
-        console.log(`📡 [WS] Đang nghe lén ${TEST_COINS.length} coin (Sandbox Mode)...`);
+        console.log(`📡 [WS-SYNC] Đang nghe lén FULL DATA của ${TEST_COINS.length} Altcoins + BTC...`);
 
         ws.on('message', (msg) => {
-            const data = JSON.parse(msg).data;
+            const raw = JSON.parse(msg);
+            const data = raw.data;
             if (!data) return;
 
+            const stream = raw.stream;
             const e = data.e;
+
             if (e === 'kline' && data.k.x) this.handleCandleClose(data);
-            else if (e === 'aggTrade') this.handleAggTrade(data);
-            else if (e === 'bookTicker') this.handleBookTicker(data);
+            else if (stream && stream.includes('@depth20')) this.handleDepth20(data);
             else if (e === 'forceOrder') this.handleForceOrder(data);
 
-            // Mồi tick giá vào luồng giám sát lệnh
             if (e === 'aggTrade') this.monitorActiveTrades(data.s.toUpperCase(), parseFloat(data.p));
         });
 
-        ws.on('close', () => {
-            console.log('⚠️ Mất kết nối WS. Bật lại sau 3s...');
-            setTimeout(() => this.startWebsocket(), 3000);
+        ws.on('close', () => setTimeout(() => this.startWebsocket(), 3000));
+        ws.on('error', (err) => console.error('WS Error:', err.message));
+    }
+
+    // --- THU THẬP VI CẤU TRÚC ---
+    handleDepth20(data) {
+        const sym = data.s.toUpperCase();
+        if (!this.marketBuffer[sym]) return;
+
+        let bidVol = 0, askVol = 0;
+        let bidVol1pct = 0, askVol1pct = 0;
+        const bestBid = data.b[0] ? parseFloat(data.b[0][0]) : 0;
+        const bestAsk = data.a[0] ? parseFloat(data.a[0][0]) : 0;
+
+        if (data.b) data.b.forEach(l => {
+            const vol = parseFloat(l[1]); bidVol += vol;
+            if (bestBid > 0 && parseFloat(l[0]) >= bestBid * 0.99) bidVol1pct += vol;
         });
-    }
+        if (data.a) data.a.forEach(l => {
+            const vol = parseFloat(l[1]); askVol += vol;
+            if (bestAsk > 0 && parseFloat(l[0]) <= bestAsk * 1.01) askVol1pct += vol;
+        });
 
-    // --- CÁC HÀM XỬ LÝ SỰ KIỆN DATA THU GỌN ---
-    handleAggTrade(data) {
-        const sym = data.s.toUpperCase();
-        if (!this.marketBuffer[sym]) return;
-        const val = parseFloat(data.p) * parseFloat(data.q);
-        if (data.m && val > this.marketBuffer[sym].micro.max_s) this.marketBuffer[sym].micro.max_s = val;
-        if (!data.m && val > this.marketBuffer[sym].micro.max_b) this.marketBuffer[sym].micro.max_b = val;
-    }
-
-    handleBookTicker(data) {
-        const sym = data.s.toUpperCase();
-        if (!this.marketBuffer[sym]) return;
-        const bidP = parseFloat(data.b), bidQ = parseFloat(data.B);
-        const askP = parseFloat(data.a), askQ = parseFloat(data.A);
-        this.marketBuffer[sym].micro.spread = askP - bidP;
-        this.marketBuffer[sym].micro.ob_imb = (bidP * bidQ) / ((bidP * bidQ) + (askP * askQ) + 0.0001);
+        const micro = this.marketBuffer[sym].micro;
+        const totalVol = bidVol + askVol;
+        if (totalVol > 0) micro.ob_imb_top20 = bidVol / totalVol;
+        if (bestBid && bestAsk) micro.spread_close = bestAsk - bestBid;
+        micro.bid_vol_1pct = bidVol1pct;
+        micro.ask_vol_1pct = askVol1pct;
     }
 
     handleForceOrder(data) {
@@ -120,146 +151,160 @@ class UniversalTester {
         else this.marketBuffer[sym].micro.liq_l += val;
     }
 
-    // --- XỬ LÝ LÕI KHI ĐÓNG NẾN (BÓP CÒ) ---
+    // --- LÕI TÍNH TOÁN & BÓP CÒ ---
     async handleCandleClose(data) {
         const sym = data.s.toUpperCase();
-        const candle = {
-            open: parseFloat(data.k.o), high: parseFloat(data.k.h),
-            low: parseFloat(data.k.l), close: parseFloat(data.k.c),
-            vol: parseFloat(data.k.v), quoteVol: parseFloat(data.k.q)
+        const k = data.k;
+        const currentOpen = parseFloat(k.o), currentClose = parseFloat(k.c);
+        
+        const candleData = {
+            open: currentOpen, high: parseFloat(k.h), low: parseFloat(k.l), close: currentClose,
+            quoteVol: parseFloat(k.q), takerBuyQuote: parseFloat(k.Q),
+            coin_pct: 0, btc_pct: 0, liq_net: 0
         };
-        
-        this.marketBuffer[sym].candles.push(candle);
-        if (this.marketBuffer[sym].candles.length > 20) this.marketBuffer[sym].candles.shift();
 
-        // 1. Chỉ phân tích nếu không phải BTC (BTC chỉ làm mỏ neo) và có đủ 20 nến tính ATR
-        if (sym === 'BTCUSDT' || this.marketBuffer[sym].candles.length < 20) return;
-        if (this.activeTrades.has(sym)) return; // Đang ôm lệnh thì không bóp cò thêm
-
-        // 2. Tính toán Features nhanh
-        const current = candle;
-        const prev = this.marketBuffer[sym].candles[this.marketBuffer[sym].candles.length - 2];
+        const history = this.marketBuffer[sym].candles;
+        if (history.length > 0) {
+            const prevClose = history[history.length - 1].close;
+            candleData.coin_pct = (currentClose - prevClose) / prevClose;
+        }
         
-        const btcCandles = this.marketBuffer['BTCUSDT'].candles;
-        let btc_rs = 0;
-        if (btcCandles.length >= 2) {
-            const btcCurr = btcCandles[btcCandles.length - 1];
-            const btcPrev = btcCandles[btcCandles.length - 2];
-            const coin_pct = (current.close - prev.close) / prev.close;
-            const btc_pct = (btcCurr.close - btcPrev.close) / btcPrev.close;
-            btc_rs = (coin_pct - btc_pct) * 100;
+        // Ghi nhận Liq Net của nến này
+        candleData.liq_net = this.marketBuffer[sym].micro.liq_long_vol - this.marketBuffer[sym].micro.liq_short_vol;
+
+        // Lưu nến vào mảng (giới hạn 25 nến)
+        history.push(candleData);
+        if (history.length > 25) history.shift();
+
+        // 🟢 NẾU LÀ BTC: Cập nhật % thay đổi vào mảng để Altcoin tính toán
+        if (sym === 'BTCUSDT') return;
+
+        // Bỏ qua nếu chưa đủ 20 nến để tính Rolling
+        if (history.length < 20 || this.marketBuffer['BTCUSDT'].candles.length < 20) return;
+
+        // Lấy lịch sử 20 nến gần nhất để tính toán
+        const rolling20 = history.slice(-20);
+        const btcRolling20 = this.marketBuffer['BTCUSDT'].candles.slice(-20);
+
+        // 1. Đồng bộ hóa btc_pct vào rolling20 của Altcoin
+        const coinPctArr = [], btcPctArr = [], quoteVolArr = [], liqNetArr = [];
+        let atrSum = 0;
+
+        for (let i = 0; i < 20; i++) {
+            coinPctArr.push(rolling20[i].coin_pct);
+            btcPctArr.push(btcRolling20[i].coin_pct); // Lấy phần trăm của BTC
+            quoteVolArr.push(rolling20[i].quoteVol);
+            liqNetArr.push(rolling20[i].liq_net);
+            atrSum += (rolling20[i].high - rolling20[i].low);
         }
 
-        const body_size = (Math.abs(current.close - current.open) / current.open) * 100;
-        const wick_size = (((current.high - current.low) - Math.abs(current.close - current.open)) / current.open) * 100;
+        // --- BẮT ĐẦU CHUẨN HÓA DỮ LIỆU (Giống hệt Python) ---
         const micro = this.marketBuffer[sym].micro;
+        const atr_20 = atrSum / 20;
 
-        // Mảng 13 features chuẩn (Tương thích với train_master)
+        // Chuẩn hóa Nến
+        const body_abs = Math.abs(currentClose - currentOpen);
+        const wick_abs = (parseFloat(k.h) - parseFloat(k.l)) - body_abs;
+        const body_to_atr = Math.min(body_abs / (atr_20 + 1e-8), 5.0);
+        const wick_to_atr = Math.min(wick_abs / (atr_20 + 1e-8), 5.0);
+
+        // Chuẩn hóa Z-Score Khối lượng
+        const volMean = getMean(quoteVolArr);
+        const volStd = getStd(quoteVolArr, volMean);
+        const vol_zscore = (candleData.quoteVol - volMean) / volStd;
+
+        // Chuẩn hóa Z-Score Thanh lý
+        const liqMean = getMean(liqNetArr);
+        const liqStd = getStd(liqNetArr, liqMean);
+        const liq_imbalance_zscore = (candleData.liq_net - liqMean) / liqStd;
+
+        // Tương quan & BTC
+        const taker_buy_ratio = candleData.takerBuyQuote / (candleData.quoteVol + 1e-8);
+        const btc_relative_strength = candleData.coin_pct - btcRolling20[19].coin_pct;
+        const btc_corr_20 = getPearsonCorr(coinPctArr, btcPctArr);
+
+        // MẢNG 11 FEATURES CHUẨN ĐỂ ĐƯA VÀO ONNX
         const features = [
-            body_size, wick_size, current.vol, 0, 0, // 0 = funding, 0 = vpin (Rút gọn cho Sandbox)
-            micro.ob_imb, micro.liq_l, micro.liq_s,
-            micro.max_b, micro.max_s, btc_rs, micro.spread, current.close
+            micro.ob_imb_top20,
+            micro.spread_close,
+            micro.bid_vol_1pct,
+            micro.ask_vol_1pct,
+            taker_buy_ratio,
+            body_to_atr,
+            wick_to_atr,
+            vol_zscore,
+            liq_imbalance_zscore,
+            btc_relative_strength,
+            btc_corr_20
         ];
 
-        // Reset Micro
-        this.marketBuffer[sym].micro = { ob_imb: 0.5, spread: 0, liq_l: 0, liq_s: 0, max_b: 0, max_s: 0 };
+        // Ghi Log phục vụ Train lại
+        this.logMarketExperience(sym, features);
 
-        // 3. Đưa vào Lò AI dự đoán
+        // Reset Micro
+        this.marketBuffer[sym].micro = { ob_imb_top20: 0.5, spread_close: 0, bid_vol_1pct: 0, ask_vol_1pct: 0, liq_long_vol: 0, liq_short_vol: 0 };
+
+        if (this.activeTrades.has(sym)) return;
+
+        // --- GỌI AI SUY LUẬN ---
         try {
-            const tensor = new ort.Tensor('float32', Float32Array.from(features), [1, 13]);
+            const tensor = new ort.Tensor('float32', Float32Array.from(features), [1, 11]);
             const results = await this.session.run({ float_input: tensor });
-            
-            const outName = this.session.outputNames[1] || 'probabilities';
-            const probs = results[outName]?.data;
+            const probs = results[this.session.outputNames[1]]?.data;
             if (!probs) return;
 
-            const p_short = probs[0], p_long = probs[1], p_noise = probs[2];
-            
-            let side = null;
-            let winProb = 0;
+            let side = null, winProb = 0;
+            if (probs[1] > 0.65) { side = 'LONG'; winProb = probs[1]; }
+            else if (probs[0] > 0.65) { side = 'SHORT'; winProb = probs[0]; }
 
-            if (p_long > 0.6 && p_long > p_noise) { side = 'LONG'; winProb = p_long; }
-            else if (p_short > 0.6 && p_short > p_noise) { side = 'SHORT'; winProb = p_short; }
+            if (side) {
+                // Đòn bẩy động & ATR Limit
+                let lev = 5;
+                if (winProb >= 0.8) lev = 20;
+                else if (winProb >= 0.75) lev = 15;
+                else if (winProb >= 0.7) lev = 10;
 
-            if (!side) return;
+                const slDist = atr_20 * 1.5;
+                const tpDist = atr_20 * 3.0;
+                const entry = currentClose;
+                
+                this.activeTrades.set(sym, {
+                    symbol: sym, side, entry, lev, winProb,
+                    sl: side === 'LONG' ? entry - slDist : entry + slDist,
+                    tp: side === 'LONG' ? entry + tpDist : entry - tpDist,
+                    trailingAct: side === 'LONG' ? entry + (tpDist * 0.5) : entry - (tpDist * 0.5),
+                    isTrailing: false, extremePrice: entry,
+                    margin: FIXED_MARGIN, size: (FIXED_MARGIN * lev) / entry,
+                    features_at_entry: features,
+                    time: new Date().toISOString()
+                });
 
-            // 4. LOGIC ĐÒN BẨY ĐỘNG (DYNAMIC LEVERAGE)
-            let lev = 5; 
-            if (winProb >= 0.8) lev = 20;
-            else if (winProb >= 0.7) lev = 15;
-            else if (winProb >= 0.65) lev = 10;
-
-            // 5. TÍNH ATR ĐỂ ĐẶT SL/TP
-            let atrSum = 0;
-            const history = this.marketBuffer[sym].candles;
-            for(let i=0; i < history.length - 1; i++) {
-                atrSum += (history[i].high - history[i].low);
+                console.log(`\n🎯 [AI FIRE] ${side} ${sym} | Độ tự tin: ${(winProb*100).toFixed(1)}% | Đòn bẩy: x${lev} | Giá: ${entry}`);
+                console.log(`   └ Tương quan BTC: ${btc_corr_20.toFixed(2)} | Đột biến Vol: ${vol_zscore.toFixed(2)} Z`);
             }
-            const atr = atrSum / 19;
-            
-            const slDist = atr * 1.5;
-            const tpDist = atr * 3.0;
-
-            const entry = current.close;
-            const sl = side === 'LONG' ? entry - slDist : entry + slDist;
-            const tp = side === 'LONG' ? entry + tpDist : entry - tpDist;
-            
-            // Điểm kích hoạt Trailing Stop (Đi được 50% quãng đường)
-            const trailingAct = side === 'LONG' ? entry + (tpDist * 0.5) : entry - (tpDist * 0.5);
-
-            // 6. KHỚP LỆNH ẢO
-            this.activeTrades.set(sym, {
-                symbol: sym, side, entry, sl, tp, lev, 
-                trailingAct, isTrailing: false, extremePrice: entry,
-                margin: FIXED_MARGIN, size: (FIXED_MARGIN * lev) / entry,
-                time: new Date().toISOString(), winProb
-            });
-
-            console.log(`\n🎯 [BÓP CÒ] ${side} ${sym} | Prob: ${(winProb*100).toFixed(1)}% | Đòn bẩy: x${lev} | Giá: ${entry}`);
-
         } catch (e) {
-            console.error('Lỗi suy luận ONNX:', e.message);
+            console.error(`❌ Lỗi suy luận ONNX ${sym}:`, e.message);
         }
     }
 
-    // --- LUỒNG GIÁM SÁT LỆNH ---
+    // --- GIÁM SÁT LỆNH ---
     monitorActiveTrades(symbol, currentPrice) {
         if (!this.activeTrades.has(symbol)) return;
         const trade = this.activeTrades.get(symbol);
-
-        let isClosed = false;
-        let closeReason = '';
+        let isClosed = false, closeReason = '';
 
         if (trade.side === 'LONG') {
             if (currentPrice > trade.extremePrice) trade.extremePrice = currentPrice;
-            
-            // Kích hoạt Trailing
-            if (!trade.isTrailing && currentPrice >= trade.trailingAct) {
-                trade.isTrailing = true;
-                console.log(`🔥 [TRAILING] ${symbol} đã kích hoạt bảo vệ lãi!`);
-            }
-
-            // Check SL / TP
+            if (!trade.isTrailing && currentPrice >= trade.trailingAct) { trade.isTrailing = true; console.log(`🔥 [TRAILING] ${symbol}`); }
             if (currentPrice <= trade.sl) { isClosed = true; closeReason = 'SL'; }
             else if (currentPrice >= trade.tp && !trade.isTrailing) { isClosed = true; closeReason = 'TP'; }
-            else if (trade.isTrailing) {
-                const dynamicSl = trade.extremePrice * (1 - 0.005); // Trailing 0.5%
-                if (currentPrice <= dynamicSl) { isClosed = true; closeReason = 'TRAILING_STOP'; }
-            }
-        } else { // SHORT
+            else if (trade.isTrailing && currentPrice <= trade.extremePrice * 0.995) { isClosed = true; closeReason = 'TRAILING_STOP'; }
+        } else {
             if (currentPrice < trade.extremePrice) trade.extremePrice = currentPrice;
-            
-            if (!trade.isTrailing && currentPrice <= trade.trailingAct) {
-                trade.isTrailing = true;
-                console.log(`🔥 [TRAILING] ${symbol} đã kích hoạt bảo vệ lãi!`);
-            }
-
+            if (!trade.isTrailing && currentPrice <= trade.trailingAct) { trade.isTrailing = true; console.log(`🔥 [TRAILING] ${symbol}`); }
             if (currentPrice >= trade.sl) { isClosed = true; closeReason = 'SL'; }
             else if (currentPrice <= trade.tp && !trade.isTrailing) { isClosed = true; closeReason = 'TP'; }
-            else if (trade.isTrailing) {
-                const dynamicSl = trade.extremePrice * (1 + 0.005);
-                if (currentPrice >= dynamicSl) { isClosed = true; closeReason = 'TRAILING_STOP'; }
-            }
+            else if (trade.isTrailing && currentPrice >= trade.extremePrice * 1.005) { isClosed = true; closeReason = 'TRAILING_STOP'; }
         }
 
         if (isClosed) this.closeTrade(trade, currentPrice, closeReason);
@@ -267,46 +312,21 @@ class UniversalTester {
 
     closeTrade(trade, exitPrice, reason) {
         this.activeTrades.delete(trade.symbol);
-
-        // Tính PnL thật (Quy ra USDT)
-        let rawPnl = 0;
-        if (trade.side === 'LONG') rawPnl = (exitPrice - trade.entry) * trade.size;
-        else rawPnl = (trade.entry - exitPrice) * trade.size;
-
-        // Tính phí sàn (Mở lệnh + Đóng lệnh) dựa trên Notional Size
-        const notionalSize = trade.margin * trade.lev; 
-        const fee = (notionalSize * TAKER_FEE) * 2; 
-
+        const rawPnl = trade.side === 'LONG' ? (exitPrice - trade.entry) * trade.size : (trade.entry - exitPrice) * trade.size;
+        const fee = (trade.margin * trade.lev * TAKER_FEE) * 2;
         const netPnl = rawPnl - fee;
         this.wallet += netPnl;
 
-        // Ghi log
-        const logData = {
-            symbol: trade.symbol,
-            side: trade.side,
-            lev: trade.lev,
-            prob: trade.winProb.toFixed(3),
-            reason: reason,
-            pnl: parseFloat(netPnl.toFixed(4)),
-            wallet: parseFloat(this.wallet.toFixed(2)),
-            time: new Date().toISOString()
-        };
-
-        // Ghi đè cập nhật Ví
-        fs.writeFileSync(WALLET_FILE, JSON.stringify({ balance: this.wallet }));
+        const logEntry = { ...trade, exit: exitPrice, close_reason: reason, fee: fee.toFixed(4), net_pnl: netPnl.toFixed(4), final_wallet: this.wallet.toFixed(2) };
         
-        // Ghi tiếp vào Lịch sử lệnh
         const history = JSON.parse(fs.readFileSync(TRADES_FILE));
-        history.push(logData);
+        history.push(logEntry);
         fs.writeFileSync(TRADES_FILE, JSON.stringify(history, null, 2));
+        fs.writeFileSync(WALLET_FILE, JSON.stringify({ balance: this.wallet }));
 
-        const icon = netPnl > 0 ? '✅' : '❌';
-        console.log(`${icon} [ĐÓNG LỆNH] ${trade.symbol} | Lý do: ${reason} | PnL: $${netPnl.toFixed(4)} | Tổng vốn: $${this.wallet.toFixed(2)}`);
+        console.log(`${netPnl > 0 ? '✅' : '❌'} [CLOSE] ${trade.symbol} | Lý do: ${reason} | PnL: $${netPnl.toFixed(4)} | Vốn: $${this.wallet.toFixed(2)}`);
     }
 }
 
-// KHỞI ĐỘNG
-const tester = new UniversalTester();
-tester.loadModel().then(() => {
-    tester.startWebsocket();
-});
+const tester = new UniversalTesterProMax();
+tester.loadModel().then(() => tester.startWebsocket());
