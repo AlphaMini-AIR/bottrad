@@ -13,7 +13,7 @@ class AiEngine {
         this.watchers = {};
         this.isReloading = {};
         // Cache danh sách các coin CHƯA CÓ model để không bị check ổ cứng liên tục (Gây lag VPS)
-        this.missingModels = new Set(); 
+        this.missingModels = new Set();
     }
 
     async init(symbol) {
@@ -22,12 +22,12 @@ class AiEngine {
 
         const modelPath = path.join(__dirname, `../../../model_v16_${symbol}.onnx`);
         const success = await this.loadModelSafe(symbol, modelPath);
-        
+
         if (success) {
             this.setupAtomicWatcher(symbol, modelPath);
         } else {
             // Ghi nhớ coin này chưa có file .onnx (Đang ở Tầng 3 thử việc)
-            this.missingModels.add(symbol); 
+            this.missingModels.add(symbol);
         }
     }
 
@@ -53,7 +53,7 @@ class AiEngine {
 
     setupAtomicWatcher(symbol, modelPath) {
         if (this.watchers[symbol]) return;
-        
+
         let debounceTimer;
         this.watchers[symbol] = fs.watch(path.dirname(modelPath), (eventType, filename) => {
             if (filename === path.basename(modelPath)) {
@@ -80,7 +80,7 @@ class AiEngine {
             const closedData = InMemoryBuffer.getLatestClosedCandle(symbol);
             if (!closedData || !closedData.micro) {
                 // Chưa có cây nến nào đóng hoàn toàn kể từ khi bật Bot
-                return null; 
+                return null;
             }
 
             const micro = closedData.micro;
@@ -93,14 +93,14 @@ class AiEngine {
             // 🟢 2. Tính toán BTC Relative Strength (Dùng cache chống Look-ahead)
             let btc_relative_strength = 0;
             const btcData = InMemoryBuffer.getHistoryObjects('BTCUSDT');
-            
+
             if (btcData && btcData.length >= 2) {
                 const btcCurrent = btcData[btcData.length - 1];
                 const btcPrev = btcData[btcData.length - 2];
-                
+
                 const timeDiff = Math.abs(current.openTime - btcCurrent.openTime);
                 // CHỐNG NHÌN TRỘM: Đảm bảo nến BTCUSDT kéo ra khớp hoàn toàn về Timestamp
-                if (timeDiff < 65000) { 
+                if (timeDiff < 65000) {
                     const altcoin_pct = ((current.close - prev.close) / prev.close) * 100;
                     const btc_pct = ((btcCurrent.close - btcPrev.close) / btcPrev.close) * 100;
                     btc_relative_strength = altcoin_pct - btc_pct;
@@ -129,9 +129,9 @@ class AiEngine {
             // 🟢 4. Biên dịch sang Tensor và chạy suy luận (Inference)
             const tensor = new ort.Tensor('float32', features13, [1, 13]);
             let winProb = 0.5; // Mặc định là Nhãn 2 (Nhiễu)
-            
+
             const results = await this.sessions[symbol].run({ float_input: tensor });
-            
+
             // Tự động nhận diện output (Xử lý tùy biến của ONNX do Sklearn sinh ra)
             const outputName = this.sessions[symbol].outputNames[1] || 'probabilities';
             let probs = results[outputName]?.data || results.probabilities?.data || results.output_probability?.data;
@@ -152,12 +152,14 @@ class AiEngine {
             }
 
             // 🟢 5. Gọi bộ não Quản Trị Rủi Ro (DeepThinker)
-            const DeepThinker = require('./DeepThinker'); // Import trễ để tránh vòng lặp tham chiếu nếu có
+            const DeepThinker = require('./DeepThinker');
             const deepThinkerResult = DeepThinker.evaluate(symbol, current.close, winProb, micro);
 
+            // BẮT BUỘC SỬA ĐOẠN NÀY ĐỂ MAIN.JS HỨNG ĐƯỢC ĐẦY ĐỦ VÀ ĐÚNG TÊN
             return {
-                prob: winProb,
-                thinker: deepThinkerResult
+                winProb: winProb,          // Đổi từ 'prob' thành 'winProb' để khớp với main.js
+                thinker: deepThinkerResult,
+                features: features13       // Bơm toàn bộ 13 features ra ngoài để lưu Trade Journal
             };
 
         } catch (err) {

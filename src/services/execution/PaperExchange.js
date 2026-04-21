@@ -11,9 +11,9 @@ const TIER_LIST_PATH = path.join(__dirname, '../../../tier_list.json');
 
 class PaperExchange {
     constructor() {
-        this.activeTrades = new Map(); 
-        this.TRADE_AMOUNT = 2.0; 
-        this.FEE_RATE = 0.0004; 
+        this.activeTrades = new Map();
+        this.TRADE_AMOUNT = 2.0;
+        this.FEE_RATE = 0.0004;
     }
 
     /**
@@ -45,12 +45,12 @@ class PaperExchange {
         try {
             const AccountModel = this.getAccountModel();
             let acc = await AccountModel.findOne({ accountId: 'MAIN_PAPER' });
-            
+
             if (!acc) {
-                acc = await AccountModel.create({ 
-                    accountId: 'MAIN_PAPER', 
-                    balance: 1000.0, 
-                    initialBalance: 1000.0 
+                acc = await AccountModel.create({
+                    accountId: 'MAIN_PAPER',
+                    balance: 1000.0,
+                    initialBalance: 1000.0
                 });
                 console.log('💰 [PaperExchange] Đã khởi tạo quỹ 1000$ tại DB TIER-1.');
             } else {
@@ -62,7 +62,7 @@ class PaperExchange {
         }
     }
 
-    async openTrade(symbol, side, limitPrice, slPrice, tpPrice, trailingParams, prob, reason) {
+    async openTrade(symbol, side, limitPrice, slPrice, tpPrice, trailingParams, prob, reason, features) {
         if (this.activeTrades.has(symbol)) return;
 
         const tradeSize = this.TRADE_AMOUNT / limitPrice;
@@ -72,7 +72,7 @@ class PaperExchange {
         try {
             const tierData = JSON.parse(fs.readFileSync(TIER_LIST_PATH, 'utf-8'));
             storageNode = tierData.storage_map[symbol] || 'scout';
-        } catch(e){}
+        } catch (e) { }
 
         const newTrade = {
             symbol,
@@ -85,10 +85,11 @@ class PaperExchange {
             margin: this.TRADE_AMOUNT,
             status: 'OPEN',
             isTrailingActive: false,
-            extremePrice: limitPrice, 
+            extremePrice: limitPrice,
             prob,
             reason,
-            storageNode, // Lưu nhãn DB vào RAM để đóng lệnh siêu tốc
+            features, // THÊM DÒNG NÀY: Lưu features vào RAM
+            storageNode,
             openTime: Date.now()
         };
 
@@ -159,7 +160,7 @@ class PaperExchange {
     async closeTrade(symbol, trade, closePrice, closeReason) {
         this.activeTrades.delete(symbol);
 
-        let pnl = (trade.side === 'LONG') 
+        let pnl = (trade.side === 'LONG')
             ? (closePrice - trade.entryPrice) * trade.size
             : (trade.entryPrice - closePrice) * trade.size;
 
@@ -178,6 +179,13 @@ class PaperExchange {
                 netPnl: netPnl,
                 outcome: netPnl > 0 ? 'WIN' : 'LOSS',
                 closeReason: closeReason,
+
+                // THÊM 4 TRƯỜNG NÀY ĐỂ ĐẨY VÀO MONGODB
+                slPrice: trade.slPrice,
+                tpPrice: trade.tpPrice,
+                winProb: trade.prob,
+                aiFeatures: trade.features,
+
                 openTime: trade.openTime,
                 closeTime: Date.now()
             });

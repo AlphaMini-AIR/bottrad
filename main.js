@@ -118,7 +118,11 @@ async function bootstrap() {
 
                 // THỰC THI GIẢ LẬP (PAPER ONLY)
                 if (decision.approved) {
-                    await PaperExchange.openTrade(symbol, decision.side, decision.limitPrice, decision.slPrice, decision.tpPrice, decision.trailingParams, decision.prob, decision.reason);
+                    await PaperExchange.openTrade(
+                        symbol, decision.side, decision.limitPrice,
+                        decision.slPrice, decision.tpPrice, decision.trailingParams,
+                        decision.prob, decision.reason, features
+                    );
                 }
             } catch (error) {
                 console.error(`❌ [ERROR] Vòng lặp AI ${symbol}:`, error.message);
