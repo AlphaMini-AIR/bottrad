@@ -1,15 +1,9 @@
+
 /**
- * src/services/execution/PaperExchange.js - V16.1 (Multi-DB Sniper Execution)
- */
-const { getDbConnection } = require('../../config/db');
-const PaperTradeSchema = require('../../models/PaperTrade');
-const PaperAccountSchema = require('../../models/PaperAccount');
-const fs = require('fs');
-const path = require('path');
-
-const TIER_LIST_PATH = path.join(__dirname, '../../../tier_list.json');
-
-class PaperExchange {
+ * src/services/execution/PaperExchange.js - V17.0 (Multi-DB Sniper Execution + Trajectory Tracker)
+ * Nhiệm vụ: Quản lý vốn, theo dõi lệnh, và chốt lời/cắt lỗ (Bao gồm Trailing Stop).
+ * Cập nhật V17: Ghi lại Quỹ đạo giá (Price Trajectory) để phục vụ việc Gán nhãn lại (Dynamic Re-labeling) ở Python.
+ */const { getDbConnection } = require('../../config/db');const PaperTradeSchema = require('../../models/PaperTrade');const PaperAccountSchema = require('../../models/PaperAccount');const fs = require('fs');const path = require('path');const TIER_LIST_PATH = path.join(__dirname, '../../../tier_list.json');class PaperExchange {
     constructor() {
         this.activeTrades = new Map();
         this.TRADE_AMOUNT = 2.0;
@@ -85,10 +79,16 @@ class PaperExchange {
             margin: this.TRADE_AMOUNT,
             status: 'OPEN',
             isTrailingActive: false,
-            extremePrice: limitPrice,
+            
+            extremePrice: limitPrice, // Biến cũ phục vụ logic Trailing Stop
+
+            // 🟢 TÍCH HỢP MỚI: Khởi tạo giá trị theo dõi Quỹ đạo giá (Price Trajectory)
+            highestSinceOpen: limitPrice, // Đỉnh quỹ đạo
+            lowestSinceOpen: limitPrice,  // Đáy quỹ đạo
+            
             prob,
             reason,
-            features, // THÊM DÒNG NÀY: Lưu features vào RAM
+            features, // Lưu features 13 thông số vào RAM để lúc đóng lệnh đẩy xuống DB
             storageNode,
             openTime: Date.now()
         };
@@ -107,6 +107,11 @@ class PaperExchange {
             let isClosed = false;
             let closePrice = 0;
             let closeReason = '';
+
+            // 🟢 TÍCH HỢP MỚI: CẬP NHẬT QUỸ ĐẠO GIÁ (O(1) Complexity)
+            // Ghi lại liên tục xem trong lúc lệnh mở, giá đã từng leo cao nhất/thấp nhất là bao nhiêu
+            if (currentPrice > trade.highestSinceOpen) trade.highestSinceOpen = currentPrice;
+            if (currentPrice < trade.lowestSinceOpen) trade.lowestSinceOpen = currentPrice;
 
             // 1. CẬP NHẬT ĐỈNH/ĐÁY CHO TRAILING STOP
             if (trade.side === 'LONG') {
@@ -180,7 +185,11 @@ class PaperExchange {
                 outcome: netPnl > 0 ? 'WIN' : 'LOSS',
                 closeReason: closeReason,
 
-                // THÊM 4 TRƯỜNG NÀY ĐỂ ĐẨY VÀO MONGODB
+                // 🟢 TÍCH HỢP MỚI: Đẩy thông tin Quỹ đạo giá xuống Database
+                // Dữ liệu này là nguồn sống để Python ban đêm quyết định Gán nhãn lại (Dynamic Relabeling)
+                highestDuringTrade: trade.highestSinceOpen,
+                lowestDuringTrade: trade.lowestSinceOpen,
+
                 slPrice: trade.slPrice,
                 tpPrice: trade.tpPrice,
                 winProb: trade.prob,
@@ -203,6 +212,4 @@ class PaperExchange {
             console.error(`❌ [PaperExchange] Lỗi khi đóng lệnh ${symbol}:`, err.message);
         }
     }
-}
-
-module.exports = new PaperExchange();
+}module.exports = new PaperExchange();

@@ -1,6 +1,7 @@
 /**
- * src/models/PaperTrade.js
- * Lưu trữ Lịch sử giao dịch để thống kê Win Rate và Phân tích AI
+ * src/models/PaperTrade.js - V17.0 (Trajectory Edition)
+ * Lưu trữ Lịch sử giao dịch để thống kê Win Rate và Phân tích AI.
+ * Tích hợp Quỹ đạo giá (Price Trajectory) phục vụ Dynamic Re-labeling.
  */
 const mongoose = require('mongoose');
 
@@ -40,6 +41,19 @@ const paperTradeSchema = new mongoose.Schema({
         type: String,
         required: true // HARD_SL, HARD_TP, hoặc TRAILING_STOP
     },
+
+    // ==========================================================
+    // 🟢 DỮ LIỆU SỐNG CÒN CHO PYTHON GÁN NHÃN LẠI (RE-LABELING)
+    // ==========================================================
+    highestDuringTrade: { 
+        type: Number, 
+        required: false // Để false để tương thích ngược với các lệnh cũ chưa có tính năng này
+    },
+    lowestDuringTrade: { 
+        type: Number, 
+        required: false 
+    },
+
     openTime: {
         type: Date,
         required: true
@@ -51,7 +65,14 @@ const paperTradeSchema = new mongoose.Schema({
     slPrice: { type: Number }, // Lưu mốc Stoploss ban đầu
     tpPrice: { type: Number }, // Lưu mốc Take Profit ban đầu
     winProb: { type: Number }, // Xác suất thắng mà AI dự đoán lúc vào lệnh
-    aiFeatures: { type: Object } // LƯU TRẠNG THÁI NÃO BỘ (Tensor 13-20 features) để Python học lại
+    
+    // ==========================================================
+    // 🧠 LƯU TRẠNG THÁI NÃO BỘ (FEATURES SNAPSHOT)
+    // ==========================================================
+    aiFeatures: { 
+        type: [Number], // Chuyển từ Object sang [Number] để lưu chuẩn mảng 13 thông số Float32
+        default: [] 
+    } 
 });
 
-module.exports = paperTradeSchema
+module.exports = paperTradeSchema;

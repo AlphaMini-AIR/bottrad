@@ -1,23 +1,66 @@
 /**
- * src/services/ai/AiEngine.js - V16.2 (Production Ready + Snapshot Guard)
- * Tối ưu hóa mỏ neo BTC, Xử lý linh hoạt Output ONNX & Vá lỗi Mù Dữ Liệu
+ * src/services/ai/AiEngine.js - V17.0 (DUAL-LOOP ARCHITECTURE)
+ * Hỗ trợ song song 2 luồng: Não Cụ Thể (Tầng 1,2) & Não Tập Trung (Tầng 3 Scout)
+ * Tích hợp Sparsity-aware (khiên NaN chuẩn IEEE 754) và Hot-Reload.
  */
+require('dotenv').config();
 const ort = require('onnxruntime-node');
-const path = require('path');
 const fs = require('fs');
-const InMemoryBuffer = require('../data/InMemoryBuffer'); // Dùng để gọi data BTC và Snapshot Micro
+const path = require('path');
+const InMemoryBuffer = require('../data/InMemoryBuffer');
+const DeepThinker = require('./DeepThinker'); // KHÔI PHỤC DEEPTHINKER
 
 class AiEngine {
     constructor() {
-        this.sessions = {};
+        this.sessions = {}; // Lưu model riêng từng coin
         this.watchers = {};
         this.isReloading = {};
-        // Cache danh sách các coin CHƯA CÓ model để không bị check ổ cứng liên tục (Gây lag VPS)
-        this.missingModels = new Set();
+        this.missingModels = new Set(); // Cache các coin chưa có model riêng
+
+        // Cấu hình Universal Model
+        this.UNIVERSAL_MODEL_PATH = path.resolve(__dirname, '../../../Universal_Scout.onnx');
+        this.loadUniversalModel();
+        this.watchUniversalModel();
     }
 
+    // =========================================================================
+    // 🧠 LUỒNG 1: QUẢN LÝ NÃO TẬP TRUNG (UNIVERSAL MODEL CHO SCOUT)
+    // =========================================================================
+    async loadUniversalModel() {
+        try {
+            if (fs.existsSync(this.UNIVERSAL_MODEL_PATH)) {
+                const options = { executionProviders: ['cpu'], graphOptimizationLevel: 'all' };
+                const session = await ort.InferenceSession.create(this.UNIVERSAL_MODEL_PATH, options);
+                this.sessions['UNIVERSAL'] = session;
+                console.log(`🌍 [AiEngine] Đã nạp Universal Model cho các coin Scout (Tầng 3)`);
+            } else {
+                console.warn(`⚠️ [AiEngine] Chưa có Universal_Scout.onnx. Đang chờ luồng Python...`);
+            }
+        } catch (error) {
+            console.error(`❌ [AiEngine] Lỗi nạp Universal Model:`, error.message);
+        }
+    }
+
+    watchUniversalModel() {
+        const modelDir = path.dirname(this.UNIVERSAL_MODEL_PATH);
+        if (!fs.existsSync(modelDir)) return;
+
+        fs.watch(modelDir, (eventType, filename) => {
+            if (filename === 'Universal_Scout.onnx' && !this.isReloading['UNIVERSAL']) {
+                this.isReloading['UNIVERSAL'] = true;
+                setTimeout(async () => {
+                    console.log(`🔄 [AiEngine] Cập nhật Universal Model mới. Đang Hot-Reload...`);
+                    await this.loadUniversalModel();
+                    this.isReloading['UNIVERSAL'] = false;
+                }, 1000); // Đợi 1s để Python Atomic Write ghi xong
+            }
+        });
+    }
+
+    // =========================================================================
+    // 🧠 LUỒNG 2: QUẢN LÝ NÃO CỤ THỂ (SPECIFIC MODELS CHO TẦNG 1, 2)
+    // =========================================================================
     async init(symbol) {
-        // Nếu đã xác nhận là không có model từ trước, bỏ qua luôn để tiết kiệm tài nguyên
         if (this.sessions[symbol] || this.missingModels.has(symbol)) return;
 
         const modelPath = path.join(__dirname, `../../../model_v16_${symbol}.onnx`);
@@ -26,8 +69,7 @@ class AiEngine {
         if (success) {
             this.setupAtomicWatcher(symbol, modelPath);
         } else {
-            // Ghi nhớ coin này chưa có file .onnx (Đang ở Tầng 3 thử việc)
-            this.missingModels.add(symbol);
+            this.missingModels.add(symbol); // Đánh dấu để lần sau không quét ổ cứng nữa
         }
     }
 
@@ -37,10 +79,9 @@ class AiEngine {
 
         try {
             if (fs.existsSync(modelPath)) {
-                // Dùng CPU backend để đảm bảo tương thích đa nền tảng VPS
                 const session = await ort.InferenceSession.create(modelPath, { executionProviders: ['cpu'] });
                 this.sessions[symbol] = session;
-                console.log(`🤖 [AiEngine] Đã nạp Model V16 cho ${symbol}`);
+                console.log(`🤖 [AiEngine] Đã nạp Model riêng cho ${symbol}`);
                 return true;
             }
         } catch (err) {
@@ -53,117 +94,118 @@ class AiEngine {
 
     setupAtomicWatcher(symbol, modelPath) {
         if (this.watchers[symbol]) return;
-
         let debounceTimer;
         this.watchers[symbol] = fs.watch(path.dirname(modelPath), (eventType, filename) => {
             if (filename === path.basename(modelPath)) {
                 clearTimeout(debounceTimer);
                 debounceTimer = setTimeout(async () => {
-                    console.log(`🔄 [AiEngine] Phát hiện Model ${symbol} mới. Đang nạp lại (Hot-Reload)...`);
+                    console.log(`🔄 [AiEngine] Hot-Reload Model riêng cho ${symbol}...`);
                     await this.loadModelSafe(symbol, modelPath);
-                }, 2000); // Trì hoãn 2s để file copy hoàn tất tránh lỗi gián đoạn
+                }, 1000);
             }
         });
     }
 
-    async predict(symbol, historyCandles) {
-        // Cần ít nhất 2 nến để so sánh (current và prev)
-        if (!this.sessions[symbol] || !historyCandles || historyCandles.length < 2) return null;
+    // =========================================================================
+    // 🎯 ĐỘNG CƠ DỰ ĐOÁN CHÍNH (PREDICTION ENGINE)
+    // =========================================================================
+    async predict(historyCandles, symbol) { // LƯU Ý: Khớp tham số với main.js gọi vào
+        if (!historyCandles || historyCandles.length < 2) return null;
+
+        // XÁC ĐỊNH NÃO: Ưu tiên Não Cụ Thể, nếu không có thì dùng Não Tập Trung (Universal)
+        const session = this.sessions[symbol] || this.sessions['UNIVERSAL'];
+        const isUniversal = !this.sessions[symbol];
+
+        if (!session) return null; // AI chưa sẵn sàng
 
         try {
             const current = historyCandles[historyCandles.length - 1];
             const prev = historyCandles[historyCandles.length - 2];
 
-            // =========================================================================
-            // 🟢 [BẢN VÁ LỖI MÙ DỮ LIỆU]: Lấy Snapshot chốt sổ từ InMemoryBuffer
-            // =========================================================================
             const closedData = InMemoryBuffer.getLatestClosedCandle(symbol);
-            if (!closedData || !closedData.micro) {
-                // Chưa có cây nến nào đóng hoàn toàn kể từ khi bật Bot
-                return null;
-            }
+            const micro = (closedData && closedData.micro) ? closedData.micro : {};
+            const macro = (closedData && closedData.macro) ? closedData.macro : {};
 
-            const micro = closedData.micro;
-            const macro = closedData.macro || { funding_rate: 0 };
+            // 🟢 1. Feature Engineering: Tính toán Nến
+            const body_size = current.open > 0 ? (Math.abs(current.close - current.open) / current.open) * 100 : 0;
+            const wick_size = current.open > 0 ? (((current.high - current.low) - Math.abs(current.close - current.open)) / current.open) * 100 : 0;
+            const taker_buy_ratio = (current.volume > 0 && current.takerBuyBase) ? (current.takerBuyBase / current.volume) : NaN;
 
-            // 🟢 1. Feature Engineering cơ bản
-            current.body_size = (Math.abs(current.close - current.open) / current.open) * 100;
-            current.wick_size = (((current.high - current.low) - Math.abs(current.close - current.open)) / current.open) * 100;
-
-            // 🟢 2. Tính toán BTC Relative Strength (Dùng cache chống Look-ahead)
-            let btc_relative_strength = 0;
+            // 🟢 2. Feature Engineering: Khôi phục logic Mỏ neo BTCUSDT
+            let btc_relative_strength = NaN;
             const btcData = InMemoryBuffer.getHistoryObjects('BTCUSDT');
-
             if (btcData && btcData.length >= 2) {
                 const btcCurrent = btcData[btcData.length - 1];
                 const btcPrev = btcData[btcData.length - 2];
-
-                const timeDiff = Math.abs(current.openTime - btcCurrent.openTime);
-                // CHỐNG NHÌN TRỘM: Đảm bảo nến BTCUSDT kéo ra khớp hoàn toàn về Timestamp
-                if (timeDiff < 65000) {
+                const timeDiff = Math.abs((current.openTime || current.t) - (btcCurrent.openTime || btcCurrent.t));
+                
+                if (timeDiff < 65000 && prev.close > 0 && btcPrev.close > 0) {
                     const altcoin_pct = ((current.close - prev.close) / prev.close) * 100;
                     const btc_pct = ((btcCurrent.close - btcPrev.close) / btcPrev.close) * 100;
                     btc_relative_strength = altcoin_pct - btc_pct;
-                } else {
-                    console.warn(`⚠️ [AiEngine] ${symbol} lệch nhịp BTC (${timeDiff}ms). Tạm bỏ qua RS.`);
                 }
             }
 
-            // 🟢 3. Xây dựng Mảng Đặc Trưng (Features) KHỚP 100% VỚI PYTHON
-            const features13 = [
-                current.body_size,
-                current.wick_size,
-                current.volume,
-                macro.funding_rate,
-                current.vpin || 0,            // Lấy từ current vì đã được tính ở luồng mảng Float32Array
-                micro.ob_imb_top20 || 0,      // Lấy từ Snapshot
-                micro.liq_long_vol || 0,      // 🚀 Lấy từ Snapshot: Lượng Long bị cháy
-                micro.liq_short_vol || 0,     // 🚀 Lấy từ Snapshot: Lượng Short bị cháy
-                micro.max_buy_trade || 0,     // 🚀 Lấy từ Snapshot: Lệnh Taker Buy lớn nhất
-                micro.max_sell_trade || 0,    // 🚀 Lấy từ Snapshot: Lệnh Taker Sell lớn nhất
-                btc_relative_strength,
-                micro.spread_close || 0,      // Lấy từ Snapshot
-                current.close
+            // 🟢 3. Xây dựng Mảng 13 Đặc trưng (Khớp Python `incremental_trainer.py`)
+            const rawFeatures = [
+                micro.ob_imb_top20 ?? NaN,
+                micro.spread_close ?? NaN,
+                micro.bid_vol_1pct ?? NaN,
+                micro.ask_vol_1pct ?? NaN,
+                micro.max_buy_trade ?? NaN,
+                micro.max_sell_trade ?? NaN,
+                micro.liq_long_vol ?? NaN,
+                micro.liq_short_vol ?? NaN,
+                macro.funding_rate ?? NaN,
+                taker_buy_ratio,
+                body_size,
+                wick_size,
+                btc_relative_strength
             ];
 
-            // 🟢 4. Biên dịch sang Tensor và chạy suy luận (Inference)
-            const tensor = new ort.Tensor('float32', features13, [1, 13]);
-            let winProb = 0.5; // Mặc định là Nhãn 2 (Nhiễu)
+            // 🟢 4. Khiên NaN (Sparsity-aware Trigger)
+            const sanitizedFeatures = rawFeatures.map(val => {
+                if (val === undefined || val === null || Number.isNaN(val)) return Number.NaN;
+                return parseFloat(val);
+            });
 
-            const results = await this.sessions[symbol].run({ float_input: tensor });
+            // 🟢 5. Chạy ONNX Model
+            const tensor = new ort.Tensor('float32', Float32Array.from(sanitizedFeatures), [1, 13]);
+            let feeds = {};
+            feeds[session.inputNames[0]] = tensor;
+            
+            const results = await session.run(feeds);
+            
+            // Xử lý output (Đảm bảo tương thích cả model cũ và mới)
+            const outputName = session.outputNames.includes('probabilities') ? 'probabilities' : session.outputNames[1] || session.outputNames[0];
+            const probsObj = results[outputName]?.data || results.probabilities?.data || results[session.outputNames[0]].data;
+            
+            let winProb = 0.5; // Mặc định nhiễu
+            if (probsObj && probsObj.length >= 3) {
+                const prob_short = probsObj[0];
+                const prob_long = probsObj[1];
+                const prob_noise = probsObj[2];
 
-            // Tự động nhận diện output (Xử lý tùy biến của ONNX do Sklearn sinh ra)
-            const outputName = this.sessions[symbol].outputNames[1] || 'probabilities';
-            let probs = results[outputName]?.data || results.probabilities?.data || results.output_probability?.data;
-
-            if (probs && probs.length >= 3) {
-                const prob_short = probs[0]; // Xác suất giảm (Short)
-                const prob_long = probs[1];  // Xác suất tăng (Long)
-                const prob_noise = probs[2]; // Xác suất nhiễu
-
-                // Truyền thẳng xác suất Long/Short nếu nó vượt trội hơn tỷ lệ Nhiễu
                 if (prob_long > prob_noise && prob_long > prob_short) {
-                    winProb = prob_long; // (VD: 0.65 -> Sẽ kích hoạt Long ở DeepThinker)
+                    winProb = prob_long; 
                 } else if (prob_short > prob_noise && prob_short > prob_long) {
-                    winProb = 1 - prob_short; // Đảo ngược để < 0.5 (VD: 1 - 0.65 = 0.35 -> Kích hoạt Short)
+                    winProb = 1 - prob_short; // Ép về < 0.5 để kích hoạt Short
                 }
-            } else {
-                console.warn(`⚠️ [AiEngine] ONNX trả về mảng xác suất bất thường cho ${symbol}`);
             }
 
-            // 🟢 5. Gọi bộ não Quản Trị Rủi Ro (DeepThinker)
-            const DeepThinker = require('./DeepThinker');
-            const deepThinkerResult = DeepThinker.evaluate(symbol, current.close, winProb, micro);
+            // 🟢 6. KHÔI PHỤC: Gọi bộ não DeepThinker để quản lý rủi ro
+            const thinkerResult = DeepThinker.evaluate(symbol, current.close, winProb, micro);
 
-            // BẮT BUỘC SỬA ĐOẠN NÀY ĐỂ MAIN.JS HỨNG ĐƯỢC ĐẦY ĐỦ VÀ ĐÚNG TÊN
+            // KHÔI PHỤC Return chuẩn để main.js không bị crash
             return {
-                winProb: winProb,          // Đổi từ 'prob' thành 'winProb' để khớp với main.js
-                thinker: deepThinkerResult,
-                features: features13       // Bơm toàn bộ 13 features ra ngoài để lưu Trade Journal
+                winProb: winProb,
+                thinker: thinkerResult,
+                features: sanitizedFeatures,
+                isUniversal: isUniversal // Gửi kèm cờ hiệu để PaperExchange biết đang xài model nào
             };
 
         } catch (err) {
-            console.error(`❌ [AiEngine] Lỗi suy luận ${symbol}:`, err);
+            console.error(`❌ [AiEngine] Lỗi suy luận ${symbol}:`, err.message);
             return null;
         }
     }
