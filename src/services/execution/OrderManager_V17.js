@@ -29,7 +29,6 @@ async function initAI() {
     try {
         aiSession = await ort.InferenceSession.create(modelPath);
         aiInputName = aiSession.inputNames[0];
-        // Giả định output cuối cùng là tensor xác suất (2 lớp: SHORT/LONG)
         aiOutputName = aiSession.outputNames[aiSession.outputNames.length - 1];
         console.log(`🧠 [AI ENGINE] Online. Input: "${aiInputName}", Output: "${aiOutputName}"`);
     } catch (e) {
@@ -58,10 +57,11 @@ setInterval(async () => {
     try {
         const scores = await dataClient.hgetall(config.CHANNELS.MACRO_SCORES || 'macro:scores');
         for (const [sym, score] of Object.entries(scores)) {
-            macroCache.set(sym.toUpperCase(), parseFloat(score)); // Chuẩn hóa key
+            macroCache.set(sym.toUpperCase(), parseFloat(score));
         }
+        console.log(`🔄 [MACRO CACHE] Đã cập nhật ${macroCache.size} coin`);
     } catch (e) {
-        // Bỏ qua lỗi tạm thời
+        console.error("⚠️ [REDIS] Lỗi đồng bộ Macro Cache:", e.message);
     }
 }, 5000);
 
@@ -89,6 +89,8 @@ function simulateLatency(callback) {
 subClient.psubscribe(config.CHANNELS.FEATURES);
 subClient.subscribe(config.CHANNELS.CANDIDATES);
 
+let featureCount = 0; // Đếm số lần nhận feature để log định kỳ
+
 subClient.on('pmessageBuffer', async (pattern, channel, messageBuffer) => {
     let feature;
     try { feature = decode(messageBuffer); } catch (e) { return; }
@@ -99,20 +101,35 @@ subClient.on('pmessageBuffer', async (pattern, channel, messageBuffer) => {
     const currentPrice = feature.best_ask || feature.last_price || 0;
     if (currentPrice === 0) return;
 
+    // LOG TỔNG QUAN MỖI 10 FEATURE
+    featureCount++;
+    if (featureCount % 10 === 0) {
+        console.log(`\n📊 [DEBUG] Đã nhận ${featureCount} features. MacroCache: ${macroCache.size} coin. ActiveTrades: ${activeTrades.size}`);
+    }
+
+    // LOG CHI TIẾT FEATURE HIỆN TẠI
+    console.log(`[DEBUG] 🎯 Feature ${symbol} | warm=${feature.is_warm} | macro=${macroCache.get(symbol) || 'N/A'} | price=${currentPrice.toFixed(6)}`);
+
     latestFeatures.set(symbol, feature);
     
     // Cập nhật sàn ảo và kiểm tra lệnh đã đóng
     exchange.updateTick(symbol, currentPrice);
 
     if (activeTrades.has(symbol) && !exchange.hasActivePosition(symbol)) {
+        console.log(`[DEBUG] ⚠️ ${symbol} có trong activeTrades nhưng không có trong PaperExchange -> xóa`);
         activeTrades.delete(symbol);
         syncStream(symbol, 'EXIT_TRADE');
         logThought(symbol, "📉 Lệnh đã đóng trên sàn ảo (SL/Liq). Ngắt stream.");
+        return;
     }
 
     // Gác cổng rủi ro
-    if (riskGuard.isHalted()) return;
+    if (riskGuard.isHalted()) {
+        console.log(`[DEBUG] ⛔ RiskGuard HALTED`);
+        return;
+    }
     if (!riskGuard.checkDrawdown(exchange.getWalletBalance())) {
+        console.log(`[DEBUG] 🚨 KILLSWITCH - Đóng tất cả lệnh`);
         for (const [s, t] of activeTrades.entries()) {
             await exchange.closeTrade(s, currentPrice, 'KILLSWITCH_DRAWDOWN');
             syncStream(s, 'EXIT_TRADE');
@@ -128,10 +145,12 @@ subClient.on('pmessageBuffer', async (pattern, channel, messageBuffer) => {
         const trade = activeTrades.get(symbol);
         if (currentPrice > trade.highestPrice) trade.highestPrice = currentPrice;
 
-        const atrPercent = feature.ATR14 || 0.002; // Fallback 0.2% nếu feed không gửi
+        const atrPercent = feature.ATR14 || 0.002;
         const stopMultiplier = (feature.MFA > 0 ? 3.5 : 1.2);
         const stopDistance = atrPercent * stopMultiplier;
         const slPrice = trade.highestPrice * (1 - stopDistance);
+
+        console.log(`[DEBUG] 📉 ${symbol} Trailing: highest=${trade.highestPrice.toFixed(6)} sl=${slPrice.toFixed(6)} MFA=${feature.MFA?.toFixed(3)}`);
 
         if (currentPrice <= slPrice || (feature.MFA && feature.MFA < -1.8)) {
             const reason = (feature.MFA < -1.8) ? 'Gia tốc xả mạnh' : `Trailing Stop (${(stopDistance*100).toFixed(2)}%)`;
@@ -140,6 +159,7 @@ subClient.on('pmessageBuffer', async (pattern, channel, messageBuffer) => {
             await exchange.closeTrade(symbol, currentPrice, reason);
             activeTrades.delete(symbol);
             syncStream(symbol, 'EXIT_TRADE');
+            console.log(`[DEBUG] 🛑 Đã đóng lệnh ${symbol}`);
         }
         return;
     }
@@ -149,11 +169,20 @@ subClient.on('pmessageBuffer', async (pattern, channel, messageBuffer) => {
     // ------------------------------------------
     
     // Fast Macro Check
-    const macroScore = macroCache.get(symbol) || 0;
-    if (macroScore < (config.MACRO_THRESHOLD || 0.6)) return;
+    const macroScore = macroCache.get(symbol);
+    if (!macroScore || macroScore < (config.MACRO_THRESHOLD || 0.6)) {
+        console.log(`[DEBUG] ❌ ${symbol} bị bỏ qua vì Macro score = ${macroScore || 'chưa có'} (threshold: ${config.MACRO_THRESHOLD || 0.6})`);
+        return;
+    }
 
-    if (pendingOrders.has(symbol) || pendingOrders.size >= MAX_PENDING_ORDERS) return;
-    if (!riskGuard.canOpenNewTrade(activeTrades.size, pendingOrders.size)) return;
+    if (pendingOrders.has(symbol) || pendingOrders.size >= MAX_PENDING_ORDERS) {
+        console.log(`[DEBUG] ⏳ ${symbol} đã có pending hoặc đầy (pending: ${pendingOrders.size}/${MAX_PENDING_ORDERS})`);
+        return;
+    }
+    if (!riskGuard.canOpenNewTrade(activeTrades.size, pendingOrders.size)) {
+        console.log(`[DEBUG] ⛔ ${symbol} bị riskGuard từ chối mở lệnh mới (active: ${activeTrades.size}, pending: ${pendingOrders.size})`);
+        return;
+    }
 
     try {
         const inputData = Float32Array.from([
@@ -171,7 +200,9 @@ subClient.on('pmessageBuffer', async (pattern, channel, messageBuffer) => {
         const output = await aiSession.run(feeds);
         
         const probs = output[aiOutputName].data;
-        const probLong = probs[1]; // Xác suất lớp LONG
+        const probLong = probs[1];
+
+        console.log(`[DEBUG] 🤖 ${symbol} AI probLong=${(probLong*100).toFixed(1)}% (Macro: ${macroScore})`);
 
         if (probLong >= 0.75) {
             logThought(symbol, `🧠 [AI] Tín hiệu LONG: ${(probLong*100).toFixed(1)}% (Macro: ${macroScore})`);
@@ -184,6 +215,8 @@ subClient.on('pmessageBuffer', async (pattern, channel, messageBuffer) => {
             const ofi = feature.OFI || 0;
             const useMarket = (vpin > 0.8 || ofi > 15);
 
+            console.log(`[DEBUG] 🚀 ${symbol} sẵn sàng mở lệnh LONG, lev=${finalLev}x, market=${useMarket}`);
+
             simulateLatency(async () => {
                 const freshAsk = latestFeatures.get(symbol)?.best_ask || currentPrice;
 
@@ -193,20 +226,25 @@ subClient.on('pmessageBuffer', async (pattern, channel, messageBuffer) => {
                         activeTrades.set(symbol, { highestPrice: freshAsk, type: 'LONG' });
                         syncStream(symbol, 'ENTER_TRADE');
                         logThought(symbol, `⚡ [EXEC] MARKET LONG @ ${freshAsk.toFixed(4)}`);
+                        console.log(`[DEBUG] ✅ Đã mở MARKET LONG ${symbol}`);
                     }
                 } else {
                     pendingOrders.set(symbol, { targetPrice: freshAsk, leverage: finalLev, prob: probLong, ts: Date.now() });
                     logThought(symbol, `🛡️ [EXEC] Đặt LIMIT @ ${freshAsk.toFixed(4)}`);
+                    console.log(`[DEBUG] 📝 Đã đặt LIMIT ${symbol} @ ${freshAsk.toFixed(4)}`);
                 }
             });
         }
-    } catch (err) { /* Bỏ qua lỗi inference để giữ luồng chạy */ }
+    } catch (err) {
+        console.error(`[DEBUG] ❌ Lỗi inference ${symbol}:`, err.message);
+    }
 
     // ------------------------------------------
     // NHÁNH C: KHỚP LỆNH LIMIT CHỜ
     // ------------------------------------------
     if (pendingOrders.has(symbol)) {
         const order = pendingOrders.get(symbol);
+        console.log(`[DEBUG] 🕒 ${symbol} đang chờ limit @ ${order.targetPrice.toFixed(6)} (current ask: ${currentPrice.toFixed(6)})`);
         if (currentPrice <= order.targetPrice) {
             logThought(symbol, `🎯 [MATCH] Khớp vùng chờ ${order.targetPrice.toFixed(4)}`);
             
@@ -214,6 +252,7 @@ subClient.on('pmessageBuffer', async (pattern, channel, messageBuffer) => {
             if (success) {
                 activeTrades.set(symbol, { highestPrice: order.targetPrice, type: 'LONG' });
                 syncStream(symbol, 'ENTER_TRADE');
+                console.log(`[DEBUG] ✅ Đã khớp LIMIT ${symbol}`);
             }
             pendingOrders.delete(symbol);
         }
@@ -225,8 +264,12 @@ subClient.on('message', (channel, message) => {
     if (channel === config.CHANNELS.CANDIDATES) {
         try {
             const data = JSON.parse(message);
-            logThought(data.symbol, `📡 [RADAR] Nhận ứng viên. Đang đợi dữ liệu Feed...`);
-        } catch (e) {}
+            const symbol = data.symbol || 'UNKNOWN';
+            console.log(`[DEBUG] 📡 Nhận candidate từ Radar: ${symbol}`);
+            logThought(symbol, `📡 [RADAR] Nhận ứng viên. Đang đợi dữ liệu Feed...`);
+        } catch (e) {
+            console.error("[DEBUG] Lỗi parse candidate:", e.message);
+        }
     }
 });
 
@@ -236,6 +279,7 @@ setInterval(() => {
     for (const [sym, order] of pendingOrders.entries()) {
         if (now - order.ts > 10000) {
             pendingOrders.delete(sym);
+            console.log(`[DEBUG] ⏰ Hủy lệnh limit treo ${sym} (quá 10s)`);
         }
     }
 }, 1000);
