@@ -230,6 +230,8 @@ class FeedHandler:
                 try:
                     channel = message['channel'].decode('utf-8')
                     data = json.loads(message['data'].decode('utf-8'))
+                    if not isinstance(data, dict) or 'symbol' not in data:
+                        continue
                     symbol = data['symbol'].lower()
                     action = data.get('action', '')
 
