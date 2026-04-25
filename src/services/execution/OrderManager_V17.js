@@ -15,7 +15,7 @@ let aiInputName = '';
 let aiOutputName = '';
 
 const configPath = path.join(__dirname, '../../../system_config.json');
-const modelPath = path.join(__dirname, '../../../../Universal_Scout.onnx');
+const modelPath = path.join(__dirname, '../../../Universal_Scout.onnx');
 
 let config;
 try {
