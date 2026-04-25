@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>V17 HFT Watchtower</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        body { background-color: #0d1117; color: #c9d1d9; font-family: 'Courier New', Courier, monospace; }
+        .grid-container { display: grid; grid-template-columns: 1fr 2fr; gap: 1rem; padding: 1rem; height: 100vh; }
+        .panel { background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1rem; overflow: hidden; display: flex; flex-direction: column; }
+        .log-box { flex-grow: 1; overflow-y: auto; background: #000; padding: 0.5rem; font-size: 0.85rem; color: #00ff00; }
+        .up { color: #3fb950; font-weight: bold; }
+        .down { color: #f85149; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="grid-container">
+        <div class="panel">
+            <h2 class="text-xl font-bold text-blue-400 mb-4">📡 RADAR (Tuần tra Vĩ mô)</h2>
+            <div id="radar-list" class="text-sm mb-6">Chưa có ứng viên mới...</div>
+
+            <h2 class="text-xl font-bold text-yellow-400 mb-4">👁️ CÁC NGHI PHẠM ĐANG THEO DÕI</h2>
+            <div id="suspects-list" class="flex-grow overflow-y-auto">
+                </div>
+        </div>
+
+        <div class="panel">
+            <h2 class="text-xl font-bold text-purple-400 mb-4">🧠 DÒNG SUY NGHĨ CỦA AI (Real-time)</h2>
+            <div id="ai-logs" class="log-box mb-4">
+                </div>
+
+            <h2 class="text-xl font-bold text-green-400 mb-4">⚡ NHỊP ĐẬP VI CẤU TRÚC (Tầng Tick)</h2>
+            <table class="w-full text-left text-sm">
+                <thead>
+                    <tr class="border-b border-gray-600">
+                        <th>Symbol</th><th>OFI (Mua/Bán)</th><th>VPIN (Độc hại)</th><th>MFA (Gia tốc)</th><th>Tín hiệu</th>
+                    </tr>
+                </thead>
+                <tbody id="tick-table">
+                    </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        const socket = io();
+        const activeSuspects = new Map();
+
+        // 1. Nhận thông báo Radar
+        socket.on('radar_update', (data) => {
+            const el = document.getElementById('radar-list');
+            el.innerHTML = `🔥 Tìm thấy siêu phẩm: <b class="text-yellow-400">${data.symbol}</b> (Điểm: ${data.score}) <br>` + el.innerHTML;
+        });
+
+        // 2. Cập nhật nhịp đập Mili-giây (Python gửi)
+        socket.on('live_features', (data) => {
+            if (!data.is_warm) return;
+            activeSuspects.set(data.symbol, data);
+            renderSuspects();
+        });
+
+        // 3. Nhận suy nghĩ của AI (Từ OrderManager)
+        socket.on('ai_thoughts', (data) => {
+            const logs = document.getElementById('ai-logs');
+            const time = new Date().toLocaleTimeString();
+            logs.innerHTML += `[${time}] ${data.msg}<br>`;
+            logs.scrollTop = logs.scrollHeight; // Auto cuộn xuống
+        });
+
+        function renderSuspects() {
+            const tbody = document.getElementById('tick-table');
+            const suspectsList = document.getElementById('suspects-list');
+            let tableHTML = '';
+            let listHTML = '';
+
+            activeSuspects.forEach((feat, symbol) => {
+                const ofiColor = feat.OFI > 0 ? 'up' : 'down';
+                const vpinColor = feat.VPIN > 0.7 ? 'down' : 'up';
+                
+                // Giao diện bảng Tick
+                tableHTML += `
+                    <tr>
+                        <td class="font-bold">${symbol}</td>
+                        <td class="${ofiColor}">${feat.OFI.toFixed(2)}</td>
+                        <td class="${vpinColor}">${(feat.VPIN * 100).toFixed(1)}%</td>
+                        <td>${feat.MFA.toFixed(2)}</td>
+                        <td>${feat.OFI > 5 && feat.MFA > 0.5 ? '🔥 CHỜ BÓP CÒ' : 'Trạng thái tĩnh'}</td>
+                    </tr>
+                `;
+
+                // Giao diện Nghi phạm
+                listHTML += `
+                    <div class="mb-2 p-2 bg-gray-800 rounded flex justify-between">
+                        <span><b>${symbol}</b></span>
+                        <span class="text-xs text-gray-400">ATR: ${(feat.ATR14 * 100).toFixed(2)}%</span>
+                    </div>
+                `;
+            });
+
+            tbody.innerHTML = tableHTML;
+            suspectsList.innerHTML = listHTML;
+        }
+    </script>
+</body>
+</html>
