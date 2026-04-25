@@ -1,0 +1,15 @@
+{
+    "REDIS_URL": "redis://127.0.0.1:6379",
+    "MAX_RADAR_SLOTS": 30,
+    "MACRO_THRESHOLD": 0.6,
+    "VOLUME_SURGE_MULTIPLIER": 3.0,
+    "MAX_LEVERAGE": 20,
+    "KELLY_FRACTION": 0.2,
+    "RISK_REWARD_RATIO": 2.0,
+    "CHANNELS": {
+        "CANDIDATES": "radar:candidates",
+        "MACRO_SCORES": "macro:scores",
+        "FEATURES": "market:features:*",
+        "SUBSCRIPTIONS": "system:subscriptions"
+    }
+}
