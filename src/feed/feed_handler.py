@@ -222,7 +222,7 @@ class FeedHandler:
 
     async def listen_to_control_channels(self):
         pubsub = self.redis.pubsub()
-     await pubsub.subscribe("radar:candidates", "system:keep_alive", "system:subscriptions")
+        await pubsub.subscribe("radar:candidates", "system:keep_alive", "system:subscriptions")
         print("📡 [PYTHON] Đã mở siêu tai nghe Async Redis...")
 
         async for message in pubsub.listen():
