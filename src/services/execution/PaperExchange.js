@@ -118,6 +118,11 @@ class PaperExchange extends IExchange {
     }
 
     getWalletBalance() { return this.walletBalance; }
+    hasActivePosition(symbol) {
+    return this.activePositions.has(symbol);
 }
+}
+
+
 
 module.exports = new PaperExchange(200);
