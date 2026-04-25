@@ -222,7 +222,7 @@ class FeedHandler:
 
     async def listen_to_control_channels(self):
         pubsub = self.redis.pubsub()
-        await pubsub.subscribe("radar:candidates", "system:keep_alive")
+     await pubsub.subscribe("radar:candidates", "system:keep_alive", "system:subscriptions")
         print("📡 [PYTHON] Đã mở siêu tai nghe Async Redis...")
 
         async for message in pubsub.listen():
@@ -249,7 +249,11 @@ class FeedHandler:
                             self.stream_refs[symbol]['trade'] = True
                         elif action == 'EXIT_TRADE':
                             self.stream_refs[symbol]['trade'] = False
-
+                    elif channel == "system:subscriptions":
+                        if action == 'SUBSCRIBE':
+                            self.stream_refs[symbol]['radar'] = True
+                        elif action == 'UNSUBSCRIBE':
+                            self.stream_refs[symbol]['radar'] = False
                     should_run = self._should_keep_stream(symbol)
                     is_running = symbol in self.active_tasks
 
