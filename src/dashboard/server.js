@@ -25,8 +25,8 @@ const io = new Server(server, { cors: { origin: "*" } });
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Bộ nhớ đệm (RAM)
-let aiLogHistory = {}; 
-let lastTickData = new Map(); 
+let aiLogHistory = {};
+let lastTickData = new Map();
 
 const subClient = new Redis(config.REDIS_URL);
 subClient.psubscribe(config.CHANNELS.FEATURES);
@@ -52,19 +52,19 @@ app.get('/api/stats', async (req, res) => {
     try {
         const trades = await ScoutTrade.find({ status: 'CLOSED' });
         const openTrades = await ScoutTrade.find({ status: 'OPEN' });
-        
+
         let totalTrades = trades.length;
         let winningTrades = trades.filter(t => t.pnl > 0).length;
         let winRate = totalTrades > 0 ? (winningTrades / totalTrades) * 100 : 0;
         let totalPnL = trades.reduce((sum, t) => sum + (t.pnl || 0), 0);
-        
+
         // Vốn gốc $200
         const STARTING_BALANCE = 200;
         let currentBalance = STARTING_BALANCE + totalPnL;
 
         res.json({
-            totalTrades: totalTrades + openTrades.length, 
-            winningTrades, 
+            totalTrades: totalTrades + openTrades.length,
+            winningTrades,
             winRate: winRate.toFixed(2) + '%',
             netPnL: totalPnL.toFixed(2) + ' USDT',
             openPositions: openTrades.length,
@@ -95,8 +95,8 @@ app.get('/api/equity-curve', async (req, res) => {
 io.on('connection', async (socket) => {
     const initialTrades = await ScoutTrade.find().sort({ openTime: -1 }).limit(100);
     socket.emit('full_state', {
-        logs: aiLogHistory, 
-        trades: initialTrades, 
+        logs: aiLogHistory,
+        trades: initialTrades,
         ticks: Array.from(lastTickData.values())
     });
 });
@@ -107,32 +107,39 @@ subClient.on('message', (channel, message) => {
             const logData = JSON.parse(message);
             const sym = logData.symbol;
             if (!aiLogHistory[sym]) aiLogHistory[sym] = [];
-            
+
             aiLogHistory[sym].push(logData);
-            
+
             // Tối ưu: Chỉ giữ tối đa 50 log gần nhất mỗi coin (Khoảng 10-15s tùy tần suất)
             if (aiLogHistory[sym].length > 50) {
                 aiLogHistory[sym].shift();
             }
-            
-            io.emit('ai_thoughts', logData); 
-        } catch (e) {}
-    } 
+
+            io.emit('ai_thoughts', logData);
+        } catch (e) { }
+    }
     else if (channel === 'dashboard:trades') {
         // Nhận tín hiệu Real-time khi OrderManager bóp cò hoặc chốt lời
         try {
             const tradeUpdate = JSON.parse(message);
             io.emit('trade_update', tradeUpdate);
-        } catch (e) {}
+        } catch (e) { }
     }
 });
 
 subClient.on('pmessageBuffer', (pattern, channel, messageBuffer) => {
+    const now = Date.now();
+    // Chỉ cho phép gửi dữ liệu của mỗi coin lên Web 1 lần mỗi 500ms (0.5 giây)
+    if (!lastEmitTime[feature.symbol] || now - lastEmitTime[feature.symbol] > 500) {
+        lastTickData.set(feature.symbol, feature);
+        io.emit('live_features', feature);
+        lastEmitTime[feature.symbol] = now;
+    }
     let feature;
     try { feature = decode(messageBuffer); } catch (e) {
         try { feature = JSON.parse(messageBuffer.toString()); } catch (err) { return; }
     }
-    if (!feature || !feature.symbol || !feature.is_warm) return; 
+    if (!feature || !feature.symbol || !feature.is_warm) return;
 
     lastTickData.set(feature.symbol, feature);
     io.emit('live_features', feature);
