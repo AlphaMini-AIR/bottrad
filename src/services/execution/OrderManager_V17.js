@@ -3,6 +3,15 @@ const { decode } = require('@msgpack/msgpack');
 const fs = require('fs');
 const path = require('path');
 const ort = require('onnxruntime-node');
+const mongoose = require('mongoose');
+
+require('dotenv').config({ path: path.join(__dirname, '../../../.env') });
+
+if (process.env.MONGO_URI_SCOUT) {
+    mongoose.connect(process.env.MONGO_URI_SCOUT)
+        .then(() => console.log("📦 [MONGO] Order Manager đã kết nối DB thành công!"))
+        .catch(err => console.error("❌ [MONGO] Lỗi kết nối DB:", err.message));
+}
 
 const exchange = require('./PaperExchange');
 const riskGuard = require('./RiskGuard');
@@ -45,7 +54,7 @@ const dataClient = new Redis(config.REDIS_URL);
 const activeTrades = new Map();
 const pendingOrders = new Map();
 const latestFeatures = new Map();
-const macroCache = new Map(); // Lưu điểm xu hướng từ Radar
+const macroCache = new Map(); 
 const MAX_PENDING_ORDERS = 3;
 
 // ==========================================
@@ -58,7 +67,6 @@ setInterval(async () => {
         for (const [sym, score] of Object.entries(scores)) {
             macroCache.set(sym.toUpperCase(), parseFloat(score));
         }
-        console.log(`🔄 [MACRO CACHE] Đã cập nhật ${macroCache.size} coin`);
     } catch (e) {
         console.error("⚠️ [REDIS] Lỗi đồng bộ Macro Cache:", e.message);
     }
@@ -99,7 +107,7 @@ subClient.on('pmessageBuffer', async (pattern, channel, messageBuffer) => {
     if (!feature || !feature.is_warm || !aiSession) return;
 
     const symbol = feature.symbol;
-    const currentPrice = feature.last_price || 0; // Dùng last_price để tính toán đồng nhất
+    const currentPrice = feature.last_price || 0; 
     if (currentPrice === 0) return;
 
     featureCount++;
@@ -122,29 +130,25 @@ subClient.on('pmessageBuffer', async (pattern, channel, messageBuffer) => {
         const stopDistance = atrPercent * stopMultiplier;
 
         if (trade.type === 'LONG') {
-            // Đuổi theo Đỉnh
             if (currentPrice > trade.highestPrice) trade.highestPrice = currentPrice;
             const slPrice = trade.highestPrice * (1 - stopDistance);
 
-            // Chốt nếu giá rơi sâu hoặc MFA báo hiệu đảo chiều giảm
             if (currentPrice <= slPrice || (feature.MFA && feature.MFA < -1.8)) {
                 const reason = (feature.MFA < -1.8) ? 'LONG: Đảo chiều giảm mạnh' : `LONG: Trailing Stop`;
                 logThought(symbol, `🛑 [CLOSE LONG] ${reason} @ ${currentPrice.toFixed(4)}`);
-                await exchange.closeTrade(symbol, currentPrice, reason, trade.features);
                 activeTrades.delete(symbol);
+                await exchange.closeTrade(symbol, currentPrice, reason, trade.features);
             }
         }
         else if (trade.type === 'SHORT') {
-            // Đuổi theo Đáy (Sửa lại logic: giá thấp hơn thì cập nhật lowestPrice)
             if (!trade.lowestPrice || currentPrice < trade.lowestPrice) trade.lowestPrice = currentPrice;
-            const slPrice = trade.lowestPrice * (1 + stopDistance); // Giá HỒI LÊN chạm slPrice là chốt
+            const slPrice = trade.lowestPrice * (1 + stopDistance); 
 
-            // Chốt nếu giá hồi lên mạnh hoặc MFA báo hiệu đảo chiều tăng
             if (currentPrice >= slPrice || (feature.MFA && feature.MFA > 1.8)) {
                 const reason = (feature.MFA > 1.8) ? 'SHORT: Đảo chiều tăng mạnh' : `SHORT: Trailing Stop`;
                 logThought(symbol, `🛑 [CLOSE SHORT] ${reason} @ ${currentPrice.toFixed(4)}`);
-                await exchange.closeTrade(symbol, currentPrice, reason, trade.features);
                 activeTrades.delete(symbol);
+                await exchange.closeTrade(symbol, currentPrice, reason, trade.features);
             }
         }
         return;
@@ -178,30 +182,25 @@ subClient.on('pmessageBuffer', async (pattern, channel, messageBuffer) => {
         const probShort = probs[0];
         const probLong = probs[1];
 
-        // Báo cáo song song cả 2 hướng lên Dashboard
         if (featureCount % 10 === 0) {
             logThought(symbol, `🤖 AI: LONG ${(probLong * 100).toFixed(1)}% | SHORT ${(probShort * 100).toFixed(1)}% | Macro: ${macroScore.toFixed(2)}`);
         }
 
-        // 🚀 ĐIỀU KIỆN VÀO LỆNH (Threshold 0.75)
+        // 🚀 ĐIỀU KIỆN VÀO LỆNH (Threshold 0.70)
         let tradeAction = null;
-        if (probLong >= 0.7) tradeAction = 'LONG';
-        else if (probShort >= 0.7) tradeAction = 'SHORT';
+        if (probLong >= 0.70) tradeAction = 'LONG';
+        else if (probShort >= 0.70) tradeAction = 'SHORT';
 
         if (tradeAction) {
             const prob = tradeAction === 'LONG' ? probLong : probShort;
             logThought(symbol, `🧠 [AI] Tín hiệu ${tradeAction}: ${(prob * 100).toFixed(1)}%`);
 
-            // Tính Kelly & Leverage
             const kelly = (prob * 2 - (1 - prob)) / 2;
             let finalLev = Math.floor(kelly * config.MAX_LEVERAGE * (config.KELLY_FRACTION || 0.5));
-
-            // [SỬA TẠI ĐÂY]: Đặt ngưỡng đòn bẩy từ 5 đến 20 như bạn yêu cầu
             finalLev = Math.max(5, Math.min(finalLev, 20));
             const useMarket = (feature.VPIN > 0.8 || Math.abs(feature.OFI) > 15);
 
             simulateLatency(async () => {
-                // LONG thì lấy giá Ask (mua), SHORT thì lấy giá Bid (bán)
                 const targetPrice = tradeAction === 'LONG'
                     ? (latestFeatures.get(symbol)?.best_ask || currentPrice)
                     : (latestFeatures.get(symbol)?.best_bid || currentPrice);
@@ -216,12 +215,16 @@ subClient.on('pmessageBuffer', async (pattern, channel, messageBuffer) => {
                             features: feature
                         });
                         syncStream(symbol, 'ENTER_TRADE');
+                        logThought(symbol, `⚡ [EXEC] MỞ LỆNH MARKET ${tradeAction} @ ${targetPrice.toFixed(4)}`);
+                    } else {
+                        logThought(symbol, `❌ Sàn ảo TỪ CHỐI lệnh ${tradeAction}. Ký quỹ hoặc Notional không đủ.`);
                     }
                 } else {
                     pendingOrders.set(symbol, {
                         targetPrice, leverage: finalLev, prob,
                         ts: Date.now(), type: tradeAction, features: feature
                     });
+                    logThought(symbol, `🛡️ [EXEC] ĐẶT LIMIT ${tradeAction} CHỜ KHỚP @ ${targetPrice.toFixed(4)}`);
                 }
             });
         }
@@ -253,7 +256,7 @@ subClient.on('pmessageBuffer', async (pattern, channel, messageBuffer) => {
     }
 });
 
-subClient.subscribe(config.CHANNELS.CANDIDATES, 'system:commands'); // Nghe thêm kênh commands
+subClient.subscribe(config.CHANNELS.CANDIDATES, 'system:commands');
 
 subClient.on('message', async (channel, message) => {
     if (channel === config.CHANNELS.CANDIDATES) {
@@ -264,13 +267,12 @@ subClient.on('message', async (channel, message) => {
         } catch (e) { }
     }
 
-    // [BỔ SUNG QUAN TRỌNG]: Lắng nghe lệnh tải lại não
     if (channel === 'system:commands') {
         try {
             const cmd = JSON.parse(message);
             if (cmd.action === 'RELOAD_AI') {
                 console.log("🔄 [HỆ THỐNG] Nhận lệnh RELOAD_AI. Đang tải lại não bộ mới...");
-                await initAI(); // Gọi lại hàm nạp ONNX
+                await initAI(); 
                 console.log("✅ [HỆ THỐNG] Nạp não mới thành công! Sẵn sàng chiến đấu.");
             }
         } catch (e) { }
