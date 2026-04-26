@@ -3,105 +3,107 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI QUANT SNIPER V17 - Dashboard</title>
+    <title>AI QUANT SNIPER V17 - Advanced Monitor</title>
     <script src="/socket.io/socket.io.js"></script>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
         @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
-        body { font-family: 'Inter', sans-serif; background-color: #0b0e11; color: #eaeaeb; }
+        body { font-family: 'Inter', sans-serif; background-color: #0b0e11; color: #eaeaeb; overflow-x: hidden; }
         .mono { font-family: 'JetBrains Mono', monospace; }
         .bg-card { background-color: #1e2329; border: 1px solid #2b3139; }
-        .status-pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }
+        .clickable-row { cursor: pointer; transition: all 0.2s; }
+        .clickable-row:hover { background-color: #2b3139 !important; transform: scale(1.005); }
+        .modal-overlay { background: rgba(0,0,0,0.85); backdrop-filter: blur(4px); }
         ::-webkit-scrollbar { width: 4px; }
         ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 10px; }
     </style>
 </head>
 <body class="p-4">
 
-    <div class="max-w-[1600px] mx-auto space-y-4">
-        
-        <nav class="bg-card p-4 rounded-lg flex justify-between items-center shadow-lg">
-            <div class="flex items-center gap-3">
-                <div class="w-8 h-8 bg-blue-600 rounded flex items-center justify-center">
-                    <i class="fas fa-bolt text-white text-sm"></i>
+    <div id="chart-modal" class="fixed inset-0 z-[100] hidden modal-overlay flex items-center justify-center p-4">
+        <div class="bg-card w-full max-w-6xl rounded-xl shadow-2xl border border-gray-700 flex flex-col h-[85vh]">
+            <div class="px-6 py-4 border-b border-gray-700 flex justify-between items-center bg-black bg-opacity-20">
+                <div class="flex items-center gap-4">
+                    <h2 id="modal-symbol" class="text-2xl font-bold text-blue-400 mono">SYMBOL</h2>
+                    <div id="modal-price" class="text-xl mono font-semibold">0.0000</div>
+                    <span id="modal-status" class="text-[10px] bg-green-900 text-green-300 px-2 py-0.5 rounded font-bold">LIVE FEED</span>
                 </div>
-                <h1 class="text-xl font-bold tracking-tight">SNIPER <span class="text-blue-500">V17 PRO</span></h1>
+                <button onclick="closeModal()" class="text-gray-400 hover:text-white text-2xl">&times;</button>
             </div>
-            
-            <div class="flex items-center gap-10">
-                <div class="text-center">
-                    <p class="text-[10px] text-gray-500 uppercase font-bold">Net PnL</p>
-                    <p id="stat-pnl" class="text-lg font-bold mono">-- USDT</p>
-                </div>
-                <div class="text-center">
-                    <p class="text-[10px] text-gray-500 uppercase font-bold">Winrate</p>
-                    <p id="stat-win" class="text-lg font-bold mono text-blue-400">0%</p>
-                </div>
-                <div class="text-center border-l border-gray-700 pl-8">
-                    <div id="connection-status" class="flex items-center gap-2 text-[10px] font-bold text-green-400 uppercase">
-                        <span class="w-2 h-2 bg-green-500 rounded-full status-pulse"></span>
-                        Websocket Live
+            <div class="flex-1 flex flex-col lg:flex-row overflow-hidden">
+                <div id="chart-container" class="flex-1 bg-black relative">
+                    <div id="chart-loading" class="absolute inset-0 flex items-center justify-center bg-black z-10">
+                        <div class="text-blue-500 animate-spin text-3xl"><i class="fas fa-spinner"></i></div>
                     </div>
-                    <p id="server-time" class="text-xs text-gray-500 mt-1 mono">--:--:--</p>
                 </div>
+                <div class="w-full lg:w-72 border-l border-gray-700 p-6 space-y-6 bg-black bg-opacity-10 overflow-y-auto">
+                    <div>
+                        <p class="text-gray-500 text-[10px] uppercase font-bold mb-2">Chỉ số HFT</p>
+                        <div class="space-y-3 text-sm mono">
+                            <div class="flex justify-between"><span>OFI:</span> <span id="m-ofi" class="text-white">--</span></div>
+                            <div class="flex justify-between"><span>VPIN:</span> <span id="m-vpin" class="text-white">--</span></div>
+                            <div class="flex justify-between"><span>MFA:</span> <span id="m-mfa" class="text-white">--</span></div>
+                            <div class="flex justify-between"><span>Whale:</span> <span id="m-whale" class="text-white">--</span></div>
+                        </div>
+                    </div>
+                    <hr class="border-gray-800">
+                    <div>
+                        <p class="text-gray-500 text-[10px] uppercase font-bold mb-2">Phân tích xu hướng</p>
+                        <div id="m-ai-summary" class="text-xs text-gray-400 italic leading-relaxed">
+                            Đang phân tích luồng dữ liệu...
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="max-w-[1600px] mx-auto space-y-4">
+        <nav class="bg-card p-4 rounded-lg flex justify-between items-center shadow-lg border-l-4 border-blue-600">
+            <div class="flex items-center gap-3">
+                <h1 class="text-xl font-bold tracking-tight">SNIPER <span class="text-blue-500">V17 MONITOR</span></h1>
+            </div>
+            <div class="flex gap-10">
+                <div class="text-center"><p class="text-[10px] text-gray-500 uppercase font-bold">PnL</p><p id="stat-pnl" class="text-lg font-bold mono">--</p></div>
+                <div class="text-center"><p class="text-[10px] text-gray-500 uppercase font-bold">Winrate</p><p id="stat-win" class="text-lg font-bold mono text-blue-400">0%</p></div>
             </div>
         </nav>
 
         <div class="grid grid-cols-12 gap-4">
-            
             <div class="col-span-12 lg:col-span-8 space-y-4">
-                
                 <div class="bg-card rounded-lg overflow-hidden shadow-xl">
-                    <div class="px-5 py-3 border-b border-gray-700 bg-black bg-opacity-20 flex justify-between">
-                        <h2 class="text-xs font-bold uppercase tracking-widest text-gray-400">Radar Monitor (Redis Sync)</h2>
-                        <span id="stat-count" class="text-xs text-blue-400 font-bold">0 Coins Active</span>
+                    <div class="px-5 py-3 border-b border-gray-700 bg-black bg-opacity-20 flex justify-between items-center">
+                        <h2 class="text-xs font-bold uppercase tracking-widest text-gray-400">🔥 Radar Monitor (Bấm để xem biểu đồ)</h2>
+                        <span id="stat-count" class="text-xs text-blue-400 font-bold">0 Coins</span>
                     </div>
-                    <div class="overflow-x-auto">
-                        <table class="w-full text-left">
-                            <thead class="text-[10px] text-gray-500 uppercase bg-black bg-opacity-10">
-                                <tr>
-                                    <th class="px-5 py-3">Symbol</th>
-                                    <th class="px-5 py-3 text-right">Price</th>
-                                    <th class="px-5 py-3 text-right">OFI (Smooth)</th>
-                                    <th class="px-5 py-3 text-right">MFA (Accel)</th>
-                                    <th class="px-5 py-3 text-right">Whale Net</th>
-                                    <th class="px-5 py-3 text-center">Trend</th>
-                                </tr>
-                            </thead>
-                            <tbody id="monitor-body" class="divide-y divide-gray-800 mono text-sm">
-                                </tbody>
-                        </table>
-                    </div>
+                    <table class="w-full text-left">
+                        <thead class="text-[10px] text-gray-500 uppercase bg-black bg-opacity-10">
+                            <tr>
+                                <th class="px-5 py-3">Symbol</th>
+                                <th class="px-5 py-3 text-right">Price</th>
+                                <th class="px-5 py-3 text-right">OFI</th>
+                                <th class="px-5 py-3 text-right">MFA</th>
+                                <th class="px-5 py-3 text-right">Whale Net</th>
+                            </tr>
+                        </thead>
+                        <tbody id="monitor-body" class="divide-y divide-gray-800 mono text-sm"></tbody>
+                    </table>
                 </div>
 
-                <div class="bg-card rounded-lg flex flex-col h-[400px] shadow-xl">
+                <div class="bg-card rounded-lg flex flex-col h-[350px]">
                     <div class="px-5 py-3 border-b border-gray-700 bg-black bg-opacity-20">
-                        <h2 class="text-xs font-bold uppercase tracking-widest text-purple-400">AI Thought Engine (Live Logs)</h2>
+                        <h2 class="text-xs font-bold uppercase text-purple-400">AI Thought Engine</h2>
                     </div>
-                    <div id="thought-log" class="flex-1 overflow-y-auto p-4 space-y-1 text-[11px] mono bg-black bg-opacity-30">
-                        </div>
+                    <div id="thought-log" class="flex-1 overflow-y-auto p-4 space-y-1 text-[11px] mono bg-black bg-opacity-30"></div>
                 </div>
             </div>
 
             <div class="col-span-12 lg:col-span-4 space-y-4">
-                
                 <div class="bg-card rounded-lg shadow-xl overflow-hidden">
-                    <div class="px-5 py-3 border-b border-gray-700 bg-blue-900 bg-opacity-10">
-                        <h2 class="text-xs font-bold uppercase tracking-widest text-blue-400">Self-Evolution (Experience)</h2>
-                    </div>
-                    <div id="experience-log" class="p-4 space-y-3 max-h-[300px] overflow-y-auto">
-                        <p class="text-center text-gray-600 text-xs py-10 italic">Đang đợi dữ liệu kinh nghiệm...</p>
-                    </div>
-                </div>
-
-                <div class="bg-card rounded-lg shadow-xl overflow-hidden">
-                    <div class="px-5 py-3 border-b border-gray-700 bg-black bg-opacity-20">
-                        <h2 class="text-xs font-bold uppercase tracking-widest text-yellow-500">Recent Trades (Database)</h2>
-                    </div>
-                    <div id="trade-history" class="divide-y divide-gray-800 max-h-[420px] overflow-y-auto">
-                        </div>
+                    <div class="px-5 py-3 border-b border-gray-700 bg-blue-900 bg-opacity-10 font-bold text-xs uppercase text-blue-400">Experience Log</div>
+                    <div id="experience-log" class="p-4 space-y-3 max-h-[600px] overflow-y-auto"></div>
                 </div>
             </div>
         </div>
@@ -109,135 +111,127 @@
 
     <script>
         const socket = io();
-        const monitorBody = document.getElementById('monitor-body');
-        const thoughtLog = document.getElementById('thought-log');
-        const expLog = document.getElementById('experience-log');
-        const tradeHistory = document.getElementById('trade-history');
+        let currentSymbol = null;
+        let chart = null;
+        let candleSeries = null;
 
-        // Cập nhật đồng hồ Dashboard
-        setInterval(() => {
-            document.getElementById('server-time').innerText = new Date().toLocaleTimeString();
-        }, 1000);
+        // --- CẤU CẤU BIỂU ĐỒ ---
+        function initChart() {
+            const container = document.getElementById('chart-container');
+            chart = LightweightCharts.createChart(container, {
+                layout: { backgroundColor: '#000000', textColor: '#d1d4dc' },
+                grid: { vertLines: { color: '#1f2937' }, horzLines: { color: '#1f2937' } },
+                crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+                priceScale: { borderColor: '#485c7b' },
+                timeScale: { borderColor: '#485c7b', timeVisible: true, secondsVisible: false },
+            });
+            candleSeries = chart.addCandlestickSeries({
+                upColor: '#10b981', downColor: '#ef4444', borderVisible: false,
+                wickUpColor: '#10b981', wickDownColor: '#ef4444'
+            });
 
-        // 1. ĐỒNG BỘ TOÀN BỘ TRẠNG THÁI (Khi vừa load trang)
-        socket.on('full_state_sync', (data) => {
-            console.log("🔄 Syncing state from Server/Redis...");
-            
-            // Đồng bộ Monitor Table
-            data.ticks.forEach(tick => updateMonitorRow(tick));
-            
-            // Nếu có macroScores nhưng chưa có tick, tạo hàng chờ
-            if(data.macroScores) {
-                Object.keys(data.macroScores).forEach(symbol => {
-                    ensureRow(symbol.toUpperCase());
-                });
-            }
-
-            // Đồng bộ Logs
-            if(data.logs) {
-                thoughtLog.innerHTML = '';
-                data.logs.forEach(log => appendThought(log));
-            }
-
-            // Đồng bộ Trades từ MongoDB
-            if(data.trades) {
-                updateTradeHistory(data.trades);
-            }
-            
-            updateStats();
-        });
-
-        // 2. LẮNG NGHE DỮ LIỆU REAL-TIME
-        socket.on('live_features', (data) => updateMonitorRow(data));
-        socket.on('ai_thoughts', (data) => appendThought(data));
-        socket.on('experience', (data) => appendExperience(data));
-        socket.on('trade_update', () => updateStats());
-
-        // --- CÁC HÀM XỬ LÝ GIAO DIỆN ---
-
-        function ensureRow(symbol) {
-            let row = document.getElementById(`row-${symbol}`);
-            if (!row) {
-                row = document.createElement('tr');
-                row.id = `row-${symbol}`;
-                row.className = "border-b border-gray-800 hover:bg-gray-800 transition-colors";
-                monitorBody.appendChild(row);
-                document.getElementById('stat-count').innerText = `${monitorBody.rows.length} Coins Active`;
-            }
-            return row;
+            new ResizeObserver(() => {
+                chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
+            }).observe(container);
         }
 
-        function updateMonitorRow(data) {
-            const row = ensureRow(data.symbol);
-            const mfaClass = data.MFA > 0 ? 'text-green-400' : (data.MFA < 0 ? 'text-red-400' : '');
-            const whaleClass = data.WHALE_NET > 0 ? 'text-green-500 font-bold' : (data.WHALE_NET < 0 ? 'text-red-500 font-bold' : '');
+        async function openModal(symbol) {
+            currentSymbol = symbol;
+            document.getElementById('chart-modal').classList.remove('hidden');
+            document.getElementById('modal-symbol').innerText = symbol;
+            document.getElementById('chart-loading').classList.remove('hidden');
+            
+            if (!chart) initChart();
+            candleSeries.setData([]);
 
+            try {
+                // Lấy 100 nến 1m từ Binance Public API để hiển thị biểu đồ nhanh
+                const resp = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1m&limit=100`);
+                const data = await resp.json();
+                const candles = data.map(d => ({
+                    time: d[0] / 1000,
+                    open: parseFloat(d[1]), high: parseFloat(d[2]),
+                    low: parseFloat(d[3]), close: parseFloat(d[4])
+                }));
+                candleSeries.setData(candles);
+                document.getElementById('chart-loading').classList.add('hidden');
+            } catch (e) { console.error("Lỗi tải nến:", e); }
+        }
+
+        function closeModal() {
+            document.getElementById('chart-modal').classList.add('hidden');
+            currentSymbol = null;
+        }
+
+        // --- SOCKET HANDLERS ---
+        socket.on('full_state_sync', (data) => {
+            data.ticks.forEach(tick => updateMonitorRow(tick));
+        });
+
+        socket.on('live_features', (data) => {
+            updateMonitorRow(data);
+            // Cập nhật giá và nến Real-time nếu đang mở Modal
+            if (currentSymbol === data.symbol) {
+                document.getElementById('modal-price').innerText = data.last_price.toFixed(4);
+                document.getElementById('m-ofi').innerText = data.OFI.toFixed(2);
+                document.getElementById('m-mfa').innerText = data.MFA.toFixed(2);
+                document.getElementById('m-vpin').innerText = (data.VPIN * 100).toFixed(1) + '%';
+                document.getElementById('m-whale').innerText = (data.WHALE_NET || 0).toFixed(4);
+                
+                // Cập nhật nến hiện tại vào biểu đồ
+                candleSeries.update({
+                    time: Math.floor(Date.now() / 1000),
+                    open: data.last_price, high: data.last_price, 
+                    low: data.last_price, close: data.last_price
+                });
+            }
+        });
+
+        function updateMonitorRow(data) {
+            let row = document.getElementById(`row-${data.symbol}`);
+            if (!row) {
+                row = document.createElement('tr');
+                row.id = `row-${data.symbol}`;
+                row.className = "clickable-row border-b border-gray-800";
+                row.onclick = () => openModal(data.symbol); // Bấm vào hàng để mở modal
+                document.getElementById('monitor-body').prepend(row);
+            }
+            
             row.innerHTML = `
                 <td class="px-5 py-3 font-bold text-blue-400">${data.symbol}</td>
                 <td class="px-5 py-3 text-right">${data.last_price.toFixed(4)}</td>
                 <td class="px-5 py-3 text-right ${data.OFI > 0 ? 'text-green-400' : 'text-red-400'}">${data.OFI.toFixed(2)}</td>
-                <td class="px-5 py-3 text-right ${mfaClass}">${data.MFA.toFixed(2)}</td>
-                <td class="px-5 py-3 text-right ${whaleClass}">${(data.WHALE_NET || 0).toFixed(4)}</td>
-                <td class="px-5 py-3 text-center"><span class="bg-gray-700 px-2 py-0.5 rounded text-[9px] text-gray-400">MONITORING</span></td>
+                <td class="px-5 py-3 text-right ${data.MFA > 0 ? 'text-green-400' : 'text-red-400'}">${data.MFA.toFixed(2)}</td>
+                <td class="px-5 py-3 text-right text-yellow-500">${(data.WHALE_NET || 0).toFixed(4)}</td>
             `;
+            document.getElementById('stat-count').innerText = `${document.getElementById('monitor-body').rows.length} Coins`;
         }
 
-        function appendThought(data) {
+        socket.on('ai_thoughts', (data) => {
             const entry = document.createElement('div');
             entry.className = "border-l-2 border-gray-700 pl-2 py-0.5 opacity-90";
-            entry.innerHTML = `
-                <span class="text-gray-500">[${data.symbol || 'SYS'}]</span> 
-                <span class="text-gray-300">${data.msg}</span>
-            `;
-            thoughtLog.prepend(entry);
-            if (thoughtLog.childNodes.length > 150) thoughtLog.lastChild.remove();
-        }
+            entry.innerHTML = `<span class="text-gray-500">[${data.symbol}]</span> ${data.msg}`;
+            document.getElementById('thought-log').prepend(entry);
+        });
 
-        function appendExperience(data) {
-            if (expLog.innerHTML.includes('Đang đợi')) expLog.innerHTML = '';
-            const isWin = data.pnl_pct >= 0;
+        socket.on('experience', (data) => {
             const div = document.createElement('div');
-            div.className = `p-3 rounded bg-black bg-opacity-20 border-l-4 ${isWin ? 'border-green-500' : 'border-red-500'}`;
-            div.innerHTML = `
-                <div class="flex justify-between items-center font-bold text-xs">
-                    <span>${data.symbol} <span class="text-[9px] text-gray-500 font-normal">${data.trade_type}</span></span>
-                    <span class="${isWin ? 'text-green-400' : 'text-red-400'}">${data.pnl_pct}%</span>
-                </div>
-                <div class="text-[10px] text-gray-500 mt-1">AI Prob: ${(data.prob_score*100).toFixed(1)}% | ${data.reason}</div>
-            `;
-            expLog.prepend(div);
-            if (expLog.childNodes.length > 20) expLog.lastChild.remove();
-        }
+            const isWin = data.pnl_pct >= 0;
+            div.className = `p-3 rounded bg-card border-l-4 ${isWin ? 'border-green-500' : 'border-red-500'}`;
+            div.innerHTML = `<div class="flex justify-between font-bold text-xs"><span>${data.symbol}</span><span class="${isWin?'text-green-400':'text-red-400'}">${data.pnl_pct}%</span></div>`;
+            document.getElementById('experience-log').prepend(div);
+        });
 
-        function updateTradeHistory(trades) {
-            tradeHistory.innerHTML = trades.map(t => {
-                const isWin = t.pnl > 0;
-                return `
-                    <div class="px-4 py-2 hover:bg-gray-800 flex justify-between items-center text-[10px]">
-                        <div>
-                            <div class="font-bold text-gray-300">${t.symbol}</div>
-                            <div class="text-gray-600">${new Date(t.closeTime || t.openTime).toLocaleTimeString()}</div>
-                        </div>
-                        <div class="text-right">
-                            <div class="${isWin ? 'text-green-500' : 'text-red-500'} font-bold">${t.pnl ? t.pnl.toFixed(2) + ' USDT' : 'OPEN'}</div>
-                            <div class="text-gray-600">${t.exitReason || 'Pending...'}</div>
-                        </div>
-                    </div>
-                `;
-            }).join('');
-        }
-
+        // Tải stats ban đầu
         async function updateStats() {
             try {
                 const res = await fetch('/api/stats');
                 const stats = await res.json();
-                const pnlEl = document.getElementById('stat-pnl');
-                pnlEl.innerText = stats.netPnL;
-                pnlEl.className = `text-lg font-bold mono ${parseFloat(stats.netPnL) >= 0 ? 'text-green-400' : 'text-red-400'}`;
+                document.getElementById('stat-pnl').innerText = stats.netPnL;
                 document.getElementById('stat-win').innerText = stats.winRate;
-                document.getElementById('stat-wallet').innerText = stats.currentWalletEstimation;
             } catch (e) {}
         }
+        updateStats();
     </script>
 </body>
 </html>
