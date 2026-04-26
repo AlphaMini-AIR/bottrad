@@ -196,6 +196,18 @@ subClient.on('pmessageBuffer', async (pattern, channel, messageBuffer) => {
         let tradeAction = null;
         let finalProb = 0;
         
+        const now = Date.now();
+        if (!latestFeatures.get(`ai_emit_${symbol}`) || now - latestFeatures.get(`ai_emit_${symbol}`) > 1000) {
+            try {
+                pubClient.publish('dashboard:predictions', JSON.stringify({
+                    symbol: symbol,
+                    long: probLong,
+                    short: probShort
+                }));
+                latestFeatures.set(`ai_emit_${symbol}`, now);
+            } catch (e) {}
+        }
+        
         if (probLong >= 0.80) { tradeAction = 'LONG'; finalProb = probLong; }
         else if (probShort >= 0.80) { tradeAction = 'SHORT'; finalProb = probShort; }
 

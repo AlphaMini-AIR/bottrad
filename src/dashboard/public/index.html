@@ -1,6 +1,5 @@
 <!DOCTYPE html>
 <html lang="vi">
-
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -11,68 +10,18 @@
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
         @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
-
-        body {
-            font-family: 'Inter', sans-serif;
-            background-color: #0b0e11;
-            color: #eaeaeb;
-            overflow-x: hidden;
-            height: 100vh;
-            display: flex;
-            flex-direction: column;
-        }
-
-        .mono {
-            font-family: 'JetBrains Mono', monospace;
-        }
-
-        .bg-card {
-            background-color: #1e2329;
-            border: 1px solid #2b3139;
-        }
-
-        .clickable-row {
-            cursor: pointer;
-            transition: background-color 0.2s;
-        }
-
-        .clickable-row:hover {
-            background-color: #2b3139;
-        }
-
-        .active-row {
-            background-color: #2563eb33 !important;
-            border-left: 3px solid #3b82f6;
-        }
-
-        ::-webkit-scrollbar {
-            width: 4px;
-            height: 4px;
-        }
-
-        ::-webkit-scrollbar-thumb {
-            background: #4b5563;
-            border-radius: 10px;
-        }
-
-        .status-pulse {
-            animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-        }
-
-        @keyframes pulse {
-
-            0%,
-            100% {
-                opacity: 1;
-            }
-
-            50% {
-                opacity: .5;
-            }
-        }
+        body { font-family: 'Inter', sans-serif; background-color: #0b0e11; color: #eaeaeb; overflow-x: hidden; height: 100vh; display: flex; flex-direction: column; }
+        .mono { font-family: 'JetBrains Mono', monospace; }
+        .bg-card { background-color: #1e2329; border: 1px solid #2b3139; }
+        .clickable-row { cursor: pointer; transition: background-color 0.2s; }
+        .clickable-row:hover { background-color: #2b3139; }
+        .active-row { background-color: #2563eb33 !important; border-left: 3px solid #3b82f6; }
+        ::-webkit-scrollbar { width: 4px; height: 4px; }
+        ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 10px; }
+        .status-pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }
     </style>
 </head>
-
 <body class="p-4 gap-4">
 
     <nav class="bg-card p-4 rounded-lg flex justify-between items-center shadow-lg shrink-0">
@@ -82,19 +31,11 @@
             </div>
             <h1 class="text-xl font-bold tracking-tight">SNIPER <span class="text-blue-500">V17 COMMAND</span></h1>
         </div>
-
         <div class="flex items-center gap-10">
-            <div class="text-center">
-                <p class="text-[10px] text-gray-500 uppercase font-bold">Net PnL</p>
-                <p id="stat-pnl" class="text-lg font-bold mono text-gray-300">-- USDT</p>
-            </div>
-            <div class="text-center">
-                <p class="text-[10px] text-gray-500 uppercase font-bold">Winrate</p>
-                <p id="stat-win" class="text-lg font-bold mono text-blue-400">0%</p>
-            </div>
+            <div class="text-center"><p class="text-[10px] text-gray-500 uppercase font-bold">Net PnL</p><p id="stat-pnl" class="text-lg font-bold mono text-gray-300">-- USDT</p></div>
+            <div class="text-center"><p class="text-[10px] text-gray-500 uppercase font-bold">Winrate</p><p id="stat-win" class="text-lg font-bold mono text-blue-400">0%</p></div>
             <div class="text-center border-l border-gray-700 pl-8">
-                <div id="connection-status"
-                    class="flex items-center gap-2 text-[10px] font-bold text-green-400 uppercase">
+                <div class="flex items-center gap-2 text-[10px] font-bold text-green-400 uppercase">
                     <span class="w-2 h-2 bg-green-500 rounded-full status-pulse"></span> Websocket Live
                 </div>
                 <p id="server-time" class="text-xs text-gray-500 mt-1 mono">--:--:--</p>
@@ -103,70 +44,57 @@
     </nav>
 
     <div class="flex-1 flex flex-col lg:flex-row gap-4 min-h-0">
-
-        <div class="w-full lg:w-1/3 flex flex-col gap-4 min-h-0 shrink-0">
-            <div class="bg-card rounded-lg flex flex-col flex-1 shadow-xl overflow-hidden">
-                <div
-                    class="px-4 py-3 border-b border-gray-700 bg-black bg-opacity-20 flex justify-between items-center shrink-0">
-                    <h2 class="text-xs font-bold uppercase tracking-widest text-gray-400">📡 Radar Monitor</h2>
-                    <span id="stat-count" class="text-xs text-blue-400 font-bold">0 Coins</span>
-                </div>
-                <div class="flex-1 overflow-y-auto">
-                    <table class="w-full text-left">
-                        <thead
-                            class="text-[10px] text-gray-500 uppercase bg-black bg-opacity-10 sticky top-0 z-10 backdrop-blur-sm">
-                            <tr>
-                                <th class="px-4 py-2">Symbol</th>
-                                <th class="px-4 py-2 text-right">Price</th>
-                                <th class="px-4 py-2 text-right">MFA</th>
-                            </tr>
-                        </thead>
-                        <tbody id="monitor-body" class="divide-y divide-gray-800 mono text-xs">
-                        </tbody>
-                    </table>
-                </div>
+        
+        <div class="w-full lg:w-1/3 flex flex-col bg-card rounded-lg shadow-xl overflow-hidden min-h-0 shrink-0">
+            <div class="px-4 py-3 border-b border-gray-700 bg-black bg-opacity-20 flex justify-between items-center shrink-0">
+                <h2 class="text-xs font-bold uppercase tracking-widest text-gray-400">📡 Radar Monitor</h2>
+                <span id="stat-count" class="text-xs text-blue-400 font-bold">0 Coins</span>
+            </div>
+            <div class="flex-1 overflow-y-auto">
+                <table class="w-full text-left">
+                    <thead class="text-[10px] text-gray-500 uppercase bg-black bg-opacity-10 sticky top-0 z-10 backdrop-blur-sm">
+                        <tr><th class="px-4 py-2">Symbol</th><th class="px-4 py-2 text-right">Price</th><th class="px-4 py-2 text-right">MFA</th></tr>
+                    </thead>
+                    <tbody id="monitor-body" class="divide-y divide-gray-800 mono text-xs"></tbody>
+                </table>
             </div>
         </div>
 
-        <div
-            class="w-full lg:w-2/3 flex flex-col bg-card rounded-lg shadow-xl overflow-hidden border border-gray-700 relative">
-            <div id="no-coin-overlay"
-                class="absolute inset-0 bg-card z-20 flex items-center justify-center flex-col gap-4">
+        <div class="w-full lg:w-2/3 flex flex-col bg-card rounded-lg shadow-xl overflow-hidden border border-gray-700 relative">
+            <div id="no-coin-overlay" class="absolute inset-0 bg-card z-20 flex items-center justify-center flex-col gap-4">
                 <i class="fas fa-satellite-dish text-4xl text-gray-600 animate-pulse"></i>
-                <p class="text-gray-500 text-sm">Đang đợi dữ liệu Radar... Hoặc bấm vào 1 Coin bên trái để xem</p>
+                <p class="text-gray-500 text-sm">Đang đợi dữ liệu Radar... Bấm vào 1 Coin để xem</p>
             </div>
 
-            <div
-                class="px-6 py-4 border-b border-gray-700 bg-black bg-opacity-30 flex justify-between items-center shrink-0">
+            <div class="px-6 py-4 border-b border-gray-700 bg-black bg-opacity-30 flex justify-between items-center shrink-0">
                 <div class="flex items-center gap-4">
                     <h2 id="active-symbol" class="text-2xl font-bold text-blue-400 mono">--</h2>
                     <div id="active-price" class="text-xl mono font-semibold text-gray-200">0.0000</div>
-                    <span id="active-trend"
-                        class="text-[10px] bg-gray-800 text-gray-400 px-2 py-0.5 rounded font-bold uppercase">WAITING</span>
+                    <span id="active-trend" class="text-[10px] bg-gray-800 text-gray-400 px-2 py-0.5 rounded font-bold uppercase">WAITING</span>
                 </div>
-                <div class="flex gap-6 text-sm mono">
-                    <div class="text-right">
-                        <p class="text-[9px] text-gray-500">OFI (Order Flow)</p>
-                        <p id="detail-ofi" class="font-bold">--</p>
+                
+                <div class="flex items-center gap-6">
+                    <div class="w-48 bg-black bg-opacity-40 p-2 rounded border border-gray-700">
+                        <div class="flex justify-between text-[9px] font-bold uppercase mb-1">
+                            <span class="text-green-500">L: <span id="ai-long">--</span>%</span>
+                            <span class="text-gray-500">AI PROB</span>
+                            <span class="text-red-500">S: <span id="ai-short">--</span>%</span>
+                        </div>
+                        <div class="w-full bg-gray-800 rounded-full h-1.5 flex overflow-hidden">
+                            <div id="bar-long" class="bg-green-500 h-1.5 transition-all duration-300" style="width: 50%"></div>
+                            <div id="bar-short" class="bg-red-500 h-1.5 transition-all duration-300" style="width: 50%"></div>
+                        </div>
                     </div>
-                    <div class="text-right">
-                        <p class="text-[9px] text-gray-500">MFA (Acceleration)</p>
-                        <p id="detail-mfa" class="font-bold">--</p>
-                    </div>
-                    <div class="text-right">
-                        <p class="text-[9px] text-gray-500">Whale Netflow</p>
-                        <p id="detail-whale" class="font-bold">--</p>
-                    </div>
-                    <div class="text-right">
-                        <p class="text-[9px] text-gray-500">VPIN</p>
-                        <p id="detail-vpin" class="font-bold text-yellow-500">--</p>
+                    <div class="flex gap-4 text-sm mono border-l border-gray-700 pl-4">
+                        <div class="text-right"><p class="text-[9px] text-gray-500">OFI</p><p id="detail-ofi" class="font-bold">--</p></div>
+                        <div class="text-right"><p class="text-[9px] text-gray-500">MFA</p><p id="detail-mfa" class="font-bold">--</p></div>
+                        <div class="text-right"><p class="text-[9px] text-gray-500">Whale</p><p id="detail-whale" class="font-bold">--</p></div>
                     </div>
                 </div>
             </div>
 
             <div id="chart-container" class="flex-1 bg-black relative">
-                <div id="chart-loading"
-                    class="absolute inset-0 flex items-center justify-center bg-black bg-opacity-80 z-10 hidden">
+                <div id="chart-loading" class="absolute inset-0 flex items-center justify-center bg-black bg-opacity-80 z-10 hidden">
                     <div class="text-blue-500 animate-spin text-3xl"><i class="fas fa-circle-notch"></i></div>
                 </div>
             </div>
@@ -174,28 +102,16 @@
     </div>
 
     <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 shrink-0 h-64 mt-4">
-
         <div class="bg-card rounded-lg flex flex-col shadow-xl overflow-hidden border border-gray-700">
-            <div class="px-4 py-2 border-b border-gray-700 bg-black bg-opacity-20">
-                <h2 class="text-[11px] font-bold uppercase text-purple-400"><i class="fas fa-brain mr-1"></i> AI Thought
-                    Engine</h2>
-            </div>
+            <div class="px-4 py-2 border-b border-gray-700 bg-black bg-opacity-20"><h2 class="text-[11px] font-bold uppercase text-purple-400">AI Thought Engine</h2></div>
             <div id="thought-log" class="flex-1 overflow-y-auto p-3 space-y-1 text-[10px] mono"></div>
         </div>
-
         <div class="bg-card rounded-lg flex flex-col shadow-xl overflow-hidden border border-gray-700">
-            <div class="px-4 py-2 border-b border-gray-700 bg-blue-900 bg-opacity-10">
-                <h2 class="text-[11px] font-bold uppercase text-blue-400"><i class="fas fa-dna mr-1"></i> Evolution
-                    Experience</h2>
-            </div>
+            <div class="px-4 py-2 border-b border-gray-700 bg-blue-900 bg-opacity-10"><h2 class="text-[11px] font-bold uppercase text-blue-400">Evolution Experience</h2></div>
             <div id="experience-log" class="flex-1 overflow-y-auto p-3 space-y-2"></div>
         </div>
-
         <div class="bg-card rounded-lg flex flex-col shadow-xl overflow-hidden border border-gray-700">
-            <div class="px-4 py-2 border-b border-gray-700 bg-black bg-opacity-20">
-                <h2 class="text-[11px] font-bold uppercase text-yellow-500"><i class="fas fa-history mr-1"></i> Recent
-                    Trades</h2>
-            </div>
+            <div class="px-4 py-2 border-b border-gray-700 bg-black bg-opacity-20"><h2 class="text-[11px] font-bold uppercase text-yellow-500">Recent Trades</h2></div>
             <div id="trade-history" class="flex-1 overflow-y-auto divide-y divide-gray-800"></div>
         </div>
     </div>
@@ -206,13 +122,10 @@
         let chart = null;
         let candleSeries = null;
         let isFirstLoad = true;
+        const VN_TIMEZONE_OFFSET = 7 * 3600; // +7 Tiếng tính bằng giây
 
-        // Đồng hồ hệ thống
         setInterval(() => { document.getElementById('server-time').innerText = new Date().toLocaleTimeString(); }, 1000);
 
-        // ==========================================
-        // 1. KHỞI TẠO BIỂU ĐỒ (TRADINGVIEW)
-        // ==========================================
         function initChart() {
             const container = document.getElementById('chart-container');
             chart = LightweightCharts.createChart(container, {
@@ -220,102 +133,88 @@
                 grid: { vertLines: { color: '#1f2937' }, horzLines: { color: '#1f2937' } },
                 crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
                 rightPriceScale: { borderColor: '#485c7b' },
+                // Đã cấu hình định dạng thời gian chuẩn để khớp với Offset VN
                 timeScale: { borderColor: '#485c7b', timeVisible: true, secondsVisible: false },
             });
             candleSeries = chart.addCandlestickSeries({
-                upColor: '#10b981', downColor: '#ef4444', borderVisible: false,
-                wickUpColor: '#10b981', wickDownColor: '#ef4444'
+                upColor: '#10b981', downColor: '#ef4444', borderVisible: false, wickUpColor: '#10b981', wickDownColor: '#ef4444'
             });
-
-            new ResizeObserver(() => {
-                chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
-            }).observe(container);
+            new ResizeObserver(() => chart.applyOptions({ width: container.clientWidth, height: container.clientHeight })).observe(container);
         }
 
-        // Bấm vào Coin để xem chi tiết
         async function selectCoin(symbol) {
             if (selectedSymbol === symbol) return;
             selectedSymbol = symbol;
-
-            // UI Cập nhật trạng thái
+            
             document.getElementById('no-coin-overlay').classList.add('hidden');
             document.getElementById('active-symbol').innerText = symbol;
-
+            
             document.querySelectorAll('.clickable-row').forEach(row => row.classList.remove('active-row'));
             const activeRow = document.getElementById(`row-${symbol}`);
             if (activeRow) activeRow.classList.add('active-row');
 
-            // Reset Biểu đồ & Tải nến
+            // Reset AI Bar
+            document.getElementById('ai-long').innerText = '--';
+            document.getElementById('ai-short').innerText = '--';
+            document.getElementById('bar-long').style.width = '50%';
+            document.getElementById('bar-short').style.width = '50%';
+
             if (!chart) initChart();
             document.getElementById('chart-loading').classList.remove('hidden');
-
-            // [THÊM LỚP BẢO VỆ Ở ĐÂY]
-            if (candleSeries) {
-                candleSeries.setData([]);
-            }
+            if (candleSeries) candleSeries.setData([]);
 
             try {
-                // Tải nến lịch sử 1m từ Binance để vẽ nền
                 const resp = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1m&limit=60`);
                 const data = await resp.json();
+                
+                // CỘNG THÊM 7 TIẾNG VÀO DATA NẾN CỦA BINANCE
                 const candles = data.map(d => ({
-                    time: d[0] / 1000,
+                    time: (d[0] / 1000) + VN_TIMEZONE_OFFSET,
                     open: parseFloat(d[1]), high: parseFloat(d[2]),
                     low: parseFloat(d[3]), close: parseFloat(d[4])
                 }));
-
-                // [THÊM LỚP BẢO VỆ Ở ĐÂY]
-                if (candleSeries) {
-                    candleSeries.setData(candles);
-                }
+                
+                if (candleSeries) candleSeries.setData(candles);
                 document.getElementById('chart-loading').classList.add('hidden');
-            } catch (e) {
-                console.error("Lỗi tải nến Binance:", e);
-                document.getElementById('chart-loading').classList.add('hidden');
-            }
+            } catch (e) { document.getElementById('chart-loading').classList.add('hidden'); }
         }
 
-        // ==========================================
-        // 2. XỬ LÝ DỮ LIỆU SOCKET TỪ REDIS BACKEND
-        // ==========================================
+        // Nhận tín hiệu AI Prediction
+        socket.on('ai_prediction', (data) => {
+            if (selectedSymbol === data.symbol) {
+                const pLong = (data.long * 100).toFixed(1);
+                const pShort = (data.short * 100).toFixed(1);
+                document.getElementById('ai-long').innerText = pLong;
+                document.getElementById('ai-short').innerText = pShort;
+                
+                // Tính toán đồ họa độ lớn của thanh (Bỏ phần trung gian)
+                const total = data.long + data.short;
+                const widthLong = (data.long / total) * 100;
+                const widthShort = (data.short / total) * 100;
+                
+                document.getElementById('bar-long').style.width = widthLong + '%';
+                document.getElementById('bar-short').style.width = widthShort + '%';
+            }
+        });
 
-        // Khi load trang, nhận gói đồng bộ toàn phần
         socket.on('full_state_sync', (data) => {
-            if (data.ticks && data.ticks.length > 0) {
+            if(data.ticks && data.ticks.length > 0) {
                 data.ticks.forEach(tick => updateMonitorRow(tick));
-                // Tự động bấm vào coin đầu tiên nếu chưa chọn coin nào
-                if (isFirstLoad) {
-                    selectCoin(data.ticks[0].symbol);
-                    isFirstLoad = false;
-                }
+                if (isFirstLoad) { selectCoin(data.ticks[0].symbol); isFirstLoad = false; }
             }
-            if (data.logs) {
-                document.getElementById('thought-log').innerHTML = '';
-                data.logs.forEach(log => appendThought(log));
-            }
-            if (data.trades) updateTradeHistory(data.trades);
+            if(data.logs) { document.getElementById('thought-log').innerHTML = ''; data.logs.forEach(log => appendThought(log)); }
+            if(data.trades) updateTradeHistory(data.trades);
             updateStats();
         });
 
-        // Dữ liệu Real-time (100ms - 500ms)
         socket.on('live_features', (data) => {
-            // 1. Cập nhật bảng bên trái
             updateMonitorRow(data);
-
-            // 2. NẾU coin này đang được chọn -> Cập nhật biểu đồ và bảng chi tiết bên phải
-            if (selectedSymbol === data.symbol) {
-                updateDetailPanel(data);
-            }
+            if (selectedSymbol === data.symbol) updateDetailPanel(data);
         });
-
-        // ==========================================
-        // 3. CÁC HÀM CẬP NHẬT GIAO DIỆN CON
-        // ==========================================
 
         function updateMonitorRow(data) {
             const tbody = document.getElementById('monitor-body');
             let row = document.getElementById(`row-${data.symbol}`);
-
             if (!row) {
                 row = document.createElement('tr');
                 row.id = `row-${data.symbol}`;
@@ -324,48 +223,28 @@
                 tbody.prepend(row);
                 document.getElementById('stat-count').innerText = `${tbody.rows.length} Coins`;
             }
-
             const mfaClass = data.MFA > 0 ? 'text-green-400' : (data.MFA < 0 ? 'text-red-400' : 'text-gray-400');
-            row.innerHTML = `
-                <td class="px-4 py-2 font-bold text-blue-400">${data.symbol}</td>
-                <td class="px-4 py-2 text-right">${data.last_price.toFixed(4)}</td>
-                <td class="px-4 py-2 text-right ${mfaClass}">${data.MFA.toFixed(2)}</td>
-            `;
+            row.innerHTML = `<td class="px-4 py-2 font-bold text-blue-400">${data.symbol}</td><td class="px-4 py-2 text-right">${data.last_price.toFixed(4)}</td><td class="px-4 py-2 text-right ${mfaClass}">${data.MFA.toFixed(2)}</td>`;
         }
 
         function updateDetailPanel(data) {
-            // Cập nhật giá & Trend
             document.getElementById('active-price').innerText = data.last_price.toFixed(4);
-            const trendBadge = document.getElementById('active-trend');
-            if (data.MFA > 2) { trendBadge.innerText = 'PUMPING'; trendBadge.className = 'text-[10px] bg-green-900 text-green-300 px-2 py-0.5 rounded font-bold uppercase'; }
-            else if (data.MFA < -2) { trendBadge.innerText = 'DUMPING'; trendBadge.className = 'text-[10px] bg-red-900 text-red-300 px-2 py-0.5 rounded font-bold uppercase'; }
-            else { trendBadge.innerText = 'NEUTRAL'; trendBadge.className = 'text-[10px] bg-gray-800 text-gray-400 px-2 py-0.5 rounded font-bold uppercase'; }
+            const trend = document.getElementById('active-trend');
+            if (data.MFA > 2) { trend.innerText = 'PUMPING'; trend.className = 'text-[10px] bg-green-900 text-green-300 px-2 py-0.5 rounded font-bold uppercase'; }
+            else if (data.MFA < -2) { trend.innerText = 'DUMPING'; trend.className = 'text-[10px] bg-red-900 text-red-300 px-2 py-0.5 rounded font-bold uppercase'; }
+            else { trend.innerText = 'NEUTRAL'; trend.className = 'text-[10px] bg-gray-800 text-gray-400 px-2 py-0.5 rounded font-bold uppercase'; }
 
-            // Cập nhật chỉ số HFT
-            const ofiEl = document.getElementById('detail-ofi');
-            ofiEl.innerText = data.OFI.toFixed(2);
-            ofiEl.className = `font-bold ${data.OFI > 0 ? 'text-green-400' : 'text-red-400'}`;
+            document.getElementById('detail-ofi').innerText = data.OFI.toFixed(2); document.getElementById('detail-ofi').className = `font-bold ${data.OFI > 0 ? 'text-green-400' : 'text-red-400'}`;
+            document.getElementById('detail-mfa').innerText = data.MFA.toFixed(2); document.getElementById('detail-mfa').className = `font-bold ${data.MFA > 0 ? 'text-green-400' : 'text-red-400'}`;
+            document.getElementById('detail-whale').innerText = (data.WHALE_NET || 0).toFixed(4); document.getElementById('detail-whale').className = `font-bold ${(data.WHALE_NET || 0) > 0 ? 'text-green-500' : 'text-red-500'}`;
 
-            const mfaEl = document.getElementById('detail-mfa');
-            mfaEl.innerText = data.MFA.toFixed(2);
-            mfaEl.className = `font-bold ${data.MFA > 0 ? 'text-green-400' : 'text-red-400'}`;
-
-            const whaleEl = document.getElementById('detail-whale');
-            whaleEl.innerText = (data.WHALE_NET || 0).toFixed(4);
-            whaleEl.className = `font-bold ${(data.WHALE_NET || 0) > 0 ? 'text-green-500' : 'text-red-500'}`;
-
-            document.getElementById('detail-vpin').innerText = (data.VPIN * 100).toFixed(1) + '%';
-
-            // Vẽ tiếp cây nến (Nến 1 phút hiện tại)
             if (candleSeries) {
-                // Tính Timestamp làm tròn về đầu phút để nến không bị nhảy liên tục
-                const currentMinute = Math.floor(Date.now() / 60000) * 60;
+                // TÍNH TOÁN GIỜ THEO CHUẨN VN CHO CÂY NẾN HIỆN TẠI
+                const currentMinute = Math.floor(Date.now() / 60000) * 60 + VN_TIMEZONE_OFFSET;
                 candleSeries.update({
                     time: currentMinute,
-                    open: data.open_price || data.last_price, // Fallback nếu Feed không đủ data
-                    high: data.high_price || data.last_price,
-                    low: data.low_price || data.last_price,
-                    close: data.last_price
+                    open: data.open_price || data.last_price, high: data.high_price || data.last_price,
+                    low: data.low_price || data.last_price, close: data.last_price
                 });
             }
         }
@@ -375,63 +254,35 @@
             const entry = document.createElement('div');
             entry.className = "border-l-2 border-gray-700 pl-2 opacity-90";
             entry.innerHTML = `<span class="text-gray-500">[${data.symbol}]</span> <span class="text-gray-300">${data.msg}</span>`;
-            const logBox = document.getElementById('thought-log');
-            logBox.prepend(entry);
+            const logBox = document.getElementById('thought-log'); logBox.prepend(entry);
             if (logBox.childNodes.length > 50) logBox.lastChild.remove();
         }
 
         socket.on('experience', (data) => {
-            const isWin = data.pnl_pct >= 0;
-            const div = document.createElement('div');
+            const isWin = data.pnl_pct >= 0; const div = document.createElement('div');
             div.className = `p-2 rounded bg-black bg-opacity-20 border-l-4 ${isWin ? 'border-green-500' : 'border-red-500'}`;
-            div.innerHTML = `
-                <div class="flex justify-between font-bold text-[10px]">
-                    <span>${data.symbol} <span class="font-normal text-gray-500">${data.trade_type}</span></span>
-                    <span class="${isWin ? 'text-green-400' : 'text-red-400'}">${data.pnl_pct}%</span>
-                </div>
-                <div class="text-[9px] text-gray-500 mt-1 truncate">Prob: ${(data.prob_score * 100).toFixed(1)}% | ${data.reason}</div>
-            `;
-            const expBox = document.getElementById('experience-log');
-            expBox.prepend(div);
+            div.innerHTML = `<div class="flex justify-between font-bold text-[10px]"><span>${data.symbol} <span class="font-normal text-gray-500">${data.trade_type}</span></span><span class="${isWin ? 'text-green-400' : 'text-red-400'}">${data.pnl_pct}%</span></div><div class="text-[9px] text-gray-500 mt-1 truncate">Prob: ${(data.prob_score*100).toFixed(1)}% | ${data.reason}</div>`;
+            const expBox = document.getElementById('experience-log'); expBox.prepend(div);
             if (expBox.childNodes.length > 20) expBox.lastChild.remove();
-            updateStats();
         });
 
         socket.on('trade_update', () => updateStats());
 
         async function updateStats() {
             try {
-                const res = await fetch('/api/stats');
-                const stats = await res.json();
-                const pnlEl = document.getElementById('stat-pnl');
-                pnlEl.innerText = stats.netPnL;
-                pnlEl.className = `text-lg font-bold mono ${parseFloat(stats.netPnL) >= 0 ? 'text-green-400' : 'text-red-400'}`;
+                const res = await fetch('/api/stats'); const stats = await res.json();
+                document.getElementById('stat-pnl').innerText = stats.netPnL; document.getElementById('stat-pnl').className = `text-lg font-bold mono ${parseFloat(stats.netPnL) >= 0 ? 'text-green-400' : 'text-red-400'}`;
                 document.getElementById('stat-win').innerText = stats.winRate;
-
-                const resTrades = await fetch('/api/trades');
-                const trades = await resTrades.json();
-                updateTradeHistory(trades);
-            } catch (e) { }
+                const resTrades = await fetch('/api/trades'); updateTradeHistory(await resTrades.json());
+            } catch (e) {}
         }
 
         function updateTradeHistory(trades) {
             document.getElementById('trade-history').innerHTML = trades.slice(0, 20).map(t => {
                 const isWin = t.pnl > 0;
-                return `
-                    <div class="px-3 py-2 hover:bg-gray-800 flex justify-between items-center text-[10px]">
-                        <div>
-                            <div class="font-bold text-gray-300">${t.symbol} <span class="${t.side === 'LONG' ? 'text-green-500' : 'text-red-500'} ml-1">${t.side}</span></div>
-                            <div class="text-gray-600">${new Date(t.closeTime || t.openTime).toLocaleTimeString()}</div>
-                        </div>
-                        <div class="text-right">
-                            <div class="${isWin ? 'text-green-500' : 'text-red-500'} font-bold">${t.pnl ? t.pnl.toFixed(2) + ' USDT' : 'OPEN'}</div>
-                            <div class="text-gray-600 max-w-[120px] truncate">${t.exitReason || 'Pending...'}</div>
-                        </div>
-                    </div>
-                `;
+                return `<div class="px-3 py-2 hover:bg-gray-800 flex justify-between items-center text-[10px]"><div><div class="font-bold text-gray-300">${t.symbol} <span class="${t.side === 'LONG'?'text-green-500':'text-red-500'} ml-1">${t.side}</span></div><div class="text-gray-600">${new Date(t.closeTime || t.openTime).toLocaleTimeString()}</div></div><div class="text-right"><div class="${isWin ? 'text-green-500' : 'text-red-500'} font-bold">${t.pnl ? t.pnl.toFixed(2) + ' USDT' : 'OPEN'}</div><div class="text-gray-600 max-w-[120px] truncate">${t.exitReason || 'Pending...'}</div></div></div>`;
             }).join('');
         }
     </script>
 </body>
-
 </html>

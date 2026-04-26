@@ -22,9 +22,9 @@ try {
     const configPath = path.join(__dirname, '../../system_config.json');
     config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 } catch (e) {
-    config = { 
+    config = {
         REDIS_URL: process.env.REDIS_URL || 'redis://127.0.0.1:6379',
-        CHANNELS: { FEATURES: 'market:features:*', MACRO_SCORES: 'macro:scores' } 
+        CHANNELS: { FEATURES: 'market:features:*', MACRO_SCORES: 'macro:scores' }
     };
 }
 
@@ -43,7 +43,7 @@ const subClient = new Redis(config.REDIS_URL);
 const dataClient = new Redis(config.REDIS_URL);
 
 subClient.psubscribe(config.CHANNELS?.FEATURES || 'market:features:*');
-subClient.subscribe('dashboard:logs', 'experience:raw', 'system:subscriptions');
+subClient.subscribe('dashboard:logs', 'experience:raw', 'system:subscriptions', 'dashboard:predictions');
 
 // 3. BỘ NHỚ ĐỆM SERVER (RAM CACHE)
 let aiLogHistory = [];
@@ -61,8 +61,8 @@ app.get('/api/trades', async (req, res) => {
     try {
         const trades = await ScoutTrade.find().sort({ openTime: -1 }).limit(50);
         res.json(trades);
-    } catch (err) { 
-        res.status(500).json({ error: err.message }); 
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -84,8 +84,8 @@ app.get('/api/stats', async (req, res) => {
             openPositions: openTrades.length,
             currentWalletEstimation: (200 + totalPnL).toFixed(2) + ' USDT' // Giả sử vốn gốc 200$
         });
-    } catch (err) { 
-        res.status(500).json({ error: err.message }); 
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -115,31 +115,31 @@ io.on('connection', async (socket) => {
 subClient.on('message', (channel, message) => {
     try {
         const data = JSON.parse(message);
-        
         if (channel === 'dashboard:logs') {
             aiLogHistory.push(data);
-            if (aiLogHistory.length > 100) aiLogHistory.shift(); // Giữ RAM nhẹ
+            if (aiLogHistory.length > 100) aiLogHistory.shift();
             io.emit('ai_thoughts', data);
-        } 
+        }
         else if (channel === 'experience:raw') {
             io.emit('experience', data);
-            io.emit('trade_update'); // Kích hoạt UI load lại API /stats
+            io.emit('trade_update');
         }
-        else if (channel === 'system:subscriptions') {
-            // Khi có lệnh vào/ra, báo UI load lại trạng thái
-            if (data.action === 'ENTER_TRADE' || data.action === 'EXIT_TRADE') {
-                io.emit('trade_update'); 
-            }
+        else if (channel === 'system:subscriptions' && (data.action === 'ENTER_TRADE' || data.action === 'EXIT_TRADE')) {
+            io.emit('trade_update');
         }
-    } catch (e) {}
+        // 🟢 [THÊM MỚI] Chuyển tiếp dự đoán AI xuống giao diện web
+        else if (channel === 'dashboard:predictions') {
+            io.emit('ai_prediction', data);
+        }
+    } catch (e) { }
 });
 
 // B. Lắng nghe dòng dữ liệu HFT (Tick by Tick)
 subClient.on('pmessageBuffer', (pattern, channel, messageBuffer) => {
     let feature;
     // Hybrid Decode: Hỗ trợ cả MsgPack (Python) và JSON
-    try { 
-        feature = decode(messageBuffer); 
+    try {
+        feature = decode(messageBuffer);
     } catch (e) {
         try { feature = JSON.parse(messageBuffer.toString()); } catch (err) { return; }
     }
