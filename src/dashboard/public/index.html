@@ -277,10 +277,51 @@
             } catch (e) {}
         }
 
-        function updateTradeHistory(trades) {
-            document.getElementById('trade-history').innerHTML = trades.slice(0, 20).map(t => {
+       function updateTradeHistory(trades) {
+            const historyContainer = document.getElementById('trade-history');
+            
+            // Nếu chưa có lệnh nào trong Database
+            if (!trades || trades.length === 0) {
+                historyContainer.innerHTML = '<p class="text-center text-gray-600 text-xs py-6 italic">Chưa có dữ liệu lệnh thực tế từ Database...</p>';
+                return;
+            }
+
+            historyContainer.innerHTML = trades.slice(0, 30).map(t => {
+                // Xác định màu sắc và trạng thái
                 const isWin = t.pnl > 0;
-                return `<div class="px-3 py-2 hover:bg-gray-800 flex justify-between items-center text-[10px]"><div><div class="font-bold text-gray-300">${t.symbol} <span class="${t.side === 'LONG'?'text-green-500':'text-red-500'} ml-1">${t.side}</span></div><div class="text-gray-600">${new Date(t.closeTime || t.openTime).toLocaleTimeString()}</div></div><div class="text-right"><div class="${isWin ? 'text-green-500' : 'text-red-500'} font-bold">${t.pnl ? t.pnl.toFixed(2) + ' USDT' : 'OPEN'}</div><div class="text-gray-600 max-w-[120px] truncate">${t.exitReason || 'Pending...'}</div></div></div>`;
+                const isClosed = t.status === 'CLOSED';
+                const pnlColor = !isClosed ? 'text-yellow-500' : (isWin ? 'text-green-500' : 'text-red-500');
+                const pnlText = !isClosed ? 'ĐANG CHẠY' : (t.pnl ? (t.pnl > 0 ? '+' : '') + t.pnl.toFixed(2) + ' USDT' : '0.00 USDT');
+                const sideColor = t.side === 'LONG' ? 'text-green-400' : 'text-red-400';
+                
+                // Format thời gian
+                const timeStr = new Date(t.closeTime || t.openTime).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+                return `
+                    <div class="px-4 py-2 hover:bg-gray-800 flex flex-col gap-1 border-b border-gray-800 transition-colors">
+                        <div class="flex justify-between items-center">
+                            <div class="font-bold text-gray-200 text-xs flex items-center gap-2">
+                                ${t.symbol} 
+                                <span class="${sideColor} bg-black bg-opacity-40 px-1.5 py-0.5 rounded text-[9px] border border-gray-700">
+                                    ${t.side} x${t.leverage || '?'}
+                                </span>
+                                <span class="text-gray-600 text-[9px] font-normal">${timeStr}</span>
+                            </div>
+                            <div class="${pnlColor} font-bold text-[11px]">${pnlText}</div>
+                        </div>
+                        
+                        <div class="flex justify-between items-center text-gray-500 text-[10px] mt-0.5">
+                            <div class="flex gap-3">
+                                <span>Ký quỹ: <span class="text-gray-300 font-mono">${t.margin ? t.margin.toFixed(2) + '$' : '--'}</span></span>
+                                <span>Entry: <span class="text-gray-300 font-mono">${t.entryPrice ? t.entryPrice.toFixed(4) : '--'}</span></span>
+                                <span>Exit: <span class="text-gray-300 font-mono">${t.exitPrice ? t.exitPrice.toFixed(4) : 'Đang chờ...'}</span></span>
+                            </div>
+                            <div class="text-right truncate max-w-[120px] text-[9px] italic" title="${t.exitReason || t.status}">
+                                ${t.exitReason || 'OPEN'}
+                            </div>
+                        </div>
+                    </div>
+                `;
             }).join('');
         }
     </script>
