@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class FeatureBuffer:
-    """Bộ đệm tính toán Features - Tích hợp ATR, VPIN, OFI, MFA"""
+    """Bộ đệm tính toán Features - Tích hợp ATR, VPIN, OFI, MFA và Chuẩn hóa Tương đối"""
     def __init__(self, symbol):
         self.symbol = symbol.upper()
         self.is_warm = False
@@ -89,7 +89,7 @@ class FeatureBuffer:
         self.ask_vol_1pct = sum(float(v) for p, v in asks if float(p) <= ask_1pct_price)
 
         # Tính OFI (dùng ob_imb_top20 làm proxy, scale để có giá trị >15 khi mạnh)
-        self.ofi = self.ob_imb_top20 * 100  # -100 đến 100
+        self.ofi = self.ob_imb_top20 * 100
 
     def update_trade(self, data):
         qty = float(data.get('q', 0))
@@ -119,6 +119,11 @@ class FeatureBuffer:
         self.mfa = self.ofi - self._last_ofi
         self._last_ofi = self.ofi
 
+        # 🚀 CHUẨN HÓA TƯƠNG ĐỐI (SCALE INVARIANT)
+        # Ép tất cả các biến khối lượng tuyệt đối (Base Asset) thành Tỷ lệ % của tổng Quote Volume
+        quote_vol_safe = self.quote_volume if self.quote_volume > 0 else 1e-8
+        close_p = self.last_price
+
         features = {
             "symbol": self.symbol,
             "is_warm": self.is_warm,
@@ -126,26 +131,26 @@ class FeatureBuffer:
             "best_bid": self.best_bid,
             "last_price": self.last_price,
             
-            # 13 features gốc cho ONNX
+            # 13 features chuẩn hóa 100% khớp với universal_trainer.py
             "ob_imb_top20": float(self.ob_imb_top20),
             "spread_close": float(self.spread_close),
-            "bid_vol_1pct": float(self.bid_vol_1pct),
-            "ask_vol_1pct": float(self.ask_vol_1pct),
-            "max_buy_trade": float(self.max_buy_trade),
-            "max_sell_trade": float(self.max_sell_trade),
-            "liq_long_vol": float(self.liq_long_vol), 
-            "liq_short_vol": float(self.liq_short_vol),
+            "bid_vol_1pct": float((self.bid_vol_1pct * close_p) / quote_vol_safe),
+            "ask_vol_1pct": float((self.ask_vol_1pct * close_p) / quote_vol_safe),
+            "max_buy_trade": float((self.max_buy_trade * close_p) / quote_vol_safe),
+            "max_sell_trade": float((self.max_sell_trade * close_p) / quote_vol_safe),
+            "liq_long_vol": float((self.liq_long_vol * close_p) / quote_vol_safe), 
+            "liq_short_vol": float((self.liq_short_vol * close_p) / quote_vol_safe),
             "funding_rate": float(current_funding_rate),
             "taker_buy_ratio": float(taker_buy_ratio),
             "body_size": float(body_size),
             "wick_size": float(wick_size),
             "btc_relative_strength": float(btc_relative_strength),
             
-            # Các chỉ số bổ sung cho OrderManager (không cần đưa vào ONNX)
-            "ATR14": float(self.atr14),        # Tỷ lệ %, ví dụ 0.003 = 0.3%
-            "VPIN": float(self.vpin),          # 0..1
-            "OFI": float(self.ofi),            # -100..100
-            "MFA": float(self.mfa)             # thay đổi của OFI
+            # Các chỉ số bổ sung cho OrderManager (không đi vào ONNX)
+            "ATR14": float(self.atr14),
+            "VPIN": float(self.vpin),
+            "OFI": float(self.ofi),
+            "MFA": float(self.mfa)
         }
 
         # Reset spikes sau mỗi lần lấy mẫu
@@ -155,7 +160,6 @@ class FeatureBuffer:
         self.liq_short_vol = 0.0
 
         return features
-
 
 class FeedHandler:
     def __init__(self):
@@ -254,6 +258,7 @@ class FeedHandler:
                             self.stream_refs[symbol]['radar'] = True
                         elif action == 'UNSUBSCRIBE':
                             self.stream_refs[symbol]['radar'] = False
+                            
                     should_run = self._should_keep_stream(symbol)
                     is_running = symbol in self.active_tasks
 
@@ -283,11 +288,12 @@ class FeedHandler:
                     current_funding = self.global_funding_rates.get(symbol, 0.0001)
                     features = buffer.extract_features(self.btc_pct, current_funding)
                     packed_data = msgpack.packb(features)
+                    # Bắn vào kênh duy nhất để tránh dư thừa dữ liệu
                     await self.redis.publish(f"market:features:{symbol.upper()}", packed_data)
             await asyncio.sleep(0.1) 
 
     async def run(self):
-        print("🧠 [PYTHON ENGINE] V17 Khởi động chuẩn HFT...")
+        print("🧠 [PYTHON ENGINE] V17 Khởi động chuẩn HFT (Scale Invariant)...")
         self.stream_refs['btcusdt'] = {'radar': True, 'trade': True}
         self.buffers['btcusdt'] = FeatureBuffer('btcusdt')
         self.active_tasks['btcusdt'] = asyncio.create_task(self.connect_binance_ws('btcusdt'))
