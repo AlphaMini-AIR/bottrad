@@ -207,9 +207,9 @@ subClient.on('pmessageBuffer', async (pattern, channel, messageBuffer) => {
                 latestFeatures.set(`ai_emit_${symbol}`, now);
             } catch (e) {}
         }
-        
-        if (probLong >= 0.80) { tradeAction = 'LONG'; finalProb = probLong; }
-        else if (probShort >= 0.80) { tradeAction = 'SHORT'; finalProb = probShort; }
+
+        if (probLong >= 0.70) { tradeAction = 'LONG'; finalProb = probLong; }
+        else if (probShort >= 0.70) { tradeAction = 'SHORT'; finalProb = probShort; }
 
         if (!tradeAction) return; 
 
