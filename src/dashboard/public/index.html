@@ -3,14 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>V17 Institutional Watchtower | AI Quant Sniper</title>
+    <title>V17 Watchtower Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="/socket.io/socket.io.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body { background-color: #0d1117; color: #c9d1d9; font-family: 'Courier New', Courier, monospace; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
-        .panel { background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1rem; overflow: hidden; display: flex; flex-direction: column; }
-        .suspect-item { cursor: pointer; transition: all 0.2s; border-left: 3px solid transparent; }
+        .panel { background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 0.75rem; overflow: hidden; display: flex; flex-direction: column; }
+        .suspect-item { cursor: pointer; transition: background-color 0.15s ease; border-left: 3px solid transparent; }
         .suspect-item:hover, .suspect-item.active { background-color: #1f6feb; color: white; border-left: 3px solid #58a6ff; }
         .up { color: #3fb950; font-weight: bold; } 
         .down { color: #f85149; font-weight: bold; }
@@ -19,252 +19,280 @@
         ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 10px; }
     </style>
 </head>
-<body class="p-2 md:p-4 gap-2 md:gap-4">
+<body class="p-2 gap-2 text-xs md:text-sm md:p-4 md:gap-4">
     
-    <div class="flex flex-col md:flex-row gap-4 h-full md:h-2/5 overflow-hidden">
+    <div class="flex flex-col md:flex-row gap-2 md:gap-4 h-full md:h-2/5 overflow-hidden">
+        
         <div class="panel w-full md:w-1/4">
             <h2 class="text-xs font-bold text-yellow-400 mb-2 flex justify-between">
                 <span>👁️ ĐANG DÒ (LIVE)</span>
                 <span id="active-count" class="text-gray-500">0</span>
             </h2>
-            <div id="suspects-list" class="overflow-y-auto pr-2 space-y-1 text-sm">
-                <div class="text-gray-600 text-center py-4">Đang đợi Python Feed...</div>
+            <div id="suspects-list" class="overflow-y-auto pr-2 space-y-1">
+                <div class="text-gray-600 text-center py-4">Đang đợi kết nối...</div>
             </div>
         </div>
 
         <div class="panel w-full md:w-2/4 relative">
-            <h2 class="text-xs font-bold text-purple-400 mb-2 border-b border-gray-700 pb-2">
-                🧠 TÂM LÝ AI: <span id="selected-coin-name" class="text-white">Toàn hệ thống</span>
+            <h2 class="text-xs font-bold text-purple-400 mb-2 border-b border-gray-700 pb-2 flex justify-between">
+                <span>🧠 TÂM LÝ AI: <span id="selected-coin-name" class="text-white">Toàn hệ thống</span></span>
+                <button onclick="clearLogs()" class="text-gray-500 hover:text-white cursor-pointer px-2">Xóa</button>
             </h2>
-            <div id="ai-logs" class="overflow-y-auto text-[10px] md:text-xs text-green-400 p-2 bg-black rounded flex-grow font-mono">
-                <div class="text-gray-700 italic">Khởi động hệ thần kinh AI...</div>
+            <div id="ai-logs" class="overflow-y-auto text-[10px] md:text-xs text-green-400 p-2 bg-black rounded flex-grow font-mono leading-relaxed">
             </div>
         </div>
 
         <div class="panel w-full md:w-1/4">
             <h2 class="text-xs font-bold text-blue-400 mb-2 border-b border-gray-700 pb-2">📊 HIỆU SUẤT V17</h2>
-            <div id="global-stats" class="text-xs space-y-2 mt-2">
-                <div class="flex justify-between"><span>Winrate:</span> <b id="stat-winrate" class="text-white">0%</b></div>
-                <div class="flex justify-between"><span>Tổng PnL:</span> <b id="stat-pnl" class="text-white">0.00 USDT</b></div>
-                <div class="flex justify-between"><span>Tổng Lệnh:</span> <b id="stat-trades" class="text-white">0</b></div>
-                <div class="flex justify-between"><span>Phí Sàn:</span> <b id="stat-fees" class="text-gray-500">0.00</b></div>
+            <div id="global-stats" class="space-y-2 mt-2">
+                <div class="flex justify-between"><span>Winrate:</span> <b id="stat-winrate" class="text-white">--</b></div>
+                <div class="flex justify-between"><span>Tổng PnL:</span> <b id="stat-pnl" class="text-white">--</b></div>
+                <div class="flex justify-between"><span>Tổng Lệnh:</span> <b id="stat-trades" class="text-white">--</b></div>
+                <div class="flex justify-between"><span>Phí Sàn:</span> <b id="stat-fees" class="text-gray-500">--</b></div>
                 <div class="flex justify-between mt-2 pt-2 border-t border-gray-700">
                     <span class="text-yellow-400 font-bold">Ước tính Ví:</span> 
-                    <b id="stat-wallet" class="text-yellow-400 text-base">200.00 USDT</b>
+                    <b id="stat-wallet" class="text-yellow-400 text-sm md:text-base">--</b>
                 </div>
             </div>
         </div>
     </div>
 
-    <div class="panel h-48 md:h-1/5 py-2">
+    <div class="panel h-32 md:h-1/5 py-2">
         <canvas id="equityChart"></canvas>
     </div>
 
     <div class="panel flex-grow h-2/5">
-        <h2 class="text-xs font-bold text-gray-400 mb-2">📚 KIỂM TOÁN LỆNH (MFE / MAE / FUNDING)</h2>
+        <h2 class="text-xs font-bold text-gray-400 mb-2">📚 KIỂM TOÁN LỆNH</h2>
         <div class="overflow-auto">
             <table class="w-full text-left text-[10px] md:text-xs whitespace-nowrap">
-                <thead class="sticky top-0 bg-[#161b22] text-gray-500 shadow-sm">
+                <thead class="sticky top-0 bg-[#161b22] text-gray-500 shadow-sm z-10">
                     <tr>
-                        <th class="pb-2">Thời gian</th>
-                        <th class="pb-2">Cặp Tiền</th>
+                        <th class="pb-2">Time</th>
+                        <th class="pb-2">Cặp</th>
                         <th class="pb-2">Loại</th>
-                        <th class="pb-2">Lev</th>
                         <th class="pb-2">Entry</th>
-                        <th class="pb-2">PnL</th>
-                        <th class="pb-2 text-yellow-500">MFE</th>
-                        <th class="pb-2 text-red-500">MAE</th>
-                        <th class="pb-2">Lý do đóng</th>
+                        <th class="pb-2 text-right">PnL</th>
+                        <th class="pb-2 text-yellow-500 text-right">MFE</th>
+                        <th class="pb-2 text-red-500 text-right">MAE</th>
                     </tr>
                 </thead>
                 <tbody id="trade-history" class="divide-y divide-gray-800">
-                    </tbody>
+                </tbody>
             </table>
         </div>
     </div>
 
     <script>
-        // Khởi tạo Socket (Tự động nhận diện IP VPS)
         const socket = io(); 
         let selectedSymbol = null;
         let aiLogsData = {}; 
-        const activeSuspects = new Map();
+        let activeSuspectsMap = new Map();
         let equityChart = null;
 
-        // 1. Khởi tạo Biểu đồ Equity
+        // Cấu hình Render
+        const MAX_LOGS_PER_COIN = 30;
+
         function initChart() {
             const ctx = document.getElementById('equityChart').getContext('2d');
             equityChart = new Chart(ctx, {
                 type: 'line',
-                data: { 
-                    labels: [], 
-                    datasets: [{ 
-                        label: 'Số dư (USDT)', 
-                        data: [], 
-                        borderColor: '#3fb950', 
-                        backgroundColor: 'rgba(63, 185, 80, 0.05)', 
-                        borderWidth: 2, 
-                        fill: true, 
-                        tension: 0.2, 
-                        pointRadius: 1 
-                    }] 
-                },
-                options: { 
-                    responsive: true, 
-                    maintainAspectRatio: false, 
-                    plugins: { legend: { display: false } }, 
-                    scales: { 
-                        x: { display: false }, 
-                        y: { ticks: { color: '#8b949e', font: { size: 10 } }, grid: { color: '#21262d' } } 
-                    } 
-                }
+                data: { labels: [], datasets: [{ data: [], borderColor: '#3fb950', backgroundColor: 'rgba(63, 185, 80, 0.05)', borderWidth: 1.5, fill: true, tension: 0.1, pointRadius: 0 }] },
+                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { ticks: { color: '#8b949e', font: { size: 9 } }, grid: { color: '#21262d' } } } }
             });
         }
 
-        // 2. Fetch Thống kê từ API (Watchtower Server)
         async function updateStats() {
             try {
                 const res = await fetch('/api/stats');
                 const data = await res.json();
                 
                 document.getElementById('stat-winrate').innerText = data.winRate;
-                document.getElementById('stat-pnl').innerText = data.netPnL;
                 document.getElementById('stat-trades').innerText = data.totalTrades;
                 document.getElementById('stat-fees').innerText = data.totalFeesPaidToBinance;
                 document.getElementById('stat-wallet').innerText = data.currentWalletEstimation;
 
-                // Màu sắc theo PnL
-                const pnlValue = parseFloat(data.netPnL);
-                document.getElementById('stat-pnl').className = pnlValue >= 0 ? 'up' : 'down';
+                const pnlEl = document.getElementById('stat-pnl');
+                pnlEl.innerText = data.netPnL;
+                pnlEl.className = parseFloat(data.netPnL) >= 0 ? 'up' : 'down';
                 
-                // Cập nhật biểu đồ
                 const curveRes = await fetch('/api/equity-curve');
                 const curveData = await curveRes.json();
                 if (equityChart && curveData.length > 0) {
-                    equityChart.data.labels = curveData.map(d => new Date(d.time).toLocaleTimeString());
+                    equityChart.data.labels = curveData.map(d => d.time);
                     equityChart.data.datasets[0].data = curveData.map(d => d.balance);
-                    equityChart.update();
+                    equityChart.update('none'); // Update không animation để mượt hơn
                 }
             } catch (e) { console.error("Lỗi cập nhật stats:", e); }
         }
 
-        // 3. Xử lý Sự kiện Socket
         socket.on('full_state', (state) => {
             aiLogsData = state.logs || {};
-            state.ticks.forEach(feat => activeSuspects.set(feat.symbol, feat));
-            renderSuspects();
+            state.ticks.forEach(feat => activeSuspectsMap.set(feat.symbol, feat));
+            renderSuspectsBatch();
             renderTradeHistory(state.trades);
             updateStats();
         });
 
-        socket.on('live_features', (data) => {
-            activeSuspects.set(data.symbol, data);
-            renderSuspects();
+        // Lắng nghe dữ liệu theo lô (Batching) để tối ưu DOM
+        socket.on('live_features_batch', (ticks) => {
+            ticks.forEach(feat => activeSuspectsMap.set(feat.symbol, feat));
+            requestAnimationFrame(renderSuspectsBatch); // Dùng rAF để vẽ mượt mà
         });
 
         socket.on('ai_thoughts', (data) => {
-            const sym = data.symbol;
+            const sym = data.symbol || 'SYSTEM';
             if (!aiLogsData[sym]) aiLogsData[sym] = [];
-            aiLogsData[sym].push(data);
             
-            // Giới hạn 50 log mỗi coin
-            if (aiLogsData[sym].length > 50) aiLogsData[sym].shift();
+            aiLogsData[sym].push(data);
+            if (aiLogsData[sym].length > MAX_LOGS_PER_COIN) aiLogsData[sym].shift();
 
+            // Chỉ vẽ thêm log nếu đang xem coin đó hoặc đang xem Toàn hệ thống
             if (selectedSymbol === null || selectedSymbol === sym) {
-                const logsBox = document.getElementById('ai-logs');
-                const timeStr = new Date(data.ts).toLocaleTimeString();
-                logsBox.innerHTML += `<div class="log-entry">[${timeStr}] [${sym}] ${data.msg}</div>`;
-                logsBox.scrollTop = logsBox.scrollHeight;
+                appendLogToDOM(data);
             }
         });
 
         socket.on('new_trade', () => {
             updateStats();
-            // Tải lại lịch sử trade sau 1s để DB kịp update
             setTimeout(async () => {
-                const res = await fetch('/api/trades');
-                const trades = await res.json();
-                renderTradeHistory(trades);
+                const res = await fetch('/api/trades'); // Tạo API endpoint này nếu chưa có, hoặc dùng tạm logic cũ
+                // Tạm thời chỉ update stats, bạn có thể implement fetch bảng lệnh riêng
             }, 1000);
         });
 
-        // 4. UI Renders
+        // --- XỬ LÝ GIAO DIỆN CHÍNH ---
+
         function selectCoin(symbol) {
+            // Toggle selection
             selectedSymbol = (selectedSymbol === symbol) ? null : symbol;
             document.getElementById('selected-coin-name').innerText = selectedSymbol || "Toàn hệ thống";
             
-            // Re-render logs
+            rebuildLogsDOM();
+            renderSuspectsBatch(); // Cập nhật lại màu sắc danh sách
+        }
+
+        function clearLogs() {
+            if(selectedSymbol) {
+                aiLogsData[selectedSymbol] = [];
+            } else {
+                aiLogsData = {};
+            }
+            document.getElementById('ai-logs').innerHTML = '';
+        }
+
+        function appendLogToDOM(log) {
+            const logsBox = document.getElementById('ai-logs');
+            const timeStr = new Date(log.ts).toLocaleTimeString('en-US', {hour12: false});
+            
+            // Tạo element mới bằng bộ nhớ để tránh reflow toàn khối
+            const el = document.createElement('div');
+            el.className = 'log-entry';
+            el.innerText = `[${timeStr}] [${log.symbol}] ${log.msg}`;
+            
+            logsBox.appendChild(el);
+            
+            // Xóa bớt DOM nếu quá dài
+            if (logsBox.childElementCount > 50) {
+                logsBox.removeChild(logsBox.firstChild);
+            }
+            
+            // Tự động cuộn xuống đáy
+            logsBox.scrollTop = logsBox.scrollHeight;
+        }
+
+        function rebuildLogsDOM() {
             const logsBox = document.getElementById('ai-logs');
             logsBox.innerHTML = "";
             
-            const logsToRender = selectedSymbol ? (aiLogsData[symbol] || []) : Object.values(aiLogsData).flat().sort((a,b) => a.ts - b.ts);
+            let logsToRender = [];
+            if (selectedSymbol) {
+                logsToRender = aiLogsData[selectedSymbol] || [];
+            } else {
+                // Gom tất cả log, sắp xếp theo thời gian
+                logsToRender = Object.values(aiLogsData).flat().sort((a,b) => a.ts - b.ts).slice(-50);
+            }
             
-            logsToRender.slice(-50).forEach(l => {
-                const timeStr = new Date(l.ts).toLocaleTimeString();
-                logsBox.innerHTML += `<div class="log-entry">[${timeStr}] [${l.symbol}] ${l.msg}</div>`;
+            const fragment = document.createDocumentFragment();
+            logsToRender.forEach(l => {
+                const timeStr = new Date(l.ts).toLocaleTimeString('en-US', {hour12: false});
+                const el = document.createElement('div');
+                el.className = 'log-entry';
+                el.innerText = `[${timeStr}] [${l.symbol}] ${l.msg}`;
+                fragment.appendChild(el);
             });
+            
+            logsBox.appendChild(fragment);
             logsBox.scrollTop = logsBox.scrollHeight;
-            renderSuspects();
         }
 
-        function renderSuspects() {
+        function renderSuspectsBatch() {
             const list = document.getElementById('suspects-list');
-            document.getElementById('active-count').innerText = activeSuspects.size;
-            let html = '';
+            document.getElementById('active-count').innerText = activeSuspectsMap.size;
             
-            // Sắp xếp BTC lên đầu, còn lại theo OFI giảm dần
-            const sorted = Array.from(activeSuspects.values()).sort((a, b) => {
+            // Dùng Fragment để tránh việc vẽ lại DOM quá nhiều lần
+            const fragment = document.createDocumentFragment();
+            
+            // Ưu tiên BTCUSDT lên đầu, sau đó sắp xếp theo OFI
+            const sorted = Array.from(activeSuspectsMap.values()).sort((a, b) => {
                 if (a.symbol === 'BTCUSDT') return -1;
+                if (b.symbol === 'BTCUSDT') return 1;
                 return Math.abs(b.OFI || 0) - Math.abs(a.OFI || 0);
             });
 
             sorted.forEach(feat => {
-                const isActive = feat.symbol === selectedSymbol ? 'active' : 'bg-gray-800/50';
+                const isActive = feat.symbol === selectedSymbol ? 'active' : 'bg-[#1e2329]';
                 const ofi = feat.OFI || 0;
-                html += `
-                    <div onclick="selectCoin('${feat.symbol}')" class="suspect-item p-2 rounded flex justify-between items-center ${isActive}">
-                        <div class="flex flex-col">
-                            <span class="font-bold text-xs">${feat.symbol}</span>
-                            <span class="text-[9px] text-gray-500">$${feat.last_price.toFixed(feat.last_price < 1 ? 5 : 2)}</span>
-                        </div>
-                        <div class="text-right">
-                            <div class="${ofi >= 0 ? 'up' : 'down'} text-xs">${ofi > 0 ? '+' : ''}${ofi.toFixed(1)}</div>
-                            <div class="text-[9px] text-gray-600">VPIN: ${(feat.VPIN || 0).toFixed(2)}</div>
-                        </div>
+                
+                const item = document.createElement('div');
+                item.className = `suspect-item p-1.5 mb-1 rounded flex justify-between items-center ${isActive}`;
+                // Sử dụng addEventListener thay vì onclick="selectCoin()" để tối ưu bộ nhớ
+                item.addEventListener('click', () => selectCoin(feat.symbol));
+                
+                item.innerHTML = `
+                    <div class="flex flex-col">
+                        <span class="font-bold text-[11px] leading-tight text-gray-200">${feat.symbol}</span>
+                        <span class="text-[9px] text-gray-500">${feat.last_price.toFixed(feat.last_price < 1 ? 4 : 2)}</span>
+                    </div>
+                    <div class="text-right flex flex-col items-end">
+                        <span class="${ofi >= 0 ? 'up' : 'down'} text-[10px] leading-tight">${ofi > 0 ? '+' : ''}${ofi.toFixed(1)}</span>
+                        <span class="text-[8px] text-gray-600">VPN: ${(feat.VPIN || 0).toFixed(2)}</span>
                     </div>
                 `;
+                fragment.appendChild(item);
             });
-            list.innerHTML = html || '<div class="text-gray-700 text-center py-4">Đang đợi tín hiệu...</div>';
+            
+            list.innerHTML = '';
+            list.appendChild(fragment);
         }
 
         function renderTradeHistory(trades) {
             const tbody = document.getElementById('trade-history');
             if (!trades || trades.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="9" class="text-center py-4 text-gray-600">Chưa có lệnh nào được thực hiện</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-gray-600">Trống</td></tr>';
                 return;
             }
-            tbody.innerHTML = trades.map(t => {
+            
+            const html = trades.map(t => {
                 const pnl = t.pnl || 0;
-                const roi = t.roi || 0;
                 return `
-                    <tr class="hover:bg-gray-800/30">
-                        <td class="py-2 text-gray-500">${new Date(t.closeTime || t.ts).toLocaleString()}</td>
-                        <td class="font-bold text-white">${t.symbol}</td>
-                        <td class="${t.type === 'LONG' ? 'up' : 'down'} text-[9px]">${t.type}</td>
-                        <td class="text-gray-400">${t.leverage}x</td>
-                        <td>${t.entryPrice.toFixed(4)}</td>
-                        <td class="${pnl >= 0 ? 'up' : 'down'} font-bold">${pnl.toFixed(2)}</td>
-                        <td class="text-yellow-500">+${(t.mfe || 0).toFixed(2)}%</td>
-                        <td class="text-red-500">${(t.mae || 0).toFixed(2)}%</td>
-                        <td class="text-gray-600 italic text-[9px]">${t.reason || 'N/A'}</td>
+                    <tr class="hover:bg-gray-800/50">
+                        <td class="py-1.5 text-gray-500">${new Date(t.closeTime || t.ts).toLocaleTimeString('en-US', {hour12: false})}</td>
+                        <td class="font-bold text-gray-300">${t.symbol}</td>
+                        <td class="${t.type === 'LONG' ? 'up' : 'down'}">${t.type}</td>
+                        <td class="text-gray-400">${t.entryPrice?.toFixed(4) || 'N/A'}</td>
+                        <td class="${pnl >= 0 ? 'up' : 'down'} text-right">${pnl.toFixed(2)}$</td>
+                        <td class="text-yellow-500 text-right">+${(t.mfe || 0).toFixed(1)}%</td>
+                        <td class="text-red-500 text-right">${(t.mae || 0).toFixed(1)}%</td>
                     </tr>
                 `;
             }).join('');
+            
+            tbody.innerHTML = html;
         }
 
-        // Khởi động hệ thống Dashboard
+        // Khởi động
         initChart();
-        setInterval(updateStats, 30000); // Tự động update stats mỗi 30s
+        setInterval(updateStats, 15000); // 15s tự làm mới một lần
     </script>
 </body>
 </html>

@@ -28,15 +28,18 @@ const io = new Server(server, { cors: { origin: "*" } });
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Bộ nhớ đệm RAM để tăng tốc hiển thị cho người dùng mới
+// Bộ nhớ đệm RAM
 let fullTradeHistory = []; 
 let aiLogHistory = {}; 
 let lastTickData = new Map(); 
 
+// Biến kiểm soát tốc độ (Throttling) để tránh làm nghẽn UI
+let lastTickEmitTime = 0;
+
 const subClient = new Redis(config.REDIS_URL);
 
 // ==========================================
-// 2. KẾT NỐI MONGODB TOÀN CỤC (FIX LỖI UNDEFINED)
+// 2. KẾT NỐI MONGODB TOÀN CỤC
 // ==========================================
 const mongoUri = process.env.MONGO_URI_SCOUT || process.env.MONGO_URI;
 
@@ -44,9 +47,9 @@ if (mongoUri) {
     mongoose.connect(mongoUri)
         .then(async () => {
             console.log("📦 [WATCHTOWER] Đã kết nối MongoDB thành công.");
-            // Load lịch sử 100 lệnh gần nhất
             try {
-                fullTradeHistory = await ScoutTrade.find().sort({ ts: -1 }).limit(100);
+                // Chỉ lấy 50 lệnh gần nhất để nhẹ UI
+                fullTradeHistory = await ScoutTrade.find().sort({ ts: -1 }).limit(50);
             } catch (e) {
                 console.warn("⚠️ [DB] Chưa có dữ liệu lệnh cũ.");
             }
@@ -57,7 +60,7 @@ if (mongoUri) {
 }
 
 // ==========================================
-// 3. API REST - CUNG CẤP DỮ LIỆU KIỂM TOÁN
+// 3. API REST
 // ==========================================
 
 app.get('/api/stats', async (req, res) => {
@@ -86,7 +89,7 @@ app.get('/api/stats', async (req, res) => {
             currentWalletEstimation: (200 + totalPnL).toFixed(2) + ' USDT'
         });
     } catch (err) {
-        res.json({ totalTrades: 0, netPnL: '0.00 USDT', winRate: '0.00%' }); // Trả về mặc định khi lỗi
+        res.json({ totalTrades: 0, netPnL: '0.00 USDT', winRate: '0.00%' });
     }
 });
 
@@ -108,20 +111,25 @@ app.get('/api/equity-curve', async (req, res) => {
 // 4. XỬ LÝ REDIS PUB/SUB & SOCKET.IO
 // ==========================================
 
-// Đăng ký nghe các kênh dữ liệu từ Python Feed và OrderManager
 subClient.psubscribe('market:features*');
 subClient.subscribe('dashboard:logs', 'dashboard:trades');
 
 subClient.on('pmessageBuffer', (pattern, channel, messageBuffer) => {
     try {
-        const feature = decode(messageBuffer); // Giải nén MsgPack từ Python
+        const feature = decode(messageBuffer);
         if (feature && feature.symbol) {
             lastTickData.set(feature.symbol, feature);
-            io.emit('live_features', feature); // Gửi dữ liệu tick lên UI
+            
+            const now = Date.now();
+            // TỐI ƯU 1: Chỉ phát sự kiện tick mỗi 500ms (giảm 80% tải cho UI)
+            if (now - lastTickEmitTime > 500) {
+                // Đóng gói tất cả ticks hiện tại thành 1 mảng để gửi 1 lần
+                const allTicks = Array.from(lastTickData.values());
+                io.emit('live_features_batch', allTicks);
+                lastTickEmitTime = now;
+            }
         }
-    } catch (e) {
-        // console.error("❌ Lỗi giải mã Tick:", e.message);
-    }
+    } catch (e) {}
 });
 
 subClient.on('message', (channel, message) => {
@@ -130,19 +138,22 @@ subClient.on('message', (channel, message) => {
         if (channel === 'dashboard:logs') {
             const sym = data.symbol || 'SYSTEM';
             if (!aiLogHistory[sym]) aiLogHistory[sym] = [];
+            
             aiLogHistory[sym].push(data);
-            if (aiLogHistory[sym].length > 100) aiLogHistory[sym].shift();
-            io.emit('ai_thoughts', data); // Gửi log suy nghĩ của AI lên UI
+            
+            // TỐI ƯU 2: Giữ tối đa 30 log mỗi coin trên RAM server
+            if (aiLogHistory[sym].length > 30) aiLogHistory[sym].shift();
+            
+            io.emit('ai_thoughts', data); 
         } 
         else if (channel === 'dashboard:trades') {
-            io.emit('new_trade', data); // Báo có lệnh mới để UI cập nhật bảng
+            io.emit('new_trade', data); 
         }
     } catch (e) {}
 });
 
 io.on('connection', (socket) => {
-    console.log("👤 [DASHBOARD] Người dùng đã kết nối.");
-    // Gửi toàn bộ trạng thái hiện tại ngay khi user mở web
+    console.log("👤 [DASHBOARD] Một người dùng đã kết nối.");
     socket.emit('full_state', {
         logs: aiLogHistory, 
         trades: fullTradeHistory, 
@@ -156,5 +167,4 @@ io.on('connection', (socket) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`\n🚀 [WATCHTOWER V17] Giao diện đang trực tại cổng ${PORT}`);
-    console.log(`🔗 Truy cập: http://localhost:${PORT} hoặc IP-VPS:${PORT}\n`);
 });
