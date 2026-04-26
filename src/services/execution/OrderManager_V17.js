@@ -195,8 +195,9 @@ subClient.on('pmessageBuffer', async (pattern, channel, messageBuffer) => {
             // Tính Kelly & Leverage
             const kelly = (prob * 2 - (1 - prob)) / 2;
             let finalLev = Math.floor(kelly * config.MAX_LEVERAGE * (config.KELLY_FRACTION || 0.5));
-            finalLev = Math.max(1, Math.min(finalLev, 20));
 
+            // [SỬA TẠI ĐÂY]: Đặt ngưỡng đòn bẩy từ 5 đến 20 như bạn yêu cầu
+            finalLev = Math.max(5, Math.min(finalLev, 20));
             const useMarket = (feature.VPIN > 0.8 || Math.abs(feature.OFI) > 15);
 
             simulateLatency(async () => {
