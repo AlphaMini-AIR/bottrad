@@ -257,10 +257,12 @@
         }
 
         function renderSuspects() {
+
             const list = document.getElementById('suspects-list');
             document.getElementById('radar-count').innerText = `${activeSuspects.size} coin`;
 
             activeSuspects.forEach((feat, symbol) => {
+                if (!symbol || symbol === 'undefined') return;
                 // Tìm element của coin này, nếu chưa có thì tạo mới
                 let item = document.getElementById(`suspect-${symbol}`);
                 if (!item) {

@@ -139,7 +139,7 @@ subClient.on('pmessageBuffer', (pattern, channel, messageBuffer) => {
     try { feature = decode(messageBuffer); } catch (e) {
         try { feature = JSON.parse(messageBuffer.toString()); } catch (err) { return; }
     }
-    if (!feature || !feature.symbol || !feature.is_warm) return;
+    if (!feature || !feature.symbol) return;
 
     lastTickData.set(feature.symbol, feature);
     io.emit('live_features', feature);

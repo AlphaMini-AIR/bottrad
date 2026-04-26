@@ -67,6 +67,11 @@ class FeatureBuffer:
         if self.data_count > 10 and self.open_price > 0:
             self.is_warm = True
 
+        if self.data_count % 5 == 0: # Cứ 5 gói tin thì log 1 lần cho đỡ rác
+            print(f"🌡️ [{self.symbol}] Warm-up: {self.data_count}/10 | Price: {self.last_price} | Open: {self.open_price}")
+            if self.is_warm:
+                print(f"✅ [{self.symbol}] ĐÃ ẤM - Sẵn sàng truyền dữ liệu!")
+
     def update_depth(self, data):
         bids = data.get('bids', [])
         asks = data.get('asks', [])
@@ -159,6 +164,9 @@ class FeatureBuffer:
         self.liq_long_vol = 0.0
         self.liq_short_vol = 0.0
 
+        if self.symbol != 'BTCUSDT': # Tránh log BTC vì nó chạy liên tục
+            print(f"📊 [{self.symbol}] OFI: {self.ofi:.1f} | Imb: {self.ob_imb_top20:.2f} | Vol: {self.quote_volume:.0f}")
+
         return features
 
 class FeedHandler:
@@ -202,6 +210,7 @@ class FeedHandler:
                             break
                             
                         packet = json.loads(msg)
+                        print(f"DEBUG: Nhận gói tin từ stream: {packet.get('stream')}")
                         stream_name = packet.get('stream', '')
                         data = packet.get('data', {})
                         
@@ -285,6 +294,7 @@ class FeedHandler:
                     continue
 
                 if buffer.is_warm:
+                    print(f"📡 [REDIS] Đang bắn Feature: market:features:{symbol.upper()}")
                     current_funding = self.global_funding_rates.get(symbol, 0.0001)
                     features = buffer.extract_features(self.btc_pct, current_funding)
                     packed_data = msgpack.packb(features)
