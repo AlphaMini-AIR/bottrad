@@ -3,7 +3,6 @@ import websockets
 import json
 import msgpack
 import os
-import time
 import aiohttp
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
@@ -11,9 +10,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class FeatureBuffer:
-    """Bộ đệm tính toán Features - Tích hợp ATR, VPIN, OFI, MFA và Chuẩn hóa Tương đối"""
+    """Bộ đệm tính toán Features - Tích hợp Smoothing OFI và Dòng tiền Cá Voi"""
     def __init__(self, symbol):
-        self.symbol = symbol.upper()
+        self.symbol = symbol.lower()
         self.is_warm = False
         self.data_count = 0
         
@@ -35,16 +34,18 @@ class FeatureBuffer:
         # Trade & Thanh lý
         self.max_buy_trade = 0.0
         self.max_sell_trade = 0.0
+        self.whale_netflow = 0.0  # Dòng tiền cá voi (>5000$)
         self.liq_long_vol = 0.0   
         self.liq_short_vol = 0.0
         self.taker_buy_quote = 0.0
         
-        # Các chỉ số bổ sung cho OrderManager
-        self.atr14 = 0.002       # ATR 14 nến (tỷ lệ %), mặc định 0.2%
-        self.vpin = 0.5          # Volume imbalance proxy
-        self.ofi = 0.0           # Order Flow Imbalance (từ depth)
-        self.mfa = 0.0           # Money Flow Acceleration
-        self._last_ofi = 0.0     # Giá trị OFI kỳ trước để tính MFA
+        # Chỉ số AI nội bộ
+        self.atr14 = 0.002
+        self.vpin = 0.5
+        self.ofi = 0.0
+        self.ofi_smoothed = 0.0   # OFI đã lọc nhiễu
+        self._last_ofi_smoothed = 0.0
+        self.mfa = 0.0
 
     def update_ticker(self, data):
         self.last_price = float(data.get('c', self.last_price))
@@ -54,11 +55,9 @@ class FeatureBuffer:
         self.quote_volume = float(data.get('q', self.quote_volume))
         self.taker_buy_quote = float(data.get('Q', self.taker_buy_quote))
         
-        # Tính ATR14 (dùng range 24h làm proxy, đơn vị %)
         if self.last_price > 0:
             self.atr14 = (self.high_price - self.low_price) / self.last_price
         
-        # Tính VPIN (dùng imbalance từ taker buy quote)
         if self.quote_volume > 0:
             taker_sell_quote = self.quote_volume - self.taker_buy_quote
             self.vpin = abs(self.taker_buy_quote - taker_sell_quote) / self.quote_volume
@@ -67,63 +66,53 @@ class FeatureBuffer:
         if self.data_count > 10 and self.open_price > 0:
             self.is_warm = True
 
-        if self.data_count % 5 == 0: # Cứ 5 gói tin thì log 1 lần cho đỡ rác
-            print(f"🌡️ [{self.symbol}] Warm-up: {self.data_count}/10 | Price: {self.last_price} | Open: {self.open_price}")
-            if self.is_warm:
-                print(f"✅ [{self.symbol}] ĐÃ ẤM - Sẵn sàng truyền dữ liệu!")
-
     def update_depth(self, data):
-    # 1. Đổi 'bids' -> 'b' và 'asks' -> 'a' (Chuẩn WebSocket Binance)
         bids = data.get('b', [])
         asks = data.get('a', [])
-        if not bids or not asks:
-            print(f"⚠️ [{self.symbol}] CẢNH BÁO: Sổ lệnh trống! Kiểm tra luồng WebSocket.")
-            return
-     # Nếu không có dữ liệu thì thoát để tránh lỗi tính toán bên dưới
-        if not bids or not asks: 
-            return
+        if not bids or not asks: return
 
-    # 2. Cập nhật Best Bid/Ask (Giá tốt nhất nằm ở vị trí đầu tiên)
         self.best_bid = float(bids[0][0])
         self.best_ask = float(asks[0][0])
     
-    # 3. Tính toán Volume thô
         bid_vol = sum(float(v) for p, v in bids)
         ask_vol = sum(float(v) for p, v in asks)
         total_vol = bid_vol + ask_vol
     
-    # 4. Tính Orderbook Imbalance (Độ lệch sổ lệnh)
         self.ob_imb_top20 = (bid_vol - ask_vol) / total_vol if total_vol > 0 else 0
 
-    # 5. Tính Spread dựa trên giá khớp lệnh gần nhất
         if self.last_price > 0:
             self.spread_close = (self.best_ask - self.best_bid) / self.last_price
 
-    # 6. Tính toán Volume trong vùng 1% giá (Cực quan trọng để AI soi tường)
         bid_1pct_price = self.best_bid * 0.99
         ask_1pct_price = self.best_ask * 1.01
         self.bid_vol_1pct = sum(float(v) for p, v in bids if float(p) >= bid_1pct_price)
         self.ask_vol_1pct = sum(float(v) for p, v in asks if float(p) <= ask_1pct_price)
 
-    # 7. Tính OFI (Cập nhật gia tốc dòng tiền)
-    # Scale x100 để đưa về định dạng Dashboard hiển thị được
+        # Tính và làm mịn OFI (Exponential Moving Average)
         self.ofi = self.ob_imb_top20 * 100
+        # Làm mịn: Lấy 70% giá trị cũ + 30% giá trị mới để tránh giật cục
+        self.ofi_smoothed = (self.ofi_smoothed * 0.7) + (self.ofi * 0.3) 
+
     def update_trade(self, data):
         qty = float(data.get('q', 0))
+        price = float(data.get('p', self.last_price))
         is_buyer_maker = data.get('m', True) 
+        
+        trade_value = qty * price
+
         if is_buyer_maker: # Lệnh Sell
             if qty > self.max_sell_trade: self.max_sell_trade = qty
+            if trade_value > 5000: self.whale_netflow -= trade_value # Cá xả
         else: # Lệnh Buy
             if qty > self.max_buy_trade: self.max_buy_trade = qty
+            if trade_value > 5000: self.whale_netflow += trade_value # Cá gom
 
     def update_force_order(self, data):
         order_info = data.get('o', {})
         side = order_info.get('S', '')
         qty = float(order_info.get('q', 0))
-        if side == 'SELL': 
-            self.liq_long_vol += qty
-        elif side == 'BUY':
-            self.liq_short_vol += qty
+        if side == 'SELL': self.liq_long_vol += qty
+        elif side == 'BUY': self.liq_short_vol += qty
 
     def extract_features(self, btc_pct, current_funding_rate):
         coin_pct = ((self.last_price - self.open_price) / self.open_price * 100) if self.open_price > 0 else 0
@@ -132,23 +121,21 @@ class FeatureBuffer:
         wick_size = (((self.high_price - self.low_price) - abs(self.last_price - self.open_price)) / self.open_price) * 100 if self.open_price > 0 else 0
         btc_relative_strength = coin_pct - btc_pct
 
-        # Tính MFA (đạo hàm của OFI)
-        self.mfa = self.ofi - self._last_ofi
-        self._last_ofi = self.ofi
+        # Tính MFA dựa trên OFI đã làm mịn (Đạo hàm cực chuẩn)
+        self.mfa = self.ofi_smoothed - self._last_ofi_smoothed
+        self._last_ofi_smoothed = self.ofi_smoothed
 
-        # 🚀 CHUẨN HÓA TƯƠNG ĐỐI (SCALE INVARIANT)
-        # Ép tất cả các biến khối lượng tuyệt đối (Base Asset) thành Tỷ lệ % của tổng Quote Volume
         quote_vol_safe = self.quote_volume if self.quote_volume > 0 else 1e-8
         close_p = self.last_price
 
         features = {
-            "symbol": self.symbol,
+            "symbol": self.symbol.upper(),
             "is_warm": self.is_warm,
             "best_ask": self.best_ask,
             "best_bid": self.best_bid,
             "last_price": self.last_price,
             
-            # 13 features chuẩn hóa 100% khớp với universal_trainer.py
+            # Chuẩn hóa Base Asset -> Quote Ratio
             "ob_imb_top20": float(self.ob_imb_top20),
             "spread_close": float(self.spread_close),
             "bid_vol_1pct": float((self.bid_vol_1pct * close_p) / quote_vol_safe),
@@ -163,40 +150,37 @@ class FeatureBuffer:
             "wick_size": float(wick_size),
             "btc_relative_strength": float(btc_relative_strength),
             
-            # Các chỉ số bổ sung cho OrderManager (không đi vào ONNX)
+            # Chỉ số nội bộ cho OrderManager
             "ATR14": float(self.atr14),
             "VPIN": float(self.vpin),
-            "OFI": float(self.ofi),
-            "MFA": float(self.mfa)
+            "OFI": float(self.ofi_smoothed),
+            "MFA": float(self.mfa),
+            "WHALE_NET": float(self.whale_netflow / quote_vol_safe) # Chuẩn hóa cá voi
         }
 
-        # Reset spikes sau mỗi lần lấy mẫu
+        # Reset spikes sau mỗi 100ms
         self.max_buy_trade = 0.0
         self.max_sell_trade = 0.0
         self.liq_long_vol = 0.0
         self.liq_short_vol = 0.0
-
-        if self.symbol != 'BTCUSDT': # Tránh log BTC vì nó chạy liên tục
-            print(f"📊 [{self.symbol}] OFI: {self.ofi:.1f} | Imb: {self.ob_imb_top20:.2f} | Vol: {self.quote_volume:.0f}")
+        # Làm nhạt dần netflow của cá voi thay vì reset về 0 (Trí nhớ ngắn hạn)
+        self.whale_netflow *= 0.5 
 
         return features
+
 
 class FeedHandler:
     def __init__(self):
         self.redis = aioredis.from_url(os.getenv('REDIS_URL', 'redis://localhost:6379'))
-        self.active_tasks = {}
         self.buffers = {}
         self.stream_refs = {} 
+        self.active_streams = set() # Quản lý các luồng đang chạy trên WS
+        self.ws_connection = None
         self.btc_pct = 0.0 
         self.global_funding_rates = {}
 
-    def _should_keep_stream(self, symbol):
-        if symbol == 'btcusdt': return True
-        refs = self.stream_refs.get(symbol, {})
-        return refs.get('radar', False) or refs.get('trade', False)
-
     async def fetch_funding_rates(self):
-        print("🌍 [REST] Bắt đầu luồng đồng bộ Funding Rate...")
+        print("🌍 [REST] Khởi chạy luồng đồng bộ Funding Rate (1 giờ/lần)...")
         while True:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -208,24 +192,45 @@ class FeedHandler:
                 print(f"⚠️ [REST] Lỗi cập nhật Funding: {e}")
             await asyncio.sleep(3600)
 
-    async def connect_binance_ws(self, symbol):
-        streams = f"{symbol}@ticker/{symbol}@depth20@100ms/{symbol}@aggTrade/{symbol}@forceOrder"
-        url = f"wss://fstream.binance.com/stream?streams={streams}"
-        print(f"🔗 [WS] Mở kết nối đa luồng cho {symbol.upper()}...")
+    def _get_stream_names(self, symbol):
+        sym = symbol.lower()
+        return [f"{sym}@ticker", f"{sym}@depth20@100ms", f"{sym}@aggTrade", f"{sym}@forceOrder"]
+
+    async def send_ws_command(self, method, streams):
+        if not self.ws_connection or not streams: return
+        payload = {
+            "method": method,
+            "params": list(streams),
+            "id": 1
+        }
+        try:
+            await self.ws_connection.send(json.dumps(payload))
+            # print(f"📡 [WS API] {method} {len(streams)} luồng thành công.")
+        except Exception as e:
+            print(f"❌ [WS API] Lỗi gửi lệnh {method}: {e}")
+
+    async def connect_binance_multiplex(self):
+        url = "wss://fstream.binance.com/stream"
+        print("🔗 [WS] Mở Đường Ống MULTIPLEX Tổng tới Binance...")
         
-        while self._should_keep_stream(symbol):
+        while True:
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                    self.ws_connection = ws
+                    print("✅ [WS] Đường ống HFT đã thông suốt!")
+                    
+                    # Nếu có luồng cũ (do đứt cáp nối lại), khôi phục ngay
+                    if self.active_streams:
+                        await self.send_ws_command("SUBSCRIBE", self.active_streams)
+
                     async for msg in ws:
-                        if not self._should_keep_stream(symbol):
-                            print(f"🛑 [WS] Ref Count = 0. Hủy diệt luồng {symbol.upper()} an toàn.")
-                            break
-                            
                         packet = json.loads(msg)
-                        print(f"DEBUG: Nhận gói tin từ stream: {packet.get('stream')}")
                         stream_name = packet.get('stream', '')
                         data = packet.get('data', {})
                         
+                        if not stream_name: continue
+
+                        symbol = stream_name.split('@')[0].lower()
                         buffer = self.buffers.get(symbol)
                         if not buffer: continue
 
@@ -241,86 +246,84 @@ class FeedHandler:
                             buffer.update_force_order(data)
                             
             except Exception as e:
-                if self._should_keep_stream(symbol):
-                    print(f"⚠️ [WS] Đứt cáp {symbol.upper()}: {e}. Đang Reconnect...")
-                    await asyncio.sleep(2)
+                print(f"⚠️ [WS] Đứt cáp tổng: {e}. Đang tái thiết lập kết nối...")
+                self.ws_connection = None
+                await asyncio.sleep(2)
 
     async def listen_to_control_channels(self):
         pubsub = self.redis.pubsub()
-        await pubsub.subscribe("radar:candidates", "system:keep_alive", "system:subscriptions")
-        print("📡 [PYTHON] Đã mở siêu tai nghe Async Redis...")
+        await pubsub.subscribe("system:subscriptions", "system:keep_alive")
+        print("📡 [PYTHON] Đã mở siêu tai nghe lắng nghe Lệnh từ Radar & OrderManager...")
 
         async for message in pubsub.listen():
             if message['type'] == 'message':
                 try:
-                    channel = message['channel'].decode('utf-8')
                     data = json.loads(message['data'].decode('utf-8'))
-                    if not isinstance(data, dict) or 'symbol' not in data:
-                        continue
+                    if 'symbol' not in data: continue
+                    
                     symbol = data['symbol'].lower()
                     action = data.get('action', '')
+                    client = data.get('client', 'unknown')
 
                     if symbol not in self.stream_refs:
                         self.stream_refs[symbol] = {'radar': False, 'trade': False}
 
-                    if channel == "radar:candidates":
-                        if action == 'ADD':
-                            self.stream_refs[symbol]['radar'] = True
-                        elif action == 'REMOVE':
-                            self.stream_refs[symbol]['radar'] = False
+                    # Cập nhật Ref Count (Bộ đếm tham chiếu)
+                    if action == 'SUBSCRIBE':
+                        if client == 'radar': self.stream_refs[symbol]['radar'] = True
+                    elif action == 'UNSUBSCRIBE':
+                        if client == 'radar': self.stream_refs[symbol]['radar'] = False
+                    elif action == 'ENTER_TRADE':
+                        self.stream_refs[symbol]['trade'] = True
+                    elif action == 'EXIT_TRADE':
+                        self.stream_refs[symbol]['trade'] = False
 
-                    elif channel == "system:keep_alive":
-                        if action == 'ENTER_TRADE':
-                            self.stream_refs[symbol]['trade'] = True
-                        elif action == 'EXIT_TRADE':
-                            self.stream_refs[symbol]['trade'] = False
-                    elif channel == "system:subscriptions":
-                        if action == 'SUBSCRIBE':
-                            self.stream_refs[symbol]['radar'] = True
-                        elif action == 'UNSUBSCRIBE':
-                            self.stream_refs[symbol]['radar'] = False
-                            
-                    should_run = self._should_keep_stream(symbol)
-                    is_running = symbol in self.active_tasks
+                    # Đánh giá xem có nên giữ kết nối không
+                    should_run = (symbol == 'btcusdt') or self.stream_refs[symbol]['radar'] or self.stream_refs[symbol]['trade']
+                    is_running = symbol in self.buffers
+
+                    streams = self._get_stream_names(symbol)
 
                     if should_run and not is_running:
-                        print(f"🎯 [BÁM ĐUÔI] Radar/Trade kích hoạt: {symbol.upper()}")
+                        print(f"🎯 [KẾT NỐI] Móc ống hút vào: {symbol.upper()}")
                         self.buffers[symbol] = FeatureBuffer(symbol)
-                        task = asyncio.create_task(self.connect_binance_ws(symbol))
-                        self.active_tasks[symbol] = task
+                        self.active_streams.update(streams)
+                        await self.send_ws_command("SUBSCRIBE", streams)
 
                     elif not should_run and is_running:
-                        print(f"🗑️ [DỌN DẸP] Ref Count = 0. Hủy kết nối {symbol.upper()}")
-                        del self.active_tasks[symbol]
-                        if symbol in self.buffers: del self.buffers[symbol]
+                        print(f"🗑️ [RÚT ỐNG] Bỏ theo dõi: {symbol.upper()}")
+                        self.active_streams.difference_update(streams)
+                        await self.send_ws_command("UNSUBSCRIBE", streams)
+                        del self.buffers[symbol]
                         del self.stream_refs[symbol]
 
                 except Exception as e:
-                    print(f"❌ [LỖI ĐIỀU PHỐI REDIS]: {e}")
+                    print(f"❌ [LỖI REDIS LISTENER]: {e}")
 
     async def publish_features(self):
-        print("🚀 [PYTHON] Khởi chạy Bơm máu thời gian thực (100ms)...")
+        print("🚀 [PYTHON] Khởi chạy Động cơ Bơm máu (100ms/nhịp)...")
         while True:
             for symbol, buffer in list(self.buffers.items()):
-                if symbol == 'btcusdt' and not self._should_keep_stream('btcusdt'):
-                    continue
+                if symbol == 'btcusdt' and not (self.stream_refs.get('btcusdt', {}).get('trade', False)):
+                    continue # BTC chỉ dùng để tính Relative Strength, không publish nếu không trade
 
                 if buffer.is_warm:
-                    print(f"📡 [REDIS] Đang bắn Feature: market:features:{symbol.upper()}")
                     current_funding = self.global_funding_rates.get(symbol, 0.0001)
                     features = buffer.extract_features(self.btc_pct, current_funding)
                     packed_data = msgpack.packb(features)
-                    # Bắn vào kênh duy nhất để tránh dư thừa dữ liệu
                     await self.redis.publish(f"market:features:{symbol.upper()}", packed_data)
             await asyncio.sleep(0.1) 
 
     async def run(self):
-        print("🧠 [PYTHON ENGINE] V17 Khởi động chuẩn HFT (Scale Invariant)...")
-        self.stream_refs['btcusdt'] = {'radar': True, 'trade': True}
+        print("🧠 [PYTHON ENGINE] Data Feed V17 (Multiplexing) Khởi động...")
+        
+        # Mặc định phải luôn theo dõi BTC để tính Relative Strength cho các coin khác
+        self.stream_refs['btcusdt'] = {'radar': True, 'trade': False}
         self.buffers['btcusdt'] = FeatureBuffer('btcusdt')
-        self.active_tasks['btcusdt'] = asyncio.create_task(self.connect_binance_ws('btcusdt'))
+        self.active_streams.update(self._get_stream_names('btcusdt'))
         
         await asyncio.gather(
+            self.connect_binance_multiplex(),
             self.fetch_funding_rates(),
             self.publish_features(),
             self.listen_to_control_channels() 
