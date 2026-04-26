@@ -185,8 +185,8 @@ subClient.on('pmessageBuffer', async (pattern, channel, messageBuffer) => {
 
         // 🚀 ĐIỀU KIỆN VÀO LỆNH (Threshold 0.75)
         let tradeAction = null;
-        if (probLong >= 0.75) tradeAction = 'LONG';
-        else if (probShort >= 0.75) tradeAction = 'SHORT';
+        if (probLong >= 0.7) tradeAction = 'LONG';
+        else if (probShort >= 0.7) tradeAction = 'SHORT';
 
         if (tradeAction) {
             const prob = tradeAction === 'LONG' ? probLong : probShort;
