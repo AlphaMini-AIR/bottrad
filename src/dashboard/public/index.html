@@ -45,8 +45,13 @@
             color: white;
         }
 
-        .up { color: #3fb950; }
-        .down { color: #f85149; }
+        .up {
+            color: #3fb950;
+        }
+
+        .down {
+            color: #f85149;
+        }
 
         .status-open {
             color: #d29922;
@@ -54,16 +59,33 @@
             animation: pulse 2s infinite;
         }
 
-        .status-closed { color: #8b949e; }
-
-        @keyframes pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.5; }
-            100% { opacity: 1; }
+        .status-closed {
+            color: #8b949e;
         }
 
-        ::-webkit-scrollbar { width: 6px; height: 6px; }
-        ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
+        @keyframes pulse {
+            0% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.5;
+            }
+
+            100% {
+                opacity: 1;
+            }
+        }
+
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #30363d;
+            border-radius: 4px;
+        }
     </style>
 </head>
 
@@ -82,7 +104,8 @@
             <h2 class="text-sm font-bold text-purple-400 mb-2 border-b border-gray-700 pb-2">
                 🧠 NÃO BỘ AI: <span id="selected-coin-name" class="text-white font-bold text-lg">Chưa chọn</span>
             </h2>
-            <div id="ai-logs" class="overflow-y-auto text-xs text-green-400 p-2 bg-black rounded flex-grow font-mono leading-relaxed">
+            <div id="ai-logs"
+                class="overflow-y-auto text-xs text-green-400 p-2 bg-black rounded flex-grow font-mono leading-relaxed">
                 <span class="text-gray-500">Hãy click vào Radar để xem luồng suy nghĩ...</span>
             </div>
         </div>
@@ -90,10 +113,14 @@
         <div class="panel w-1/4">
             <h2 class="text-sm font-bold text-blue-400 mb-2 border-b border-gray-700 pb-2">📊 HIỆU SUẤT V17</h2>
             <div id="global-stats" class="text-sm space-y-3 mt-2">
-                <div class="flex justify-between"><span>Lệnh đang mở:</span> <b id="stat-open" class="text-yellow-400">0</b></div>
-                <div class="flex justify-between"><span>Winrate:</span> <b id="stat-winrate" class="text-white">--</b></div>
-                <div class="flex justify-between"><span>Tổng PnL:</span> <b id="stat-pnl" class="text-white">--</b></div>
-                <div class="flex justify-between"><span>Tổng Lệnh:</span> <b id="stat-trades" class="text-gray-400">--</b></div>
+                <div class="flex justify-between"><span>Lệnh đang mở:</span> <b id="stat-open"
+                        class="text-yellow-400">0</b></div>
+                <div class="flex justify-between"><span>Winrate:</span> <b id="stat-winrate" class="text-white">--</b>
+                </div>
+                <div class="flex justify-between"><span>Tổng PnL:</span> <b id="stat-pnl" class="text-white">--</b>
+                </div>
+                <div class="flex justify-between"><span>Tổng Lệnh:</span> <b id="stat-trades"
+                        class="text-gray-400">--</b></div>
                 <div class="flex justify-between mt-4 pt-4 border-t border-gray-700">
                     <span class="text-white">Ước tính Ví (Gốc $200):</span>
                     <b id="stat-wallet" class="text-green-400 text-lg">--</b>
@@ -109,7 +136,8 @@
     <div class="panel h-2/5">
         <div class="flex justify-between mb-2">
             <h2 class="text-sm font-bold text-gray-300">📚 KIỂM TOÁN LỆNH (REAL-TIME)</h2>
-            <button onclick="fetchStatsAndChart(); fetchTrades();" class="text-xs bg-gray-800 hover:bg-gray-700 px-2 py-1 rounded text-white">🔄 Làm mới</button>
+            <button onclick="fetchStatsAndChart(); fetchTrades();"
+                class="text-xs bg-gray-800 hover:bg-gray-700 px-2 py-1 rounded text-white">🔄 Làm mới</button>
         </div>
         <div class="overflow-y-auto">
             <table class="w-full text-left text-xs whitespace-nowrap">
@@ -196,8 +224,9 @@
                 }
                 const isActive = symbol === selectedSymbol ? 'active' : 'bg-gray-800';
                 item.className = `suspect-item p-2 mb-1 rounded flex justify-between ${isActive}`;
-
-                const score = feat.macro || feat.OFI || feat.ofi || 0;
+                console.log(feat);
+                
+                const score = feat.macro || feat.OFI || feat.ofi || feat.ob_imb_top20 || 0;
                 item.innerHTML = `<b>${symbol}</b><span class="${score >= 0 ? 'up' : 'down'}">${score.toFixed(2)}</span>`;
             });
         }
@@ -208,7 +237,7 @@
                 const isOp = t.status === 'OPEN';
                 const time = new Date(t.openTime).toLocaleTimeString();
                 const pnlColor = t.pnl > 0 ? 'up' : (t.pnl < 0 ? 'down' : '');
-                
+
                 // MÀU SẮC LỆNH: LONG xanh, SHORT đỏ
                 const typeColor = t.type === 'LONG' ? 'text-green-400' : 'text-red-400';
                 const statusHtml = isOp ? `<span class="status-open">🟢 ĐANG MỞ</span>` : `<span class="status-closed">⚪ ĐÓNG</span>`;
@@ -288,4 +317,5 @@
         initChart();
     </script>
 </body>
+
 </html>
