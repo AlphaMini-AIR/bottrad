@@ -1,16 +1,89 @@
 {
-    "REDIS_URL": "redis://127.0.0.1:6379",
-    "MAX_RADAR_SLOTS": 30,
-    "MACRO_THRESHOLD": 0.1,
-    "VOLUME_SURGE_MULTIPLIER": 2,
-    "MAX_LEVERAGE": 20,
-    "KELLY_FRACTION": 0.2,
-    "RISK_REWARD_RATIO": 2.0,
-    "CHANNELS": {
-        "CANDIDATES": "radar:candidates",
-        "MACRO_SCORES": "macro:scores",
-        "FEATURES": "market:features:*",
-        "SUBSCRIPTIONS": "system:subscriptions",
-        "COMMANDS": "system:commands" 
-    }
+  "REDIS_URL": "redis://127.0.0.1:6379",
+
+  "MAX_RADAR_SLOTS": 30,
+  "MACRO_THRESHOLD": 0.1,
+  "VOLUME_SURGE_MULTIPLIER": 2,
+
+  "MAX_LEVERAGE": 20,
+  "KELLY_FRACTION": 0.2,
+  "RISK_REWARD_RATIO": 2.0,
+
+  "CHANNELS": {
+    "CANDIDATES": "radar:candidates",
+    "MACRO_SCORES": "macro:scores",
+    "FEATURES": "market:features:*",
+    "SUBSCRIPTIONS": "system:subscriptions",
+    "COMMANDS": "system:commands"
+  },
+
+  "TRADING": {
+    "EXCHANGE_MODE": "PAPER",
+
+    "MAX_ACTIVE_TRADES": 3,
+
+    "AI_LONG_THRESHOLD": 0.7,
+    "AI_SHORT_THRESHOLD": 0.7,
+    "MIN_MACRO_SCORE": 0.4,
+
+    "MAX_SPREAD_CLOSE": 0.002,
+    "MAX_ATR_PERCENT": 0.2,
+    "MIN_ATR_PERCENT": 0.00001,
+
+    "COOLDOWN_AFTER_CLOSE_MS": 900000,
+    "COOLDOWN_AFTER_FAIL_MS": 60000,
+    "COOLDOWN_AFTER_LIQUIDATION_MS": 1800000,
+
+    "PREDICTION_EMIT_INTERVAL_MS": 1000,
+    "MACRO_SYNC_INTERVAL_MS": 5000,
+    "COOLDOWN_CLEAN_INTERVAL_MS": 60000,
+
+    "EV_SWITCH_MIN_PROB_DELTA": 0.1,
+    "EV_SWITCH_PROTECT_PROFIT_ROI": 10,
+
+    "DEFAULT_ATR_PERCENT": 0.003,
+    "MFA_PANIC_THRESHOLD": 5.0,
+    "MFA_TIGHTEN_THRESHOLD": 4.0,
+    "TRAILING_MULTIPLIER_NORMAL": 3.0,
+    "TRAILING_MULTIPLIER_TIGHT": 1.5,
+
+    "MODEL_VERSION": "Universal_Scout.onnx"
+  },
+
+  "RISK": {
+    "ENABLED": true,
+
+    "MAX_SPREAD_CLOSE": 0.0025,
+    "MAX_DEPTH_AGE_MS": 2500,
+    "MAX_PRICE_AGE_MS": 8000,
+    "MAX_MARK_PRICE_AGE_MS": 10000,
+    "REQUIRE_MARK_PRICE": false,
+
+    "MAX_ABS_FUNDING_RATE": 0.005,
+    "MAX_ATR14": 0.2,
+    "MIN_ATR14": 0.00001,
+
+    "MAX_ACTIVE_TRADES": 3,
+    "MAX_LEVERAGE_PER_TRADE": 20,
+
+    "MAX_TRADES_PER_HOUR": 20,
+    "MAX_TRADES_PER_SYMBOL_PER_HOUR": 3,
+
+    "MAX_DAILY_LOSS_USDT": 10,
+    "MAX_CONSECUTIVE_LOSSES": 5,
+
+    "MIN_ENTRY_PROB": 0.7,
+    "MIN_PROB_GAP": 0.02,
+
+    "BLACKLIST": [],
+    "WHITELIST": []
+  },
+
+  "LIVE": {
+    "DRY_RUN": true,
+    "FIXED_MARGIN": 2,
+    "MARGIN_TYPE": "ISOLATED",
+    "POSITION_MODE": "ONE_WAY",
+    "FEE_TAKER": 0.0004
+  }
 }
