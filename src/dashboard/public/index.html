@@ -3,81 +3,71 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Quant Sniper V17 - Watchtower Control</title>
+    <title>AI QUANT SNIPER V17 - Dashboard</title>
     <script src="/socket.io/socket.io.js"></script>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
         @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
-        body { font-family: 'Inter', sans-serif; background-color: #0b0e11; }
+        body { font-family: 'Inter', sans-serif; background-color: #0b0e11; color: #eaeaeb; }
         .mono { font-family: 'JetBrains Mono', monospace; }
-        .scrollbar-hide::-webkit-scrollbar { display: none; }
+        .bg-card { background-color: #1e2329; border: 1px solid #2b3139; }
         .status-pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }
-        .bg-card { background-color: #1e2329; }
-        .border-gray-custom { border-color: #2b3139; }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 10px; }
     </style>
 </head>
-<body class="text-gray-200">
+<body class="p-4">
 
-    <nav class="bg-card border-b border-gray-custom px-6 py-3 flex justify-between items-center sticky top-0 z-50">
-        <div class="flex items-center gap-3">
-            <div class="w-8 h-8 bg-blue-600 rounded flex items-center justify-center">
-                <i class="fas fa-crosshairs text-white"></i>
-            </div>
-            <h1 class="text-xl font-bold tracking-tight">AI QUANT <span class="text-blue-500">SNIPER V17</span></h1>
-        </div>
-        <div class="flex items-center gap-6">
-            <div id="connection-status" class="flex items-center gap-2 text-xs font-semibold text-green-400">
-                <span class="w-2 h-2 bg-green-500 rounded-full status-pulse"></span>
-                LIVE CONNECTED
-            </div>
-            <div class="text-gray-500 text-xs mono" id="server-time">--:--:--</div>
-        </div>
-    </nav>
-
-    <main class="p-6 space-y-6">
+    <div class="max-w-[1600px] mx-auto space-y-4">
         
-        <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
-            <div class="bg-card p-4 rounded-lg border border-gray-custom">
-                <p class="text-gray-500 text-xs font-bold uppercase">Tổng PnL (Net)</p>
-                <h3 class="text-2xl font-bold mono" id="stat-pnl">0.00 USDT</h3>
+        <nav class="bg-card p-4 rounded-lg flex justify-between items-center shadow-lg">
+            <div class="flex items-center gap-3">
+                <div class="w-8 h-8 bg-blue-600 rounded flex items-center justify-center">
+                    <i class="fas fa-bolt text-white text-sm"></i>
+                </div>
+                <h1 class="text-xl font-bold tracking-tight">SNIPER <span class="text-blue-500">V17 PRO</span></h1>
             </div>
-            <div class="bg-card p-4 rounded-lg border border-gray-custom">
-                <p class="text-gray-500 text-xs font-bold uppercase">Tỷ lệ thắng (Winrate)</p>
-                <h3 class="text-2xl font-bold mono" id="stat-winrate">0%</h3>
-            </div>
-            <div class="bg-card p-4 rounded-lg border border-gray-custom">
-                <p class="text-gray-500 text-xs font-bold uppercase">Vị thế đang mở</p>
-                <h3 class="text-2xl font-bold mono text-blue-400" id="stat-open">0</h3>
-            </div>
-            <div class="bg-card p-4 rounded-lg border border-gray-custom">
-                <p class="text-gray-500 text-xs font-bold uppercase">Ước tính Ví</p>
-                <h3 class="text-2xl font-bold mono text-yellow-500" id="stat-wallet">-- USDT</h3>
-            </div>
-        </div>
-
-        <div class="grid grid-cols-12 gap-6">
             
-            <div class="col-span-12 lg:col-span-8 space-y-6">
-                <div class="bg-card rounded-lg border border-gray-custom overflow-hidden">
-                    <div class="px-5 py-4 border-b border-gray-custom flex justify-between items-center">
-                        <h2 class="font-bold flex items-center gap-2">
-                            <i class="fas fa-broadcast-tower text-blue-500"></i>
-                            Radar Monitor (Throttled 500ms)
-                        </h2>
-                        <span class="text-[10px] bg-gray-700 px-2 py-0.5 rounded text-gray-400">MULTIPLEX FEED</span>
+            <div class="flex items-center gap-10">
+                <div class="text-center">
+                    <p class="text-[10px] text-gray-500 uppercase font-bold">Net PnL</p>
+                    <p id="stat-pnl" class="text-lg font-bold mono">-- USDT</p>
+                </div>
+                <div class="text-center">
+                    <p class="text-[10px] text-gray-500 uppercase font-bold">Winrate</p>
+                    <p id="stat-win" class="text-lg font-bold mono text-blue-400">0%</p>
+                </div>
+                <div class="text-center border-l border-gray-700 pl-8">
+                    <div id="connection-status" class="flex items-center gap-2 text-[10px] font-bold text-green-400 uppercase">
+                        <span class="w-2 h-2 bg-green-500 rounded-full status-pulse"></span>
+                        Websocket Live
+                    </div>
+                    <p id="server-time" class="text-xs text-gray-500 mt-1 mono">--:--:--</p>
+                </div>
+            </div>
+        </nav>
+
+        <div class="grid grid-cols-12 gap-4">
+            
+            <div class="col-span-12 lg:col-span-8 space-y-4">
+                
+                <div class="bg-card rounded-lg overflow-hidden shadow-xl">
+                    <div class="px-5 py-3 border-b border-gray-700 bg-black bg-opacity-20 flex justify-between">
+                        <h2 class="text-xs font-bold uppercase tracking-widest text-gray-400">Radar Monitor (Redis Sync)</h2>
+                        <span id="stat-count" class="text-xs text-blue-400 font-bold">0 Coins Active</span>
                     </div>
                     <div class="overflow-x-auto">
-                        <table class="w-full text-left border-collapse">
-                            <thead>
-                                <tr class="text-gray-500 text-[11px] uppercase tracking-wider bg-black bg-opacity-20">
+                        <table class="w-full text-left">
+                            <thead class="text-[10px] text-gray-500 uppercase bg-black bg-opacity-10">
+                                <tr>
                                     <th class="px-5 py-3">Symbol</th>
-                                    <th class="px-5 py-3">Price</th>
-                                    <th class="px-5 py-3">OFI (Smooth)</th>
-                                    <th class="px-5 py-3">VPIN</th>
-                                    <th class="px-5 py-3">Whale Net</th>
-                                    <th class="px-5 py-3">MFA</th>
+                                    <th class="px-5 py-3 text-right">Price</th>
+                                    <th class="px-5 py-3 text-right">OFI (Smooth)</th>
+                                    <th class="px-5 py-3 text-right">MFA (Accel)</th>
+                                    <th class="px-5 py-3 text-right">Whale Net</th>
+                                    <th class="px-5 py-3 text-center">Trend</th>
                                 </tr>
                             </thead>
                             <tbody id="monitor-body" class="divide-y divide-gray-800 mono text-sm">
@@ -86,154 +76,168 @@
                     </div>
                 </div>
 
-                <div class="bg-card rounded-lg border border-gray-custom overflow-hidden">
-                    <div class="px-5 py-4 border-b border-gray-custom">
-                        <h2 class="font-bold flex items-center gap-2">
-                            <i class="fas fa-history text-yellow-500"></i>
-                            Lịch sử khớp lệnh gần đây
-                        </h2>
+                <div class="bg-card rounded-lg flex flex-col h-[400px] shadow-xl">
+                    <div class="px-5 py-3 border-b border-gray-700 bg-black bg-opacity-20">
+                        <h2 class="text-xs font-bold uppercase tracking-widest text-purple-400">AI Thought Engine (Live Logs)</h2>
                     </div>
-                    <div class="max-h-80 overflow-y-auto">
-                        <table class="w-full text-left text-xs">
-                            <thead class="sticky top-0 bg-card shadow-md">
-                                <tr class="text-gray-500 uppercase border-b border-gray-800">
-                                    <th class="px-5 py-3">Time</th>
-                                    <th class="px-5 py-3">Symbol</th>
-                                    <th class="px-5 py-3">Side</th>
-                                    <th class="px-5 py-3">PnL</th>
-                                    <th class="px-5 py-3">Reason</th>
-                                </tr>
-                            </thead>
-                            <tbody id="history-body" class="divide-y divide-gray-800"></tbody>
-                        </table>
-                    </div>
-                </div>
-            </div>
-
-            <div class="col-span-12 lg:col-span-4 space-y-6">
-                
-                <div class="bg-card rounded-lg border border-gray-custom flex flex-col h-[500px]">
-                    <div class="px-5 py-4 border-b border-gray-custom">
-                        <h2 class="font-bold flex items-center gap-2 text-purple-400">
-                            <i class="fas fa-brain"></i>
-                            AI Thought Engine
-                        </h2>
-                    </div>
-                    <div id="thought-log" class="flex-1 overflow-y-auto p-4 space-y-2 scrollbar-hide bg-black bg-opacity-20 text-[11px] mono">
+                    <div id="thought-log" class="flex-1 overflow-y-auto p-4 space-y-1 text-[11px] mono bg-black bg-opacity-30">
                         </div>
                 </div>
+            </div>
 
-                <div class="bg-card rounded-lg border border-gray-custom overflow-hidden">
-                    <div class="px-5 py-4 border-b border-gray-custom bg-blue-900 bg-opacity-10">
-                        <h2 class="font-bold flex items-center gap-2 text-blue-400">
-                            <i class="fas fa-graduation-cap"></i>
-                            Nhật ký Tiến hóa (Experience)
-                        </h2>
+            <div class="col-span-12 lg:col-span-4 space-y-4">
+                
+                <div class="bg-card rounded-lg shadow-xl overflow-hidden">
+                    <div class="px-5 py-3 border-b border-gray-700 bg-blue-900 bg-opacity-10">
+                        <h2 class="text-xs font-bold uppercase tracking-widest text-blue-400">Self-Evolution (Experience)</h2>
                     </div>
-                    <div id="experience-log" class="p-4 space-y-3 max-h-64 overflow-y-auto">
-                        <p class="text-gray-600 italic text-center text-xs py-4">Chờ dữ liệu đóng lệnh...</p>
+                    <div id="experience-log" class="p-4 space-y-3 max-h-[300px] overflow-y-auto">
+                        <p class="text-center text-gray-600 text-xs py-10 italic">Đang đợi dữ liệu kinh nghiệm...</p>
                     </div>
                 </div>
 
+                <div class="bg-card rounded-lg shadow-xl overflow-hidden">
+                    <div class="px-5 py-3 border-b border-gray-700 bg-black bg-opacity-20">
+                        <h2 class="text-xs font-bold uppercase tracking-widest text-yellow-500">Recent Trades (Database)</h2>
+                    </div>
+                    <div id="trade-history" class="divide-y divide-gray-800 max-h-[420px] overflow-y-auto">
+                        </div>
+                </div>
             </div>
         </div>
-    </main>
+    </div>
 
     <script>
         const socket = io();
         const monitorBody = document.getElementById('monitor-body');
         const thoughtLog = document.getElementById('thought-log');
         const expLog = document.getElementById('experience-log');
-        const historyBody = document.getElementById('history-body');
+        const tradeHistory = document.getElementById('trade-history');
 
-        // Cập nhật giờ hệ thống
+        // Cập nhật đồng hồ Dashboard
         setInterval(() => {
             document.getElementById('server-time').innerText = new Date().toLocaleTimeString();
         }, 1000);
 
-        // 1. Xử lý dữ liệu Tickers/Features (Real-time)
-        socket.on('live_features', (data) => {
-            let row = document.getElementById(`row-${data.symbol}`);
-            if (!row) {
-                row = document.createElement('tr');
-                row.id = `row-${data.symbol}`;
-                monitorBody.prepend(row);
+        // 1. ĐỒNG BỘ TOÀN BỘ TRẠNG THÁI (Khi vừa load trang)
+        socket.on('full_state_sync', (data) => {
+            console.log("🔄 Syncing state from Server/Redis...");
+            
+            // Đồng bộ Monitor Table
+            data.ticks.forEach(tick => updateMonitorRow(tick));
+            
+            // Nếu có macroScores nhưng chưa có tick, tạo hàng chờ
+            if(data.macroScores) {
+                Object.keys(data.macroScores).forEach(symbol => {
+                    ensureRow(symbol.toUpperCase());
+                });
             }
 
+            // Đồng bộ Logs
+            if(data.logs) {
+                thoughtLog.innerHTML = '';
+                data.logs.forEach(log => appendThought(log));
+            }
+
+            // Đồng bộ Trades từ MongoDB
+            if(data.trades) {
+                updateTradeHistory(data.trades);
+            }
+            
+            updateStats();
+        });
+
+        // 2. LẮNG NGHE DỮ LIỆU REAL-TIME
+        socket.on('live_features', (data) => updateMonitorRow(data));
+        socket.on('ai_thoughts', (data) => appendThought(data));
+        socket.on('experience', (data) => appendExperience(data));
+        socket.on('trade_update', () => updateStats());
+
+        // --- CÁC HÀM XỬ LÝ GIAO DIỆN ---
+
+        function ensureRow(symbol) {
+            let row = document.getElementById(`row-${symbol}`);
+            if (!row) {
+                row = document.createElement('tr');
+                row.id = `row-${symbol}`;
+                row.className = "border-b border-gray-800 hover:bg-gray-800 transition-colors";
+                monitorBody.appendChild(row);
+                document.getElementById('stat-count').innerText = `${monitorBody.rows.length} Coins Active`;
+            }
+            return row;
+        }
+
+        function updateMonitorRow(data) {
+            const row = ensureRow(data.symbol);
             const mfaClass = data.MFA > 0 ? 'text-green-400' : (data.MFA < 0 ? 'text-red-400' : '');
             const whaleClass = data.WHALE_NET > 0 ? 'text-green-500 font-bold' : (data.WHALE_NET < 0 ? 'text-red-500 font-bold' : '');
 
-            row.className = "hover:bg-gray-800 transition-colors border-b border-gray-800";
             row.innerHTML = `
                 <td class="px-5 py-3 font-bold text-blue-400">${data.symbol}</td>
-                <td class="px-5 py-3">${data.last_price.toFixed(4)}</td>
-                <td class="px-5 py-3 ${data.OFI > 0 ? 'text-green-400' : 'text-red-400'}">${data.OFI.toFixed(2)}</td>
-                <td class="px-5 py-3 text-gray-400">${(data.VPIN * 100).toFixed(1)}%</td>
-                <td class="px-5 py-3 ${whaleClass}">${(data.WHALE_NET || 0).toFixed(4)}</td>
-                <td class="px-5 py-3 ${mfaClass}">${data.MFA.toFixed(2)}</td>
+                <td class="px-5 py-3 text-right">${data.last_price.toFixed(4)}</td>
+                <td class="px-5 py-3 text-right ${data.OFI > 0 ? 'text-green-400' : 'text-red-400'}">${data.OFI.toFixed(2)}</td>
+                <td class="px-5 py-3 text-right ${mfaClass}">${data.MFA.toFixed(2)}</td>
+                <td class="px-5 py-3 text-right ${whaleClass}">${(data.WHALE_NET || 0).toFixed(4)}</td>
+                <td class="px-5 py-3 text-center"><span class="bg-gray-700 px-2 py-0.5 rounded text-[9px] text-gray-400">MONITORING</span></td>
             `;
-        });
+        }
 
-        // 2. Xử lý Log Suy nghĩ của AI
-        socket.on('ai_thoughts', (data) => {
+        function appendThought(data) {
             const entry = document.createElement('div');
-            entry.className = "pb-1 border-l-2 border-purple-900 pl-2 opacity-90";
+            entry.className = "border-l-2 border-gray-700 pl-2 py-0.5 opacity-90";
             entry.innerHTML = `
-                <span class="text-gray-600">[${new Date().toLocaleTimeString()}]</span>
-                <span class="text-purple-400 font-bold">${data.symbol}</span>: 
+                <span class="text-gray-500">[${data.symbol || 'SYS'}]</span> 
                 <span class="text-gray-300">${data.msg}</span>
             `;
             thoughtLog.prepend(entry);
-            if (thoughtLog.childNodes.length > 100) thoughtLog.lastChild.remove();
-        });
+            if (thoughtLog.childNodes.length > 150) thoughtLog.lastChild.remove();
+        }
 
-        // 3. Xử lý Experience (Dữ liệu học tập)
-        socket.on('experience', (data) => {
-            if (expLog.innerHTML.includes('Chờ dữ liệu')) expLog.innerHTML = '';
-            
-            const card = document.createElement('div');
-            const isProfit = data.pnl_pct >= 0;
-            card.className = `p-3 rounded border-l-4 bg-gray-800 ${isProfit ? 'border-green-500' : 'border-red-500'}`;
-            card.innerHTML = `
-                <div class="flex justify-between items-center">
-                    <span class="font-bold text-sm">${data.symbol} <span class="text-[10px] text-gray-500">${data.trade_type}</span></span>
-                    <span class="${isProfit ? 'text-green-400' : 'text-red-400'} font-bold">${data.pnl_pct}%</span>
+        function appendExperience(data) {
+            if (expLog.innerHTML.includes('Đang đợi')) expLog.innerHTML = '';
+            const isWin = data.pnl_pct >= 0;
+            const div = document.createElement('div');
+            div.className = `p-3 rounded bg-black bg-opacity-20 border-l-4 ${isWin ? 'border-green-500' : 'border-red-500'}`;
+            div.innerHTML = `
+                <div class="flex justify-between items-center font-bold text-xs">
+                    <span>${data.symbol} <span class="text-[9px] text-gray-500 font-normal">${data.trade_type}</span></span>
+                    <span class="${isWin ? 'text-green-400' : 'text-red-400'}">${data.pnl_pct}%</span>
                 </div>
-                <div class="text-[10px] text-gray-500 mt-1">AI Confidence: ${(data.prob_score * 100).toFixed(1)}%</div>
-                <div class="text-[10px] italic text-gray-400 truncate">Reason: ${data.reason}</div>
+                <div class="text-[10px] text-gray-500 mt-1">AI Prob: ${(data.prob_score*100).toFixed(1)}% | ${data.reason}</div>
             `;
-            expLog.prepend(card);
-            updateStats(); // Refresh stats khi có lệnh mới đóng
-        });
+            expLog.prepend(div);
+            if (expLog.childNodes.length > 20) expLog.lastChild.remove();
+        }
 
-        // 4. Cập nhật Stats & History từ API
+        function updateTradeHistory(trades) {
+            tradeHistory.innerHTML = trades.map(t => {
+                const isWin = t.pnl > 0;
+                return `
+                    <div class="px-4 py-2 hover:bg-gray-800 flex justify-between items-center text-[10px]">
+                        <div>
+                            <div class="font-bold text-gray-300">${t.symbol}</div>
+                            <div class="text-gray-600">${new Date(t.closeTime || t.openTime).toLocaleTimeString()}</div>
+                        </div>
+                        <div class="text-right">
+                            <div class="${isWin ? 'text-green-500' : 'text-red-500'} font-bold">${t.pnl ? t.pnl.toFixed(2) + ' USDT' : 'OPEN'}</div>
+                            <div class="text-gray-600">${t.exitReason || 'Pending...'}</div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
         async function updateStats() {
             try {
                 const res = await fetch('/api/stats');
                 const stats = await res.json();
-                document.getElementById('stat-pnl').innerText = stats.netPnL;
-                document.getElementById('stat-pnl').className = `text-2xl font-bold mono ${parseFloat(stats.netPnL) >= 0 ? 'text-green-400' : 'text-red-400'}`;
-                document.getElementById('stat-winrate').innerText = stats.winRate;
-                document.getElementById('stat-open').innerText = stats.openPositions;
+                const pnlEl = document.getElementById('stat-pnl');
+                pnlEl.innerText = stats.netPnL;
+                pnlEl.className = `text-lg font-bold mono ${parseFloat(stats.netPnL) >= 0 ? 'text-green-400' : 'text-red-400'}`;
+                document.getElementById('stat-win').innerText = stats.winRate;
                 document.getElementById('stat-wallet').innerText = stats.currentWalletEstimation;
-
-                const resTrades = await fetch('/api/trades');
-                const trades = await resTrades.json();
-                historyBody.innerHTML = trades.slice(0, 20).map(t => `
-                    <tr class="hover:bg-gray-800 transition-colors">
-                        <td class="px-5 py-2 text-gray-500">${new Date(t.closeTime || t.openTime).toLocaleTimeString()}</td>
-                        <td class="px-5 py-2 font-bold">${t.symbol}</td>
-                        <td class="px-5 py-2"><span class="px-1.5 py-0.5 rounded text-[10px] ${t.side === 'LONG' ? 'bg-green-900 text-green-300' : 'bg-red-900 text-red-300'}">${t.side}</span></td>
-                        <td class="px-5 py-2 font-bold ${t.pnl >= 0 ? 'text-green-400' : 'text-red-400'}">${t.pnl ? t.pnl.toFixed(2) : '--'}</td>
-                        <td class="px-5 py-2 text-gray-500 italic">${t.exitReason || 'OPEN'}</td>
-                    </tr>
-                `).join('');
-            } catch (e) { console.log("Lỗi fetch stats:", e); }
+            } catch (e) {}
         }
-
-        socket.on('trade_update', updateStats);
-        updateStats();
-
     </script>
 </body>
 </html>
