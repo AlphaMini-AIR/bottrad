@@ -257,13 +257,19 @@
         }
 
         function renderSuspects() {
-
             const list = document.getElementById('suspects-list');
-            document.getElementById('radar-count').innerText = `${activeSuspects.size} coin`;
+            const radarCountEl = document.getElementById('radar-count');
+
+            // Cập nhật số lượng coin đang quét
+            if (radarCountEl) {
+                radarCountEl.innerText = `${activeSuspects.size} coin`;
+            }
 
             activeSuspects.forEach((feat, symbol) => {
+                // 1. Lọc bỏ rác để giao diện không bị lỗi
                 if (!symbol || symbol === 'undefined') return;
-                // Tìm element của coin này, nếu chưa có thì tạo mới
+
+                // 2. Tìm element của coin này, nếu chưa có thì mới tạo (để chống giật màn hình)
                 let item = document.getElementById(`suspect-${symbol}`);
                 if (!item) {
                     item = document.createElement('div');
@@ -272,15 +278,20 @@
                     list.appendChild(item);
                 }
 
-                // Cập nhật class để biết coin nào đang được chọn
+                // 3. Cập nhật class hiển thị (Active nếu đang được nhấn xem)
                 const isActive = symbol === selectedSymbol ? 'active' : 'bg-gray-800';
-                item.className = `suspect-item p-2 mb-1 rounded flex justify-between ${isActive}`;
+                item.className = `suspect-item p-2 mb-1 rounded flex justify-between transition-all ${isActive}`;
 
-                // LẤY GIÁ TRỊ: Thử cả OFI (hoa) và ofi (thường) để chắc chắn
-                const ofiVal = feat.OFI || feat.ofi || 0;
+                // 4. Lấy giá trị hiển thị: Ưu tiên Macro Score (điểm xu hướng) trước, sau đó tới OFI
+                const scoreVal = feat.macro || feat.OFI || feat.ofi || 0;
 
-                // Chỉ cập nhật nội dung bên trong, không vẽ lại cả div -> Chống nhảy/giật
-                item.innerHTML = `<b>${symbol}</b><span class="${ofiVal >= 0 ? 'up' : 'down'}">${ofiVal.toFixed(1)}</span>`;
+                // 5. Chỉ cập nhật text bên trong (innerHTML) để trình duyệt không phải vẽ lại cả khối
+                item.innerHTML = `
+            <b class="tracking-wider">${symbol}</b>
+            <span class="font-bold ${scoreVal >= 0 ? 'up' : 'down'}">
+                ${scoreVal.toFixed(2)}
+            </span>
+        `;
             });
         }
         function renderTradeHistory(trades) {

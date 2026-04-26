@@ -188,10 +188,12 @@ subClient.on('pmessageBuffer', async (pattern, channel, messageBuffer) => {
 
         const probs = output[aiOutputName].data;
         const probLong = probs[1];
-
+        if (featureCount % 5 === 0) { // Cứ 5 tick báo 1 lần cho đỡ rác Dashboard
+            logThought(symbol, `🤖 Phân tích: LONG ${(probLong * 100).toFixed(1)}% | Macro: ${macroScore.toFixed(2)}`);
+        }
         console.log(`[DEBUG] 🤖 ${symbol} AI probLong=${(probLong * 100).toFixed(1)}% (Macro: ${macroScore})`);
 
-        if (probLong >= 0.75) {
+        if (probLong >= 0.70) {
             logThought(symbol, `🧠 [AI] Tín hiệu LONG: ${(probLong * 100).toFixed(1)}% (Macro: ${macroScore})`);
 
             const kelly = (probLong * (config.RISK_REWARD_RATIO || 2) - (1 - probLong)) / (config.RISK_REWARD_RATIO || 2);
