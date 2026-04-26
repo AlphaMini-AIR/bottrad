@@ -73,29 +73,41 @@ class FeatureBuffer:
                 print(f"✅ [{self.symbol}] ĐÃ ẤM - Sẵn sàng truyền dữ liệu!")
 
     def update_depth(self, data):
-        bids = data.get('bids', [])
-        asks = data.get('asks', [])
-        if not bids or not asks: return
+    # 1. Đổi 'bids' -> 'b' và 'asks' -> 'a' (Chuẩn WebSocket Binance)
+        bids = data.get('b', [])
+        asks = data.get('a', [])
+        if not bids or not asks:
+            print(f"⚠️ [{self.symbol}] CẢNH BÁO: Sổ lệnh trống! Kiểm tra luồng WebSocket.")
+            return
+     # Nếu không có dữ liệu thì thoát để tránh lỗi tính toán bên dưới
+        if not bids or not asks: 
+            return
 
+    # 2. Cập nhật Best Bid/Ask (Giá tốt nhất nằm ở vị trí đầu tiên)
         self.best_bid = float(bids[0][0])
         self.best_ask = float(asks[0][0])
-        
+    
+    # 3. Tính toán Volume thô
         bid_vol = sum(float(v) for p, v in bids)
         ask_vol = sum(float(v) for p, v in asks)
         total_vol = bid_vol + ask_vol
+    
+    # 4. Tính Orderbook Imbalance (Độ lệch sổ lệnh)
         self.ob_imb_top20 = (bid_vol - ask_vol) / total_vol if total_vol > 0 else 0
 
+    # 5. Tính Spread dựa trên giá khớp lệnh gần nhất
         if self.last_price > 0:
             self.spread_close = (self.best_ask - self.best_bid) / self.last_price
 
+    # 6. Tính toán Volume trong vùng 1% giá (Cực quan trọng để AI soi tường)
         bid_1pct_price = self.best_bid * 0.99
         ask_1pct_price = self.best_ask * 1.01
         self.bid_vol_1pct = sum(float(v) for p, v in bids if float(p) >= bid_1pct_price)
         self.ask_vol_1pct = sum(float(v) for p, v in asks if float(p) <= ask_1pct_price)
 
-        # Tính OFI (dùng ob_imb_top20 làm proxy, scale để có giá trị >15 khi mạnh)
+    # 7. Tính OFI (Cập nhật gia tốc dòng tiền)
+    # Scale x100 để đưa về định dạng Dashboard hiển thị được
         self.ofi = self.ob_imb_top20 * 100
-
     def update_trade(self, data):
         qty = float(data.get('q', 0))
         is_buyer_maker = data.get('m', True) 
