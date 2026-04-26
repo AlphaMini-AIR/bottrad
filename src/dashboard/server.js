@@ -8,107 +8,153 @@ const fs = require('fs');
 const path = require('path');
 const ScoutTrade = require('../models/ScoutTrade');
 
+// ==========================================
+// 1. KHỞI TẠO VÀ ĐỌC CẤU HÌNH
+// ==========================================
 require('dotenv').config({ path: path.join(__dirname, '../../.env') });
-
 const configPath = path.join(__dirname, '../../system_config.json');
+
 let config;
 try {
     config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 } catch (e) {
-    config = { 
-        REDIS_URL: process.env.REDIS_URL || 'redis://127.0.0.1:6379',
-        CHANNELS: { FEATURES: 'market:features:*', MACRO_SCORES: 'macro:scores' } 
-    };
+    console.error("❌ [WATCHTOWER] Không tìm thấy system_config.json");
+    process.exit(1);
 }
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-// KẾT NỐI REDIS: 1 luồng nghe (Sub), 1 luồng đọc/ghi (Data)
-const subClient = new Redis(config.REDIS_URL);
-const dataClient = new Redis(config.REDIS_URL);
-
-// Đăng ký các kênh dữ liệu
-subClient.psubscribe(config.CHANNELS?.FEATURES || 'market:features:*');
-subClient.subscribe('dashboard:logs', 'experience:raw', 'dashboard:trades');
-
-if (process.env.MONGO_URI_SCOUT) {
-    mongoose.connect(process.env.MONGO_URI_SCOUT).catch(e => console.error("❌ MongoDB Error:", e.message));
-}
-
 app.use(express.static(path.join(__dirname, 'public')));
 
-// BỘ NHỚ TẠM TRÊN RAM SERVER
-let aiLogHistory = [];
-let lastTickCache = new Map();
+// Bộ nhớ đệm RAM để tăng tốc hiển thị cho người dùng mới
+let fullTradeHistory = []; 
+let aiLogHistory = {}; 
+let lastTickData = new Map(); 
 
-// --- XỬ LÝ KHI NGƯỜI DÙNG KẾT NỐI ---
-io.on('connection', async (socket) => {
-    console.log("👤 [DASHBOARD] Người dùng đã kết nối.");
+const subClient = new Redis(config.REDIS_URL);
 
+// ==========================================
+// 2. KẾT NỐI MONGODB TOÀN CỤC (FIX LỖI UNDEFINED)
+// ==========================================
+const mongoUri = process.env.MONGO_URI_SCOUT || process.env.MONGO_URI;
+
+if (mongoUri) {
+    mongoose.connect(mongoUri)
+        .then(async () => {
+            console.log("📦 [WATCHTOWER] Đã kết nối MongoDB thành công.");
+            // Load lịch sử 100 lệnh gần nhất
+            try {
+                fullTradeHistory = await ScoutTrade.find().sort({ ts: -1 }).limit(100);
+            } catch (e) {
+                console.warn("⚠️ [DB] Chưa có dữ liệu lệnh cũ.");
+            }
+        })
+        .catch(err => console.error("❌ [WATCHTOWER] Lỗi MongoDB:", err.message));
+} else {
+    console.warn("⚠️ [WATCHTOWER] Thiếu cấu hình MONGO_URI trong .env");
+}
+
+// ==========================================
+// 3. API REST - CUNG CẤP DỮ LIỆU KIỂM TOÁN
+// ==========================================
+
+app.get('/api/stats', async (req, res) => {
     try {
-        // 1. Đọc "Toàn bộ" danh sách coin và điểm vĩ mô từ Redis
-        const macroScores = await dataClient.hgetall(config.CHANNELS?.MACRO_SCORES || 'macro:scores');
-        
-        // 2. Lấy 50 lệnh gần nhất từ MongoDB
-        const initialTrades = await ScoutTrade.find().sort({ openTime: -1 }).limit(50);
+        const trades = await ScoutTrade.find();
+        if (!trades || trades.length === 0) {
+            return res.json({
+                totalTrades: 0, winningTrades: 0, winRate: '0.00%',
+                netPnL: '0.00 USDT', totalFeesPaidToBinance: '0.0000 USDT',
+                currentWalletEstimation: '200.00 USDT'
+            });
+        }
 
-        // 3. Gửi toàn bộ trạng thái hiện tại cho UI ngay lập tức
-        socket.emit('full_state_sync', {
-            macroScores: macroScores,
-            logs: aiLogHistory,
-            trades: initialTrades,
-            ticks: Array.from(lastTickCache.values())
+        let totalTrades = trades.length;
+        let winningTrades = trades.filter(t => t.pnl > 0).length;
+        let winRate = (winningTrades / totalTrades) * 100;
+        let totalPnL = trades.reduce((sum, t) => sum + (t.pnl || 0), 0);
+        let totalFees = trades.reduce((sum, t) => sum + (t.entryFee || 0) + (t.exitFee || 0), 0);
+
+        res.json({
+            totalTrades, 
+            winningTrades, 
+            winRate: winRate.toFixed(2) + '%',
+            netPnL: totalPnL.toFixed(2) + ' USDT',
+            totalFeesPaidToBinance: totalFees.toFixed(4) + ' USDT',
+            currentWalletEstimation: (200 + totalPnL).toFixed(2) + ' USDT'
         });
-    } catch (e) {
-        console.error("❌ [SYNC ERROR]:", e.message);
+    } catch (err) {
+        res.json({ totalTrades: 0, netPnL: '0.00 USDT', winRate: '0.00%' }); // Trả về mặc định khi lỗi
     }
 });
 
-// --- LẮNG NGHE DỮ LIỆU THỜI GIAN THỰC ---
+app.get('/api/equity-curve', async (req, res) => {
+    try {
+        const trades = await ScoutTrade.find().sort({ closeTime: 1 });
+        let balance = 200;
+        let curve = [{ time: Date.now(), balance: 200 }];
+        
+        trades.forEach(t => {
+            balance += (t.pnl || 0);
+            curve.push({ time: t.closeTime || t.ts, balance: parseFloat(balance.toFixed(2)) });
+        });
+        res.json(curve);
+    } catch (err) { res.json([]); }
+});
 
-// A. Log suy nghĩ và Kinh nghiệm học tập
+// ==========================================
+// 4. XỬ LÝ REDIS PUB/SUB & SOCKET.IO
+// ==========================================
+
+// Đăng ký nghe các kênh dữ liệu từ Python Feed và OrderManager
+subClient.psubscribe('market:features*');
+subClient.subscribe('dashboard:logs', 'dashboard:trades');
+
+subClient.on('pmessageBuffer', (pattern, channel, messageBuffer) => {
+    try {
+        const feature = decode(messageBuffer); // Giải nén MsgPack từ Python
+        if (feature && feature.symbol) {
+            lastTickData.set(feature.symbol, feature);
+            io.emit('live_features', feature); // Gửi dữ liệu tick lên UI
+        }
+    } catch (e) {
+        // console.error("❌ Lỗi giải mã Tick:", e.message);
+    }
+});
+
 subClient.on('message', (channel, message) => {
     try {
         const data = JSON.parse(message);
         if (channel === 'dashboard:logs') {
-            aiLogHistory.push(data);
-            if (aiLogHistory.length > 100) aiLogHistory.shift();
-            io.emit('ai_thoughts', data);
+            const sym = data.symbol || 'SYSTEM';
+            if (!aiLogHistory[sym]) aiLogHistory[sym] = [];
+            aiLogHistory[sym].push(data);
+            if (aiLogHistory[sym].length > 100) aiLogHistory[sym].shift();
+            io.emit('ai_thoughts', data); // Gửi log suy nghĩ của AI lên UI
         } 
-        else if (channel === 'experience:raw') {
-            io.emit('experience', data);
-        }
         else if (channel === 'dashboard:trades') {
-            io.emit('trade_update', { ts: Date.now() });
+            io.emit('new_trade', data); // Báo có lệnh mới để UI cập nhật bảng
         }
     } catch (e) {}
 });
 
-// B. Luồng dữ liệu Features (Tick-by-tick)
-let lastEmitTime = {};
-subClient.on('pmessageBuffer', (pattern, channel, messageBuffer) => {
-    let feature;
-    try { 
-        feature = decode(messageBuffer); 
-    } catch (e) {
-        try { feature = JSON.parse(messageBuffer.toString()); } catch (err) { return; }
-    }
-
-    if (!feature || !feature.symbol) return;
-    const symbol = feature.symbol.toUpperCase();
-
-    // Lưu vào cache để người dùng vào sau có cái xem ngay
-    lastTickCache.set(symbol, feature);
-
-    // Throttling 500ms để tránh treo trình duyệt
-    const now = Date.now();
-    if (!lastEmitTime[symbol] || (now - lastEmitTime[symbol]) > 500) {
-        io.emit('live_features', feature);
-        lastEmitTime[symbol] = now;
-    }
+io.on('connection', (socket) => {
+    console.log("👤 [DASHBOARD] Người dùng đã kết nối.");
+    // Gửi toàn bộ trạng thái hiện tại ngay khi user mở web
+    socket.emit('full_state', {
+        logs: aiLogHistory, 
+        trades: fullTradeHistory, 
+        ticks: Array.from(lastTickData.values())
+    });
 });
 
+// ==========================================
+// 5. START SERVER
+// ==========================================
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Watchtower V17 Ready on Port ${PORT}`));
+server.listen(PORT, () => {
+    console.log(`\n🚀 [WATCHTOWER V17] Giao diện đang trực tại cổng ${PORT}`);
+    console.log(`🔗 Truy cập: http://localhost:${PORT} hoặc IP-VPS:${PORT}\n`);
+});
