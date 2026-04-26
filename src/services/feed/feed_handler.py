@@ -476,12 +476,11 @@ class FeedHandler:
     def __init__(self):
         self.redis = aioredis.from_url(
             REDIS_URL,
-            encoding=None,
             decode_responses=False,
             socket_keepalive=True,
             retry_on_timeout=True,
             health_check_interval=30
-        )
+        )   
 
         self.buffers = {}
         self.stream_refs = {}
