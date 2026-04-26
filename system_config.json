@@ -10,6 +10,7 @@
         "CANDIDATES": "radar:candidates",
         "MACRO_SCORES": "macro:scores",
         "FEATURES": "market:features:*",
-        "SUBSCRIPTIONS": "system:subscriptions"
+        "SUBSCRIPTIONS": "system:subscriptions",
+        "COMMANDS": "system:commands" 
     }
 }
