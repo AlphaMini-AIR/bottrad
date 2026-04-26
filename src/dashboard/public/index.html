@@ -45,13 +45,8 @@
             color: white;
         }
 
-        .up {
-            color: #3fb950;
-        }
-
-        .down {
-            color: #f85149;
-        }
+        .up { color: #3fb950; }
+        .down { color: #f85149; }
 
         .status-open {
             color: #d29922;
@@ -59,33 +54,16 @@
             animation: pulse 2s infinite;
         }
 
-        .status-closed {
-            color: #8b949e;
-        }
+        .status-closed { color: #8b949e; }
 
         @keyframes pulse {
-            0% {
-                opacity: 1;
-            }
-
-            50% {
-                opacity: 0.5;
-            }
-
-            100% {
-                opacity: 1;
-            }
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
         }
 
-        ::-webkit-scrollbar {
-            width: 6px;
-            height: 6px;
-        }
-
-        ::-webkit-scrollbar-thumb {
-            background: #30363d;
-            border-radius: 4px;
-        }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
     </style>
 </head>
 
@@ -104,23 +82,18 @@
             <h2 class="text-sm font-bold text-purple-400 mb-2 border-b border-gray-700 pb-2">
                 🧠 NÃO BỘ AI: <span id="selected-coin-name" class="text-white font-bold text-lg">Chưa chọn</span>
             </h2>
-            <div id="ai-logs"
-                class="overflow-y-auto text-xs text-green-400 p-2 bg-black rounded flex-grow font-mono leading-relaxed">
-                <span class="text-gray-500">Hãy click vào một đồng coin bên Radar để xem luồng suy nghĩ...</span>
+            <div id="ai-logs" class="overflow-y-auto text-xs text-green-400 p-2 bg-black rounded flex-grow font-mono leading-relaxed">
+                <span class="text-gray-500">Hãy click vào Radar để xem luồng suy nghĩ...</span>
             </div>
         </div>
 
         <div class="panel w-1/4">
             <h2 class="text-sm font-bold text-blue-400 mb-2 border-b border-gray-700 pb-2">📊 HIỆU SUẤT V17</h2>
             <div id="global-stats" class="text-sm space-y-3 mt-2">
-                <div class="flex justify-between"><span>Lệnh đang mở:</span> <b id="stat-open"
-                        class="text-yellow-400">0</b></div>
-                <div class="flex justify-between"><span>Winrate:</span> <b id="stat-winrate" class="text-white">--</b>
-                </div>
-                <div class="flex justify-between"><span>Tổng PnL:</span> <b id="stat-pnl" class="text-white">--</b>
-                </div>
-                <div class="flex justify-between"><span>Tổng Lệnh:</span> <b id="stat-trades"
-                        class="text-gray-400">--</b></div>
+                <div class="flex justify-between"><span>Lệnh đang mở:</span> <b id="stat-open" class="text-yellow-400">0</b></div>
+                <div class="flex justify-between"><span>Winrate:</span> <b id="stat-winrate" class="text-white">--</b></div>
+                <div class="flex justify-between"><span>Tổng PnL:</span> <b id="stat-pnl" class="text-white">--</b></div>
+                <div class="flex justify-between"><span>Tổng Lệnh:</span> <b id="stat-trades" class="text-gray-400">--</b></div>
                 <div class="flex justify-between mt-4 pt-4 border-t border-gray-700">
                     <span class="text-white">Ước tính Ví (Gốc $200):</span>
                     <b id="stat-wallet" class="text-green-400 text-lg">--</b>
@@ -136,8 +109,7 @@
     <div class="panel h-2/5">
         <div class="flex justify-between mb-2">
             <h2 class="text-sm font-bold text-gray-300">📚 KIỂM TOÁN LỆNH (REAL-TIME)</h2>
-            <button onclick="fetchStatsAndChart(); fetchTrades();"
-                class="text-xs bg-gray-800 hover:bg-gray-700 px-2 py-1 rounded text-white">🔄 Làm mới</button>
+            <button onclick="fetchStatsAndChart(); fetchTrades();" class="text-xs bg-gray-800 hover:bg-gray-700 px-2 py-1 rounded text-white">🔄 Làm mới</button>
         </div>
         <div class="overflow-y-auto">
             <table class="w-full text-left text-xs whitespace-nowrap">
@@ -152,7 +124,7 @@
                         <th class="pb-2">Close</th>
                         <th class="pb-2">PnL</th>
                         <th class="pb-2">ROI</th>
-                        <th class="pb-2 text-gray-500">Lý do</th>
+                        <th class="pb-2">Lý do</th>
                     </tr>
                 </thead>
                 <tbody id="trade-history" class="divide-y divide-gray-800"></tbody>
@@ -190,12 +162,12 @@
 
                 const curveRes = await fetch('/api/equity-curve');
                 const curve = await curveRes.json();
-                if (equityChart) {
-                    equityChart.data.labels = curve.map(d => new Date(d.time).toLocaleTimeString());
+                if (equityChart && curve.length > 0) {
+                    equityChart.data.labels = curve.map(d => d.time === 'Start' ? 'Bắt đầu' : new Date(d.time).toLocaleTimeString());
                     equityChart.data.datasets[0].data = curve.map(d => d.balance);
                     equityChart.update();
                 }
-            } catch (e) { console.error("Lỗi fetch Stats", e); }
+            } catch (e) { console.error("Stats Error", e); }
         }
 
         async function fetchTrades() {
@@ -206,10 +178,84 @@
             } catch (e) { }
         }
 
-        // SOCKET LISTENERS
+        // --- RENDER LOGIC ---
+
+        function renderSuspects() {
+            const list = document.getElementById('suspects-list');
+            const countEl = document.getElementById('radar-count');
+            countEl.innerText = `${activeSuspects.size} coin`;
+
+            activeSuspects.forEach((feat, symbol) => {
+                if (!symbol || symbol === 'undefined') return;
+                let item = document.getElementById(`suspect-${symbol}`);
+                if (!item) {
+                    item = document.createElement('div');
+                    item.id = `suspect-${symbol}`;
+                    item.onclick = () => selectCoin(symbol);
+                    list.appendChild(item);
+                }
+                const isActive = symbol === selectedSymbol ? 'active' : 'bg-gray-800';
+                item.className = `suspect-item p-2 mb-1 rounded flex justify-between ${isActive}`;
+
+                const score = feat.macro || feat.OFI || feat.ofi || 0;
+                item.innerHTML = `<b>${symbol}</b><span class="${score >= 0 ? 'up' : 'down'}">${score.toFixed(2)}</span>`;
+            });
+        }
+
+        function renderTradeHistory(trades) {
+            const tbody = document.getElementById('trade-history');
+            tbody.innerHTML = (trades || []).map(t => {
+                const isOp = t.status === 'OPEN';
+                const time = new Date(t.openTime).toLocaleTimeString();
+                const pnlColor = t.pnl > 0 ? 'up' : (t.pnl < 0 ? 'down' : '');
+                
+                // MÀU SẮC LỆNH: LONG xanh, SHORT đỏ
+                const typeColor = t.type === 'LONG' ? 'text-green-400' : 'text-red-400';
+                const statusHtml = isOp ? `<span class="status-open">🟢 ĐANG MỞ</span>` : `<span class="status-closed">⚪ ĐÓNG</span>`;
+
+                return `
+                    <tr class="hover:bg-gray-800 transition-colors ${isOp ? 'bg-gray-800/50' : ''}">
+                        <td class="py-2">${statusHtml}</td>
+                        <td class="text-gray-400">${time}</td>
+                        <td class="font-bold">${t.symbol}</td>
+                        <td class="font-bold ${typeColor}">${t.type}</td>
+                        <td>${t.leverage}x</td>
+                        <td>${t.entryPrice?.toFixed(4)}</td>
+                        <td>${isOp ? '...' : t.closePrice?.toFixed(4)}</td>
+                        <td class="${pnlColor} font-bold">${isOp ? '--' : (t.pnl?.toFixed(2) + '$')}</td>
+                        <td class="${pnlColor}">${isOp ? '--' : (t.roi?.toFixed(2) + '%')}</td>
+                        <td class="text-gray-500 text-[10px] italic">${t.reason || ''}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        // --- INTERACTION ---
+
+        window.selectCoin = function (symbol) {
+            selectedSymbol = symbol;
+            document.getElementById('selected-coin-name').innerText = symbol;
+            renderSuspects();
+
+            const logsBox = document.getElementById('ai-logs');
+            if (!aiLogsData[symbol] || aiLogsData[symbol].length === 0) {
+                logsBox.innerHTML = "<span class='text-gray-500'>Đang đợi luồng suy nghĩ từ AI...</span>";
+                return;
+            }
+            logsBox.innerHTML = aiLogsData[symbol].map(l => {
+                const t = new Date(l.ts).toLocaleTimeString();
+                return `[${t}] ${l.msg}`;
+            }).join('<br>');
+            logsBox.scrollTop = logsBox.scrollHeight;
+        }
+
+        // --- SOCKETS ---
+
         socket.on('full_state', (state) => {
             aiLogsData = state.logs || {};
-            state.ticks.forEach(feat => activeSuspects.set(feat.symbol, feat));
+            if (state.ticks) {
+                state.ticks.forEach(feat => activeSuspects.set(feat.symbol, feat));
+            }
             renderSuspects();
             renderTradeHistory(state.trades);
             fetchStatsAndChart();
@@ -223,105 +269,23 @@
         socket.on('ai_thoughts', (data) => {
             if (!aiLogsData[data.symbol]) aiLogsData[data.symbol] = [];
             aiLogsData[data.symbol].push(data);
-
-            // Giữ tối đa 50 log cuối
             if (aiLogsData[data.symbol].length > 50) aiLogsData[data.symbol].shift();
 
             if (selectedSymbol === data.symbol) {
                 const logsBox = document.getElementById('ai-logs');
                 const time = new Date(data.ts).toLocaleTimeString();
+                if (logsBox.innerHTML.includes('Đang đợi')) logsBox.innerHTML = '';
                 logsBox.innerHTML += `[${time}] ${data.msg}<br>`;
-                logsBox.scrollTop = logsBox.scrollHeight; // Auto scroll
+                logsBox.scrollTop = logsBox.scrollHeight;
             }
         });
 
         socket.on('trade_update', () => {
-            // Có thay đổi lệnh (Bóp cò hoặc Chốt lời), load lại Data
             fetchTrades();
             fetchStatsAndChart();
         });
 
-        // UI ACTIONS
-        window.selectCoin = function (symbol) {
-            selectedSymbol = symbol;
-            document.getElementById('selected-coin-name').innerText = symbol;
-            renderSuspects();
-
-            const logsBox = document.getElementById('ai-logs');
-            if (!aiLogsData[symbol] || aiLogsData[symbol].length === 0) {
-                logsBox.innerHTML = "<span class='text-gray-500'>Đang thu thập luồng suy nghĩ...</span>";
-                return;
-            }
-            logsBox.innerHTML = aiLogsData[symbol].map(l => `[${new Date(l.ts).toLocaleTimeString()}] ${l.msg}`).join('<br>');
-            logsBox.scrollTop = logsBox.scrollHeight;
-        }
-
-        function renderSuspects() {
-            const list = document.getElementById('suspects-list');
-            const radarCountEl = document.getElementById('radar-count');
-
-            // Cập nhật số lượng coin đang quét
-            if (radarCountEl) {
-                radarCountEl.innerText = `${activeSuspects.size} coin`;
-            }
-
-            activeSuspects.forEach((feat, symbol) => {
-                // 1. Lọc bỏ rác để giao diện không bị lỗi
-                if (!symbol || symbol === 'undefined') return;
-
-                // 2. Tìm element của coin này, nếu chưa có thì mới tạo (để chống giật màn hình)
-                let item = document.getElementById(`suspect-${symbol}`);
-                if (!item) {
-                    item = document.createElement('div');
-                    item.id = `suspect-${symbol}`;
-                    item.onclick = () => selectCoin(symbol);
-                    list.appendChild(item);
-                }
-
-                // 3. Cập nhật class hiển thị (Active nếu đang được nhấn xem)
-                const isActive = symbol === selectedSymbol ? 'active' : 'bg-gray-800';
-                item.className = `suspect-item p-2 mb-1 rounded flex justify-between transition-all ${isActive}`;
-
-                // 4. Lấy giá trị hiển thị: Ưu tiên Macro Score (điểm xu hướng) trước, sau đó tới OFI
-                const scoreVal = feat.macro || feat.OFI || feat.ofi || 0;
-
-                // 5. Chỉ cập nhật text bên trong (innerHTML) để trình duyệt không phải vẽ lại cả khối
-                item.innerHTML = `
-            <b class="tracking-wider">${symbol}</b>
-            <span class="font-bold ${scoreVal >= 0 ? 'up' : 'down'}">
-                ${scoreVal.toFixed(2)}
-            </span>
-        `;
-            });
-        }
-        function renderTradeHistory(trades) {
-            const tbody = document.getElementById('trade-history');
-            tbody.innerHTML = (trades || []).map(t => {
-                const isOp = t.status === 'OPEN';
-                const time = new Date(t.openTime).toLocaleTimeString();
-                const pnlColor = t.pnl > 0 ? 'up' : (t.pnl < 0 ? 'down' : '');
-                const statusHtml = isOp ? `<span class="status-open">🟢 ĐANG MỞ</span>` : `<span class="status-closed">⚪ ĐÓNG</span>`;
-                const typeColor = t.type === 'LONG' ? 'text-green-400' : 'text-red-400';
-
-                return `
-                    <tr class="hover:bg-gray-800 transition-colors ${isOp ? 'bg-gray-800/50' : ''}">
-                        <td class="py-2">${statusHtml}</td>
-                        <td class="text-gray-400">${time}</td>
-                        <td class="font-bold">${t.symbol}</td>
-                        <td class="font-bold ${typeColor}">${t.type}</td>
-                        <td>${t.leverage}x</td>
-                        <td>${t.entryPrice?.toFixed(4)}</td>
-                        <td>${isOp ? '...' : t.closePrice?.toFixed(4)}</td>
-                        <td class="${pnlColor} font-bold">${isOp ? '--' : (t.pnl?.toFixed(2) + '$')}</td>
-                        <td class="${pnlColor}">${isOp ? '--' : (t.roi?.toFixed(2) + '%')}</td>
-                        <td class="text-gray-500 text-[10px]">${t.reason || ''}</td>
-                    </tr>
-                `;
-            }).join('');
-        }
-
         initChart();
     </script>
 </body>
-
 </html>

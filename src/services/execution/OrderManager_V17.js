@@ -92,78 +92,66 @@ let featureCount = 0;
 
 subClient.on('pmessageBuffer', async (pattern, channel, messageBuffer) => {
     let feature;
-    try { feature = decode(messageBuffer); } catch (e) { return; }
+    try {
+        feature = decode(messageBuffer);
+    } catch (e) { return; }
 
     if (!feature || !feature.is_warm || !aiSession) return;
 
     const symbol = feature.symbol;
-    const currentPrice = feature.best_ask || feature.last_price || 0;
+    const currentPrice = feature.last_price || 0; // Dùng last_price để tính toán đồng nhất
     if (currentPrice === 0) return;
 
     featureCount++;
-    if (featureCount % 10 === 0) {
-        console.log(`\n📊 [DEBUG] Đã nhận ${featureCount} features. MacroCache: ${macroCache.size} coin. ActiveTrades: ${activeTrades.size}`);
-    }
-
-    console.log(`[DEBUG] 🎯 Feature ${symbol} | warm=${feature.is_warm} | macro=${macroCache.get(symbol) || 'N/A'} | price=${currentPrice.toFixed(6)}`);
-
     latestFeatures.set(symbol, feature);
-
     exchange.updateTick(symbol, currentPrice);
 
-    if (activeTrades.has(symbol) && !exchange.hasActivePosition(symbol)) {
-        console.log(`[DEBUG] ⚠️ ${symbol} có trong activeTrades nhưng không có trong PaperExchange -> xóa`);
-        activeTrades.delete(symbol);
-        syncStream(symbol, 'EXIT_TRADE');
-        logThought(symbol, "📉 Lệnh đã đóng trên sàn ảo (SL/Liq). Ngắt stream.");
-        return;
-    }
-
-    if (riskGuard.isHalted()) {
-        console.log(`[DEBUG] ⛔ RiskGuard HALTED`);
-        return;
-    }
-    if (!riskGuard.checkDrawdown(exchange.getWalletBalance())) {
-        console.log(`[DEBUG] 🚨 KILLSWITCH - Đóng tất cả lệnh`);
-        for (const [s, t] of activeTrades.entries()) {
-            // [CẬP NHẬT]: Truyền mảng features vào hàm closeTrade khi KillSwitch kích hoạt
-            await exchange.closeTrade(s, currentPrice, 'KILLSWITCH_DRAWDOWN', t.features);
-            syncStream(s, 'EXIT_TRADE');
-        }
-        activeTrades.clear();
-        return;
-    }
-
     // ------------------------------------------
-    // NHÁNH A: QUẢN LÝ LỆNH ĐANG CHẠY (TRAILING)
+    // NHÁNH A: QUẢN LÝ LỆNH ĐANG CHẠY (TRAILING STOP 2 CHIỀU)
     // ------------------------------------------
     if (activeTrades.has(symbol)) {
         const trade = activeTrades.get(symbol);
-        if (currentPrice > trade.highestPrice) trade.highestPrice = currentPrice;
-
-        const atrPercent = feature.ATR14 || 0.002;
-        const stopMultiplier = (feature.MFA > 0 ? 3.5 : 1.2);
-        const stopDistance = atrPercent * stopMultiplier;
-        const slPrice = trade.highestPrice * (1 - stopDistance);
-
-        console.log(`[DEBUG] 📉 ${symbol} Trailing: highest=${trade.highestPrice.toFixed(6)} sl=${slPrice.toFixed(6)} MFA=${feature.MFA?.toFixed(3)}`);
-
-        if (currentPrice <= slPrice || (feature.MFA && feature.MFA < -1.8)) {
-            const reason = (feature.MFA < -1.8) ? 'Gia tốc xả mạnh' : `Trailing Stop (${(stopDistance * 100).toFixed(2)}%)`;
-            logThought(symbol, `🛑 [CLOSE] ${reason} @ ${currentPrice.toFixed(4)}`);
-
-            // [CẬP NHẬT BẮT BUỘC]: Truyền trade.features sang PaperExchange để lưu Database
-            await exchange.closeTrade(symbol, currentPrice, reason, trade.features);
-
+        if (!exchange.hasActivePosition(symbol)) {
             activeTrades.delete(symbol);
             syncStream(symbol, 'EXIT_TRADE');
-            console.log(`[DEBUG] 🛑 Đã đóng lệnh ${symbol}`);
+            return;
+        }
+
+        const atrPercent = feature.ATR14 || 0.002;
+        const stopMultiplier = (Math.abs(feature.MFA) > 0.5 ? 3.5 : 1.2);
+        const stopDistance = atrPercent * stopMultiplier;
+
+        if (trade.type === 'LONG') {
+            // Đuổi theo Đỉnh
+            if (currentPrice > trade.highestPrice) trade.highestPrice = currentPrice;
+            const slPrice = trade.highestPrice * (1 - stopDistance);
+
+            // Chốt nếu giá rơi sâu hoặc MFA báo hiệu đảo chiều giảm
+            if (currentPrice <= slPrice || (feature.MFA && feature.MFA < -1.8)) {
+                const reason = (feature.MFA < -1.8) ? 'LONG: Đảo chiều giảm mạnh' : `LONG: Trailing Stop`;
+                logThought(symbol, `🛑 [CLOSE LONG] ${reason} @ ${currentPrice.toFixed(4)}`);
+                await exchange.closeTrade(symbol, currentPrice, reason, trade.features);
+                activeTrades.delete(symbol);
+            }
+        }
+        else if (trade.type === 'SHORT') {
+            // Đuổi theo Đáy (Sửa lại logic: giá thấp hơn thì cập nhật lowestPrice)
+            if (!trade.lowestPrice || currentPrice < trade.lowestPrice) trade.lowestPrice = currentPrice;
+            const slPrice = trade.lowestPrice * (1 + stopDistance); // Giá HỒI LÊN chạm slPrice là chốt
+
+            // Chốt nếu giá hồi lên mạnh hoặc MFA báo hiệu đảo chiều tăng
+            if (currentPrice >= slPrice || (feature.MFA && feature.MFA > 1.8)) {
+                const reason = (feature.MFA > 1.8) ? 'SHORT: Đảo chiều tăng mạnh' : `SHORT: Trailing Stop`;
+                logThought(symbol, `🛑 [CLOSE SHORT] ${reason} @ ${currentPrice.toFixed(4)}`);
+                await exchange.closeTrade(symbol, currentPrice, reason, trade.features);
+                activeTrades.delete(symbol);
+            }
         }
         return;
     }
 
     // ------------------------------------------
-    // NHÁNH B: BÓP CÒ AI (INFERENCE)
+    // NHÁNH B: BÓP CÒ AI (INFERENCE 2 CHIỀU)
     // ------------------------------------------
     const macroScore = macroCache.get(symbol);
     if (!macroScore || macroScore < (config.MACRO_THRESHOLD || 0.6)) return;
@@ -185,66 +173,78 @@ subClient.on('pmessageBuffer', async (pattern, channel, messageBuffer) => {
         const tensor = new ort.Tensor('float32', inputData, [1, 13]);
         const feeds = {}; feeds[aiInputName] = tensor;
         const output = await aiSession.run(feeds);
-
         const probs = output[aiOutputName].data;
+
+        const probShort = probs[0];
         const probLong = probs[1];
-        if (featureCount % 5 === 0) { // Cứ 5 tick báo 1 lần cho đỡ rác Dashboard
-            logThought(symbol, `🤖 Phân tích: LONG ${(probLong * 100).toFixed(1)}% | Macro: ${macroScore.toFixed(2)}`);
+
+        // Báo cáo song song cả 2 hướng lên Dashboard
+        if (featureCount % 10 === 0) {
+            logThought(symbol, `🤖 AI: LONG ${(probLong * 100).toFixed(1)}% | SHORT ${(probShort * 100).toFixed(1)}% | Macro: ${macroScore.toFixed(2)}`);
         }
-        console.log(`[DEBUG] 🤖 ${symbol} AI probLong=${(probLong * 100).toFixed(1)}% (Macro: ${macroScore})`);
 
-        if (probLong >= 0.70) {
-            logThought(symbol, `🧠 [AI] Tín hiệu LONG: ${(probLong * 100).toFixed(1)}% (Macro: ${macroScore})`);
+        // 🚀 ĐIỀU KIỆN VÀO LỆNH (Threshold 0.75)
+        let tradeAction = null;
+        if (probLong >= 0.75) tradeAction = 'LONG';
+        else if (probShort >= 0.75) tradeAction = 'SHORT';
 
-            const kelly = (probLong * (config.RISK_REWARD_RATIO || 2) - (1 - probLong)) / (config.RISK_REWARD_RATIO || 2);
+        if (tradeAction) {
+            const prob = tradeAction === 'LONG' ? probLong : probShort;
+            logThought(symbol, `🧠 [AI] Tín hiệu ${tradeAction}: ${(prob * 100).toFixed(1)}%`);
+
+            // Tính Kelly & Leverage
+            const kelly = (prob * 2 - (1 - prob)) / 2;
             let finalLev = Math.floor(kelly * config.MAX_LEVERAGE * (config.KELLY_FRACTION || 0.5));
             finalLev = Math.max(1, Math.min(finalLev, 20));
 
-            const vpin = feature.VPIN || 0;
-            const ofi = feature.OFI || 0;
-            const useMarket = (vpin > 0.8 || ofi > 15);
-
-            console.log(`[DEBUG] 🚀 ${symbol} sẵn sàng mở lệnh LONG, lev=${finalLev}x, market=${useMarket}`);
+            const useMarket = (feature.VPIN > 0.8 || Math.abs(feature.OFI) > 15);
 
             simulateLatency(async () => {
-                const freshAsk = latestFeatures.get(symbol)?.best_ask || currentPrice;
+                // LONG thì lấy giá Ask (mua), SHORT thì lấy giá Bid (bán)
+                const targetPrice = tradeAction === 'LONG'
+                    ? (latestFeatures.get(symbol)?.best_ask || currentPrice)
+                    : (latestFeatures.get(symbol)?.best_bid || currentPrice);
 
                 if (useMarket) {
-                    // [CẬP NHẬT]: Truyền 'LONG' và feature sang PaperExchange
-                    const success = await exchange.openTrade(symbol, 'MARKET', freshAsk, finalLev, probLong, 'LONG', feature);
+                    const success = await exchange.openTrade(symbol, 'MARKET', targetPrice, finalLev, prob, tradeAction, feature);
                     if (success) {
-                        // [CẬP NHẬT]: Gắn features vào RAM để chờ chốt lời
-                        activeTrades.set(symbol, { highestPrice: freshAsk, type: 'LONG', features: feature });
+                        activeTrades.set(symbol, {
+                            highestPrice: targetPrice,
+                            lowestPrice: targetPrice,
+                            type: tradeAction,
+                            features: feature
+                        });
                         syncStream(symbol, 'ENTER_TRADE');
-                        logThought(symbol, `⚡ [EXEC] MARKET LONG @ ${freshAsk.toFixed(4)}`);
                     }
                 } else {
-                    // [CẬP NHẬT]: Lưu features vào hàng chờ Limit
                     pendingOrders.set(symbol, {
-                        targetPrice: freshAsk, leverage: finalLev, prob: probLong,
-                        ts: Date.now(), type: 'LONG', features: feature
+                        targetPrice, leverage: finalLev, prob,
+                        ts: Date.now(), type: tradeAction, features: feature
                     });
-                    logThought(symbol, `🛡️ [EXEC] Đặt LIMIT @ ${freshAsk.toFixed(4)}`);
                 }
             });
         }
-    } catch (err) {
-        console.error(`[DEBUG] ❌ Lỗi inference ${symbol}:`, err.message);
-    }
+    } catch (err) { console.error(`❌ Inference error ${symbol}:`, err.message); }
 
     // ------------------------------------------
-    // NHÁNH C: KHỚP LỆNH LIMIT CHỜ
+    // NHÁNH C: KHỚP LỆNH LIMIT CHỜ (2 CHIỀU)
     // ------------------------------------------
     if (pendingOrders.has(symbol)) {
         const order = pendingOrders.get(symbol);
-        if (currentPrice <= order.targetPrice) {
-            logThought(symbol, `🎯 [MATCH] Khớp vùng chờ ${order.targetPrice.toFixed(4)}`);
+        const canMatch = order.type === 'LONG'
+            ? currentPrice <= order.targetPrice
+            : currentPrice >= order.targetPrice;
 
-            // [CẬP NHẬT]: Truyền order.type và order.features
+        if (canMatch) {
+            logThought(symbol, `🎯 [MATCH] Khớp vùng chờ ${order.type} @ ${order.targetPrice.toFixed(4)}`);
             const success = await exchange.openTrade(symbol, 'LIMIT_MAKER', order.targetPrice, order.leverage, order.prob, order.type, order.features);
             if (success) {
-                // [CẬP NHẬT]: Đưa từ hàng chờ lên bảng điều khiển activeTrades
-                activeTrades.set(symbol, { highestPrice: order.targetPrice, type: order.type, features: order.features });
+                activeTrades.set(symbol, {
+                    highestPrice: order.targetPrice,
+                    lowestPrice: order.targetPrice,
+                    type: order.type,
+                    features: order.features
+                });
                 syncStream(symbol, 'ENTER_TRADE');
             }
             pendingOrders.delete(symbol);
