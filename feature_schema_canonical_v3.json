@@ -1,0 +1,66 @@
+{
+  "input_name": "float_input",
+  "input_shape": [
+    null,
+    13
+  ],
+  "features": [
+    "ob_imb_top20",
+    "spread_close",
+    "bid_vol_1pct",
+    "ask_vol_1pct",
+    "max_buy_trade",
+    "max_sell_trade",
+    "liq_long_vol",
+    "liq_short_vol",
+    "funding_rate",
+    "taker_buy_ratio",
+    "body_size",
+    "wick_size",
+    "btc_relative_strength"
+  ],
+  "output_classes": {
+    "0": "SHORT",
+    "1": "LONG"
+  },
+  "order_manager_mapping": {
+    "probShort": "probs[0]",
+    "probLong": "probs[1]"
+  },
+  "multi_tier": {
+    "enabled_tiers": [
+      "tier1",
+      "tier2",
+      "scout"
+    ],
+    "tier_weights": {
+      "tier1": 0.9,
+      "tier2": 1.05,
+      "scout": 1.2
+    }
+  },
+  "canonical_normalization_required_in_live": true,
+  "canonical_rules": {
+    "enabled": true,
+    "quote_ref_window": 60,
+    "notional_feature_modes": {
+      "bid_vol_1pct": "raw_notional_to_ratio",
+      "ask_vol_1pct": "raw_notional_to_ratio",
+      "max_buy_trade": "raw_notional_to_ratio",
+      "max_sell_trade": "raw_notional_to_ratio",
+      "liq_long_vol": "already_ratio",
+      "liq_short_vol": "already_ratio"
+    },
+    "rules": {
+      "ob_imb_top20": "clip(-1.0, 1.0)",
+      "spread_close": "decimal percent of price, clip(0, 0.02)",
+      "notional_features": "auto raw-notional/ratio -> log1p(value/quote_volume_ref or value) -> clip",
+      "funding_rate": "clip(-0.01, 0.01)",
+      "taker_buy_ratio": "clip(0, 1)",
+      "body_size": "decimal body/price, clip(0, 0.08)",
+      "wick_size": "decimal wick/price, clip(0, 0.12)",
+      "btc_relative_strength": "clip(-10.0, 10.0)"
+    }
+  },
+  "note": "Model 2 class, train bằng canonical features. Live DataFeed/OrderManager phải đưa 13 feature cùng scale canonical, đặc biệt các field volume/orderbook/liquidation phải là log1p(ratio so với quote_volume_ref)."
+}
