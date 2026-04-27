@@ -1,116 +1,149 @@
 const IExchange = require('./IExchange');
 const ScoutTrade = require('../../models/ScoutTrade');
+
 const Redis = require('ioredis');
 const fs = require('fs');
 const path = require('path');
-const exchangeRules = require('../binance/ExchangeRules');
+require('dotenv').config({ path: path.join(__dirname, '../../../.env') });
 
 // ============================================================
-// PAPER EXCHANGE V19 - LIVE PARITY PAPER ENGINE
+// PAPER EXCHANGE - FIXED SAFE MONGO-FIRST VERSION
 // ------------------------------------------------------------
-// Mục tiêu:
-// 1. PaperExchange phải mô phỏng gần LiveExchange nhất có thể.
-// 2. Mọi lệnh phải qua ExchangeRules: tickSize, stepSize, minNotional, leverage bracket.
-// 3. Không dùng last_price để khớp lệnh một cách ảo tưởng.
-// 4. Entry/exit MARKET được mô phỏng bằng bid/ask + slippage.
-// 5. Liquidation check ưu tiên mark_price nếu FeedHandler cung cấp.
-// 6. Wallet accounting đúng: mở lệnh khóa margin + trừ entry fee, đóng lệnh hoàn margin + PnL - exit fee - funding.
-// 7. Lưu đầy đủ ScoutTrade_Model_V18/V19 fields để training và audit live-ready.
+// Mục tiêu sửa lỗi lần này:
+// 1. Tuyệt đối KHÔNG trừ ví paper nếu Mongo lưu OPEN thất bại.
+// 2. Tuyệt đối KHÔNG set activePositions nếu Mongo lưu OPEN thất bại.
+// 3. Khi closeTrade, nếu update Mongo thất bại thì vẫn giữ position trong RAM
+//    và KHÔNG cộng/trừ ví để tránh lệch trạng thái.
+// 4. Có restoreOpenTrades() để PM2 restart vẫn khôi phục lệnh OPEN từ Mongo.
+// 5. Ví paper mặc định 200 USDT, có thể reset qua system command.
+// 6. Không mở trùng symbol nếu lệnh cũ còn mở.
+// 7. Giữ interface tương thích OrderManager_Final:
+//    - openTrade(...)
+//    - closeTrade(...)
+//    - updateTick(...)
+//    - restoreOpenTrades()
+//    - resetPaperWallet(...)
+//    - getActivePositions()
 //
-// Interface giữ tương thích OrderManager_V18:
-// - openTrade(symbol, orderType, currentPrice, leverage, prob, type, features, meta)
-// - closeTrade(symbol, closePrice, reason, exitFeatures)
-// - updateTick(symbol, currentPrice, exitFeatures)
+// Lý do phải Mongo-first:
+// Nếu bot dùng để học mỗi đêm, một lệnh không lưu được Mongo là lệnh vô nghĩa.
+// Không được để ví paper thay đổi nhưng không có lịch sử lệnh/dataset.
 // ============================================================
 
 const configPath = path.join(__dirname, '../../../system_config.json');
 let config;
-
 try {
     config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 } catch (e) {
-    config = {
-        REDIS_URL: process.env.REDIS_URL || 'redis://localhost:6379'
-    };
+    config = { REDIS_URL: process.env.REDIS_URL || 'redis://localhost:6379' };
 }
 
-const PAPER_MODE = 'PAPER';
-const DEFAULT_INITIAL_CAPITAL = Number(process.env.PAPER_INITIAL_CAPITAL || 200);
-const DEFAULT_FIXED_MARGIN = Number(process.env.PAPER_FIXED_MARGIN || 2.0);
-const DEFAULT_FEE_MAKER = Number(process.env.PAPER_FEE_MAKER || 0.0002);
-const DEFAULT_FEE_TAKER = Number(process.env.PAPER_FEE_TAKER || 0.0004);
-const DEFAULT_MOCK_FUNDING_RATE = Number(process.env.PAPER_MOCK_FUNDING_RATE || 0.0001);
-const DEFAULT_SLIPPAGE_BPS = Number(process.env.PAPER_SLIPPAGE_BPS || 2); // 2 bps = 0.02%
-const MAX_ACCEPTABLE_SPREAD = Number(process.env.PAPER_MAX_ACCEPTABLE_SPREAD || 0.003); // 0.3%
-const WALLET_REDIS_KEY = process.env.PAPER_WALLET_REDIS_KEY || 'paper:wallet:balance:v19';
-const BOT_ID = process.env.BOT_ID || 'scout-main';
-const MODEL_VERSION = process.env.MODEL_VERSION || 'Universal_Scout.onnx';
+const REDIS_URL = config.REDIS_URL || process.env.REDIS_URL || 'redis://localhost:6379';
+const PAPER = config.PAPER || {};
+const TRADING = config.TRADING || {};
+
+const INITIAL_CAPITAL = Number(process.env.PAPER_INITIAL_CAPITAL || PAPER.INITIAL_CAPITAL || 200);
+const FIXED_MARGIN = Number(process.env.PAPER_FIXED_MARGIN || PAPER.FIXED_MARGIN || TRADING.FIXED_MARGIN || 2);
+const FEE_TAKER = Number(process.env.PAPER_FEE_TAKER || PAPER.FEE_TAKER || 0.0004);
+const SLIPPAGE_BPS = Number(process.env.PAPER_SLIPPAGE_BPS || PAPER.SLIPPAGE_BPS || 2);
+const MAX_ACCEPTABLE_SPREAD = Number(process.env.PAPER_MAX_ACCEPTABLE_SPREAD || PAPER.MAX_ACCEPTABLE_SPREAD || 0.003);
+const WALLET_KEY = process.env.PAPER_WALLET_REDIS_KEY || 'paper:wallet:balance:v19';
+const BOT_ID = process.env.BOT_ID || 'scout-paper-v19';
+const MODEL_VERSION = process.env.MODEL_VERSION || TRADING.MODEL_VERSION || 'Universal_Scout.onnx';
 
 class PaperExchange extends IExchange {
-    constructor(initialCapital = DEFAULT_INITIAL_CAPITAL) {
+    constructor() {
         super();
 
-        this.initialCapital = initialCapital;
-        this.walletBalance = initialCapital;
+        this.redis = new Redis(REDIS_URL);
+        this.redis.on('error', err => console.error('❌ [PAPER REDIS]', err.message));
+
         this.activePositions = new Map();
+        this.wallet = {
+            balance: INITIAL_CAPITAL,
+            initialCapital: INITIAL_CAPITAL,
+            updatedAt: Date.now()
+        };
 
-        this.pubClient = new Redis(config.REDIS_URL);
-        this.dataClient = new Redis(config.REDIS_URL);
-
-        this.pubClient.on('error', err => console.error('❌ [PAPER REDIS pubClient]', err.message));
-        this.dataClient.on('error', err => console.error('❌ [PAPER REDIS dataClient]', err.message));
-
-        this.FIXED_MARGIN = DEFAULT_FIXED_MARGIN;
-        this.FEE_MAKER = DEFAULT_FEE_MAKER;
-        this.FEE_TAKER = DEFAULT_FEE_TAKER;
-        this.MOCK_FUNDING_RATE = DEFAULT_MOCK_FUNDING_RATE;
-        this.DEFAULT_SLIPPAGE_BPS = DEFAULT_SLIPPAGE_BPS;
-
-        this._walletLoaded = false;
-        this._rulesReady = false;
-        this._restoreDone = false;
+        this.ready = false;
+        this.FIXED_MARGIN = FIXED_MARGIN;
+        this.FEE_TAKER = FEE_TAKER;
+        this.SLIPPAGE_BPS = SLIPPAGE_BPS;
+        this.MAX_ACCEPTABLE_SPREAD = MAX_ACCEPTABLE_SPREAD;
     }
 
     // ========================================================
-    // 1. UTILS
+    // 1. INIT / WALLET
     // ========================================================
-    _safeNumber(value, fallback = 0) {
+    async ensureReady() {
+        if (this.ready) return;
+        await this.loadWallet();
+        await this.restoreOpenTrades();
+        this.ready = true;
+        console.log(`✅ [SÀN ẢO FIXED] Ready | balance=${this.wallet.balance.toFixed(4)} USDT | active=${this.activePositions.size}`);
+    }
+
+    async loadWallet() {
+        try {
+            const raw = await this.redis.get(WALLET_KEY);
+            const parsed = raw != null ? Number(raw) : NaN;
+
+            if (Number.isFinite(parsed)) {
+                this.wallet.balance = parsed;
+                console.log(`👛 [SÀN ẢO FIXED] Khôi phục ví từ Redis: ${this.wallet.balance.toFixed(4)} USDT`);
+            } else {
+                this.wallet.balance = INITIAL_CAPITAL;
+                await this.persistWallet();
+                console.log(`👛 [SÀN ẢO FIXED] Tạo ví mới: ${this.wallet.balance.toFixed(4)} USDT`);
+            }
+        } catch (error) {
+            console.error('❌ [SÀN ẢO FIXED] Lỗi load ví Redis:', error.message);
+            this.wallet.balance = INITIAL_CAPITAL;
+        }
+    }
+
+    async persistWallet() {
+        this.wallet.updatedAt = Date.now();
+        await this.redis.set(WALLET_KEY, String(this.wallet.balance));
+    }
+
+    async resetPaperWallet(amount = INITIAL_CAPITAL) {
+        const value = Number(amount);
+        if (!Number.isFinite(value) || value < 0) {
+            throw new Error(`Invalid paper wallet reset amount: ${amount}`);
+        }
+
+        this.wallet.balance = value;
+        this.wallet.initialCapital = value;
+        await this.persistWallet();
+        console.log(`🔄 [SÀN ẢO FIXED] Reset ví paper: ${value.toFixed(4)} USDT`);
+        return this.wallet;
+    }
+
+    getWallet() {
+        return { ...this.wallet };
+    }
+
+    // ========================================================
+    // 2. BASIC UTILS
+    // ========================================================
+    normalizeSymbol(symbol) {
+        return String(symbol || '').toUpperCase().trim();
+    }
+
+    normalizeType(type) {
+        return type === 'SHORT' ? 'SHORT' : 'LONG';
+    }
+
+    safeNumber(value, fallback = 0) {
         const n = Number(value);
         return Number.isFinite(n) ? n : fallback;
     }
 
-    _normalizeSymbol(symbol) {
-        return String(symbol || '').toUpperCase().trim();
-    }
-
-    _normalizeType(type) {
-        return type === 'SHORT' ? 'SHORT' : 'LONG';
-    }
-
-    _now() {
-        return Date.now();
-    }
-
-    _isTakerOrder(orderType) {
-        return orderType === 'MARKET' || orderType === 'LIMIT_FOK';
-    }
-
-    _getFeeRate(orderType) {
-        return this._isTakerOrder(orderType) ? this.FEE_TAKER : this.FEE_MAKER;
-    }
-
-    _sideFromType(type) {
-        return type === 'LONG' ? 'BUY' : 'SELL';
-    }
-
-    _exitSideFromType(type) {
-        return type === 'LONG' ? 'SELL' : 'BUY';
-    }
-
-    _buildFeatureVector(features = {}) {
+    buildFeatureVector(features = {}) {
         if (!features || typeof features !== 'object') return undefined;
 
-        // Thứ tự phải khớp 13 input ONNX trong OrderManager.
+        // THỨ TỰ 13 INPUT phải khớp OrderManager/ONNX.
         return [
             Number(features.ob_imb_top20 || 0),
             Number(features.spread_close || 0),
@@ -128,155 +161,56 @@ class PaperExchange extends IExchange {
         ];
     }
 
-    async ensureReady() {
-        await this.ensureWalletLoaded();
+    getExecutionPrice(type, currentPrice, features = null, purpose = 'ENTRY') {
+        const price = this.safeNumber(currentPrice, 0);
+        if (price <= 0) return 0;
 
-        if (!this._rulesReady) {
-            await exchangeRules.ensureReady();
-            // Nếu có API key thì ExchangeRules tự sync leverageBracket trong init; ensureReady chỉ cần exchangeInfo.
-            if (typeof exchangeRules.syncLeverageBrackets === 'function') {
-                await exchangeRules.syncLeverageBrackets(false);
+        const bestBid = this.safeNumber(features?.best_bid, 0);
+        const bestAsk = this.safeNumber(features?.best_ask, 0);
+
+        // Nếu có bid/ask thật thì mô phỏng market fill sát hơn.
+        if (bestBid > 0 && bestAsk > 0 && bestAsk > bestBid) {
+            if (purpose === 'ENTRY') {
+                return type === 'LONG' ? bestAsk : bestBid;
             }
-            this._rulesReady = true;
+            return type === 'LONG' ? bestBid : bestAsk;
         }
+
+        // Fallback slippage theo bps.
+        const slip = this.SLIPPAGE_BPS / 10000;
+        if (purpose === 'ENTRY') {
+            return type === 'LONG' ? price * (1 + slip) : price * (1 - slip);
+        }
+        return type === 'LONG' ? price * (1 - slip) : price * (1 + slip);
     }
 
-    // ========================================================
-    // 2. WALLET PERSISTENCE
-    // ========================================================
-    async ensureWalletLoaded() {
-        if (this._walletLoaded) return;
-
-        try {
-            const saved = await this.dataClient.get(WALLET_REDIS_KEY);
-            const savedBalance = this._safeNumber(saved, NaN);
-
-            if (Number.isFinite(savedBalance) && savedBalance >= 0) {
-                this.walletBalance = savedBalance;
-                console.log(`👛 [SÀN ẢO V19] Khôi phục ví từ Redis: ${this.walletBalance.toFixed(4)} USDT`);
-            } else {
-                await this.persistWalletBalance();
-                console.log(`👛 [SÀN ẢO V19] Khởi tạo ví: ${this.walletBalance.toFixed(4)} USDT`);
-            }
-        } catch (error) {
-            console.error('⚠️ [SÀN ẢO V19] Không thể load ví Redis, dùng RAM:', error.message);
-        } finally {
-            this._walletLoaded = true;
+    validateSpread(features = null) {
+        if (!features) return { ok: true };
+        const spread = this.safeNumber(features.spread_close, 0);
+        if (spread < 0) return { ok: false, reason: 'BAD_SPREAD' };
+        if (spread > this.MAX_ACCEPTABLE_SPREAD) {
+            return { ok: false, reason: `SPREAD_TOO_WIDE_${spread}` };
         }
+        return { ok: true };
     }
 
-    async persistWalletBalance() {
-        try {
-            await this.dataClient.set(WALLET_REDIS_KEY, String(this.walletBalance));
-        } catch (error) {
-            console.error('⚠️ [SÀN ẢO V19] Không thể lưu ví Redis:', error.message);
+    estimateLiquidationPrice(type, entryPrice, size, margin, notionalValue) {
+        if (size <= 0 || entryPrice <= 0 || margin <= 0) return 0;
+
+        // Mô phỏng đơn giản cho paper, không thay thế công thức Binance thật.
+        // Dùng maintenance giả định 0.5% notional để dashboard có mốc tham khảo.
+        const maintenanceMargin = notionalValue * 0.005;
+        const effectiveMargin = Math.max(0, margin - maintenanceMargin);
+
+        if (type === 'LONG') {
+            return Math.max(0, entryPrice - effectiveMargin / size);
         }
+        return entryPrice + effectiveMargin / size;
     }
 
-    // ========================================================
-    // 3. LIVE-LIKE FILL SIMULATOR
-    // ========================================================
-    _getBookFromFeature(features = {}, fallbackPrice = 0) {
-        const last = this._safeNumber(features?.last_price, fallbackPrice);
-        const bid = this._safeNumber(features?.best_bid, 0);
-        const ask = this._safeNumber(features?.best_ask, 0);
-        const mark = this._safeNumber(features?.mark_price, last);
+    calculateMaeMfe(position) {
+        if (!position || !position.entryPrice) return { maePercent: 0, mfePercent: 0 };
 
-        if (bid > 0 && ask > 0 && ask > bid) {
-            const spread = last > 0 ? (ask - bid) / last : 0;
-            return { bid, ask, last: last || (bid + ask) / 2, mark: mark || last || (bid + ask) / 2, spread, hasBook: true };
-        }
-
-        // Fallback bất lợi nếu chưa có book: tự tạo synthetic spread nhẹ quanh current price.
-        const synthetic = last || fallbackPrice;
-        if (synthetic <= 0) {
-            return { bid: 0, ask: 0, last: 0, mark: 0, spread: 1, hasBook: false };
-        }
-
-        const syntheticSpread = 0.0005; // 0.05% fallback
-        return {
-            bid: synthetic * (1 - syntheticSpread / 2),
-            ask: synthetic * (1 + syntheticSpread / 2),
-            last: synthetic,
-            mark: mark || synthetic,
-            spread: syntheticSpread,
-            hasBook: false
-        };
-    }
-
-    _slippageRate(features = {}, side = 'BUY') {
-        const base = this.DEFAULT_SLIPPAGE_BPS / 10000;
-        const spread = this._safeNumber(features?.spread_close, 0);
-
-        // Nếu spread đã cao, paper phải phạt thêm để không quá lạc quan.
-        const spreadPenalty = Math.max(0, spread) * 0.25;
-
-        // Nếu có orderbook imbalance nghiêng ngược hướng thì phạt nhẹ.
-        const obImb = this._safeNumber(features?.ob_imb_top20, 0);
-        let imbalancePenalty = 0;
-        if (side === 'BUY' && obImb < -0.3) imbalancePenalty = 0.0002;
-        if (side === 'SELL' && obImb > 0.3) imbalancePenalty = 0.0002;
-
-        return Math.max(0, base + spreadPenalty + imbalancePenalty);
-    }
-
-    _simulateMarketFill({ symbol, side, quantity, fallbackPrice, features, purpose }) {
-        const book = this._getBookFromFeature(features, fallbackPrice);
-        if (book.last <= 0 || book.bid <= 0 || book.ask <= 0) {
-            return { ok: false, reason: 'NO_VALID_PRICE' };
-        }
-
-        if (book.spread > MAX_ACCEPTABLE_SPREAD) {
-            return { ok: false, reason: 'SPREAD_TOO_WIDE', detail: `spread=${book.spread}` };
-        }
-
-        const slip = this._slippageRate(features, side);
-        let rawFillPrice;
-
-        if (side === 'BUY') {
-            rawFillPrice = book.ask * (1 + slip);
-        } else {
-            rawFillPrice = book.bid * (1 - slip);
-        }
-
-        const normalizedPrice = exchangeRules.normalizePrice(symbol, rawFillPrice, side === 'BUY' ? 'ceil' : 'floor');
-        if (!normalizedPrice || normalizedPrice <= 0) {
-            return { ok: false, reason: 'BAD_NORMALIZED_FILL_PRICE' };
-        }
-
-        return {
-            ok: true,
-            purpose,
-            side,
-            quantity,
-            fillPrice: normalizedPrice,
-            rawFillPrice,
-            slippageRate: slip,
-            spread: book.spread,
-            usedSyntheticBook: !book.hasBook,
-            markPrice: book.mark
-        };
-    }
-
-    _calculateLiquidationPrice(type, entryPrice, positionSize, margin, notionalValue, maintenanceMarginRate) {
-        if (positionSize <= 0 || entryPrice <= 0) return 0;
-
-        const maintMargin = notionalValue * maintenanceMarginRate;
-        const liquidationPrice = type === 'LONG'
-            ? entryPrice - (margin - maintMargin) / positionSize
-            : entryPrice + (margin - maintMargin) / positionSize;
-
-        return liquidationPrice > 0 ? liquidationPrice : 0;
-    }
-
-    _calculateGrossPnl(position, closePrice) {
-        if (position.type === 'LONG') {
-            return (closePrice - position.entryPrice) * position.size;
-        }
-        return (position.entryPrice - closePrice) * position.size;
-    }
-
-    _calculateMaeMfe(position) {
         let mfePercent = 0;
         let maePercent = 0;
 
@@ -288,205 +222,116 @@ class PaperExchange extends IExchange {
             maePercent = ((position.entryPrice - position.highestPrice) / position.entryPrice) * 100;
         }
 
-        return { mfePercent, maePercent };
-    }
-
-    _publishDashboardUpdate() {
-        try {
-            this.pubClient.publish('dashboard:trades', JSON.stringify({ action: 'UPDATE' }));
-        } catch (error) {
-            console.error('⚠️ [PAPER V19] Lỗi publish dashboard:trades:', error.message);
-        }
-    }
-
-    _logReject(symbol, reason, extra = '') {
-        console.log(`⚠️ [SÀN ẢO V19] TỪ CHỐI ${symbol}: ${reason}${extra ? ` | ${extra}` : ''}`);
+        return { maePercent, mfePercent };
     }
 
     // ========================================================
-    // 4. RESTORE OPEN TRADES
+    // 3. RESTORE OPEN TRADES FROM MONGO
     // ========================================================
     async restoreOpenTrades() {
-        await this.ensureReady();
-        if (this._restoreDone) return this.getActivePositions();
-
         try {
-            const openTrades = await ScoutTrade.find({
-                status: 'OPEN',
-                mode: PAPER_MODE,
-                botId: BOT_ID
-            }).sort({ openTime: 1 }).lean();
+            const openTrades = await ScoutTrade.find({ status: 'OPEN', mode: { $in: ['PAPER', 'BACKTEST'] } })
+                .sort({ openTime: -1 })
+                .lean();
 
-            for (const trade of openTrades) {
-                const symbol = this._normalizeSymbol(trade.symbol);
-                if (!symbol || this.activePositions.has(symbol)) continue;
+            this.activePositions.clear();
 
-                const position = {
-                    dbId: trade._id,
-                    entryPrice: this._safeNumber(trade.entryPrice),
-                    size: this._safeNumber(trade.size),
-                    leverage: this._safeNumber(trade.leverage, 1),
-                    margin: this._safeNumber(trade.margin, this.FIXED_MARGIN),
-                    notionalValue: this._safeNumber(trade.notionalValue, this._safeNumber(trade.size) * this._safeNumber(trade.entryPrice)),
-                    orderType: trade.orderType || 'MARKET',
-                    entryFee: this._safeNumber(trade.entryFee),
-                    type: this._normalizeType(trade.type),
-                    features: trade.featuresAtEntry || trade.features || null,
-                    featureVectorAtEntry: trade.featureVectorAtEntry,
-                    liquidationPrice: this._safeNumber(trade.liquidationPrice),
-                    highestPrice: this._safeNumber(trade.highestPrice, trade.entryPrice),
-                    lowestPrice: this._safeNumber(trade.lowestPrice, trade.entryPrice),
-                    openTime: trade.openTs || new Date(trade.openTime).getTime(),
-                    prob: this._safeNumber(trade.prob),
-                    probLong: this._safeNumber(trade.probLong, undefined),
-                    probShort: this._safeNumber(trade.probShort, undefined),
-                    macroScore: this._safeNumber(trade.macroScore, undefined)
-                };
+            for (const t of openTrades) {
+                const symbol = this.normalizeSymbol(t.symbol);
+                if (!symbol) continue;
 
-                this.activePositions.set(symbol, position);
+                const entryPrice = this.safeNumber(t.executedEntryPrice || t.entryPrice, 0);
+                const size = this.safeNumber(t.size, 0);
+                if (entryPrice <= 0 || size <= 0) continue;
+
+                this.activePositions.set(symbol, {
+                    dbId: t._id,
+                    symbol,
+                    type: this.normalizeType(t.type),
+                    entryPrice,
+                    size,
+                    leverage: this.safeNumber(t.leverage, 1),
+                    margin: this.safeNumber(t.margin, this.FIXED_MARGIN),
+                    notionalValue: this.safeNumber(t.notionalValue, entryPrice * size),
+                    entryFee: this.safeNumber(t.entryFee, 0),
+                    liquidationPrice: this.safeNumber(t.liquidationPrice, 0),
+                    highestPrice: this.safeNumber(t.highestPrice, entryPrice),
+                    lowestPrice: this.safeNumber(t.lowestPrice, entryPrice),
+                    openTime: this.safeNumber(t.openTs, t.openTime ? new Date(t.openTime).getTime() : Date.now()),
+                    prob: this.safeNumber(t.prob, 0),
+                    probLong: t.probLong,
+                    probShort: t.probShort,
+                    macroScore: t.macroScore,
+                    features: t.featuresAtEntry || t.features || null,
+                    featureVectorAtEntry: t.featureVectorAtEntry || undefined,
+                    restored: true
+                });
             }
 
             if (openTrades.length > 0) {
-                console.log(`♻️ [SÀN ẢO V19] Restore ${this.activePositions.size} lệnh OPEN từ MongoDB`);
+                console.log(`♻️ [SÀN ẢO FIXED] Restore ${this.activePositions.size}/${openTrades.length} OPEN trades từ Mongo`);
             }
         } catch (error) {
-            console.error('❌ [SÀN ẢO V19] Lỗi restoreOpenTrades:', error.message);
-        } finally {
-            this._restoreDone = true;
+            console.error('❌ [SÀN ẢO FIXED] Lỗi restore OPEN trades:', error.message);
         }
-
-        return this.getActivePositions();
-    }
-
-    getActivePositions() {
-        return new Map(this.activePositions);
     }
 
     // ========================================================
-    // 5. OPEN TRADE
+    // 4. OPEN TRADE - MONGO FIRST, WALLET SECOND
     // ========================================================
     async openTrade(symbol, orderType, currentPrice, leverage, prob, type = 'LONG', features = null, meta = {}) {
         await this.ensureReady();
 
-        symbol = this._normalizeSymbol(symbol);
-        type = this._normalizeType(type);
-        orderType = orderType || 'MARKET';
-        currentPrice = this._safeNumber(currentPrice);
-        leverage = Math.floor(this._safeNumber(leverage));
-        prob = this._safeNumber(prob);
+        symbol = this.normalizeSymbol(symbol);
+        type = this.normalizeType(type);
+        currentPrice = this.safeNumber(currentPrice, 0);
+        leverage = Math.floor(this.safeNumber(leverage, 1));
+        prob = this.safeNumber(prob, 0);
 
-        if (!symbol) return false;
+        if (!symbol || currentPrice <= 0 || leverage <= 0) {
+            console.warn(`⚠️ [SÀN ẢO FIXED] Reject open: BAD_INPUT symbol=${symbol} price=${currentPrice} lev=${leverage}`);
+            return false;
+        }
+
         if (this.activePositions.has(symbol)) {
-            this._logReject(symbol, 'đã có vị thế PAPER đang mở');
-            return false;
-        }
-        if (currentPrice <= 0) {
-            this._logReject(symbol, 'currentPrice không hợp lệ', `currentPrice=${currentPrice}`);
-            return false;
-        }
-        if (leverage <= 0) {
-            this._logReject(symbol, 'leverage không hợp lệ', `leverage=${leverage}`);
+            console.warn(`⚠️ [SÀN ẢO FIXED] Reject open ${symbol}: ACTIVE_POSITION_EXISTS`);
             return false;
         }
 
-        const rule = exchangeRules.getSymbolRules(symbol);
-        if (!rule || !exchangeRules.isTradable(symbol)) {
-            this._logReject(symbol, 'symbol không tradable theo ExchangeRules');
+        const spreadCheck = this.validateSpread(features);
+        if (!spreadCheck.ok) {
+            console.warn(`⚠️ [SÀN ẢO FIXED] Reject open ${symbol}: ${spreadCheck.reason}`);
             return false;
         }
 
-        const side = this._sideFromType(type);
-        const targetNotional = this.FIXED_MARGIN * leverage;
-        const book = this._getBookFromFeature(features, currentPrice);
-        const referenceEntryPrice = side === 'BUY' ? book.ask : book.bid;
-
-        if (!referenceEntryPrice || referenceEntryPrice <= 0) {
-            this._logReject(symbol, 'không có referenceEntryPrice hợp lệ');
+        const margin = this.FIXED_MARGIN;
+        if (this.wallet.balance < margin) {
+            console.warn(`⚠️ [SÀN ẢO FIXED] Reject open ${symbol}: INSUFFICIENT_BALANCE balance=${this.wallet.balance.toFixed(4)} margin=${margin}`);
             return false;
         }
 
-        const rawQuantity = targetNotional / referenceEntryPrice;
-        const quantity = exchangeRules.normalizeQuantity(symbol, rawQuantity, orderType);
+        const entryPrice = this.getExecutionPrice(type, currentPrice, features, 'ENTRY');
+        if (entryPrice <= 0) {
+            console.warn(`⚠️ [SÀN ẢO FIXED] Reject open ${symbol}: BAD_EXECUTION_PRICE`);
+            return false;
+        }
 
-        const validation = exchangeRules.validateMarketEntry({
+        const notionalValue = margin * leverage;
+        const size = notionalValue / entryPrice;
+        const entryFee = notionalValue * this.FEE_TAKER;
+        const openTs = Date.now();
+        const liquidationPrice = this.estimateLiquidationPrice(type, entryPrice, size, margin, notionalValue);
+        const featureVectorAtEntry = this.buildFeatureVector(features);
+
+        const position = {
             symbol,
-            side,
-            quantity,
-            currentPrice: referenceEntryPrice,
-            leverage
-        });
-
-        if (!validation.ok) {
-            this._logReject(symbol, validation.reason, validation.detail || '');
-            return false;
-        }
-
-        const normalizedQty = validation.normalized.quantity;
-        const fill = this._simulateMarketFill({
-            symbol,
-            side,
-            quantity: normalizedQty,
-            fallbackPrice: currentPrice,
-            features,
-            purpose: 'ENTRY'
-        });
-
-        if (!fill.ok) {
-            this._logReject(symbol, fill.reason, fill.detail || '');
-            return false;
-        }
-
-        const entryPrice = fill.fillPrice;
-        const notionalValue = normalizedQty * entryPrice;
-        const finalValidation = exchangeRules.validateMarketEntry({
-            symbol,
-            side,
-            quantity: normalizedQty,
-            currentPrice: entryPrice,
-            leverage
-        });
-
-        if (!finalValidation.ok) {
-            this._logReject(symbol, finalValidation.reason, finalValidation.detail || '');
-            return false;
-        }
-
-        const maintenanceMarginRate = exchangeRules.getMaintenanceMarginRate(symbol, notionalValue);
-        const entryFee = notionalValue * this._getFeeRate(orderType);
-        const requiredWallet = this.FIXED_MARGIN + entryFee;
-
-        if (this.walletBalance < requiredWallet) {
-            this._logReject(symbol, 'ví PAPER không đủ margin + fee', `wallet=${this.walletBalance.toFixed(4)} required=${requiredWallet.toFixed(4)}`);
-            return false;
-        }
-
-        const openTs = this._now();
-        const liquidationPrice = this._calculateLiquidationPrice(
             type,
             entryPrice,
-            normalizedQty,
-            this.FIXED_MARGIN,
-            notionalValue,
-            maintenanceMarginRate
-        );
-
-        this.walletBalance -= requiredWallet;
-        await this.persistWalletBalance();
-
-        const featureVectorAtEntry = this._buildFeatureVector(features);
-
-        const newPosition = {
-            entryPrice,
-            size: normalizedQty,
+            size,
             leverage,
-            margin: this.FIXED_MARGIN,
+            margin,
             notionalValue,
-            orderType,
             entryFee,
-            type,
-            side,
-            features,
-            featureVectorAtEntry,
             liquidationPrice,
             highestPrice: entryPrice,
             lowestPrice: entryPrice,
@@ -495,236 +340,231 @@ class PaperExchange extends IExchange {
             probLong: meta.probLong,
             probShort: meta.probShort,
             macroScore: meta.macroScore,
+            features,
+            featureVectorAtEntry
+        };
+
+        const payload = {
+            symbol,
+            type,
+            mode: 'PAPER',
+            orderType: orderType || 'MARKET',
+            status: 'OPEN',
+            leverage,
+            margin,
+            size,
+            notionalValue,
+            liquidationPrice,
+            entryPrice,
+            executedEntryPrice: entryPrice,
+            entryFee,
+            openTime: new Date(openTs),
+            openTs,
+            prob,
+            probLong: meta.probLong,
+            probShort: meta.probShort,
+            macroScore: meta.macroScore,
             entrySignal: meta.entrySignal || 'AI_PROB_THRESHOLD',
             modelVersion: meta.modelVersion || MODEL_VERSION,
-            entryFill: fill
+            features,
+            featuresAtEntry: features,
+            featureVectorAtEntry,
+            highestPrice: entryPrice,
+            lowestPrice: entryPrice,
+            botId: BOT_ID,
+            note: JSON.stringify({
+                paperVersion: 'FIXED_MONGO_FIRST',
+                currentPrice,
+                entryPrice,
+                slippageBps: this.SLIPPAGE_BPS,
+                spread: features?.spread_close
+            })
         };
 
-        this.activePositions.set(symbol, newPosition);
-
-        console.log(
-            `💰 [SÀN ẢO V19] Mở ${type} ${symbol} | Fill=${entryPrice.toFixed(8)} | Qty=${normalizedQty} | Lev=${leverage}x | Notional=${notionalValue.toFixed(4)}$ | Fee=${entryFee.toFixed(5)}$ | Slip=${(fill.slippageRate * 100).toFixed(4)}%`
-        );
+        let dbRecord;
 
         try {
-            const dbRecord = await ScoutTrade.create({
-                symbol,
-                type,
-                mode: PAPER_MODE,
-                orderType,
-                status: 'OPEN',
-                leverage,
-                margin: this.FIXED_MARGIN,
-                size: normalizedQty,
-                notionalValue,
-                liquidationPrice,
-                entryPrice,
-                executedEntryPrice: entryPrice,
-                entryFee,
-                openTime: new Date(openTs),
-                openTs,
-                prob,
-                probLong: meta.probLong,
-                probShort: meta.probShort,
-                macroScore: meta.macroScore,
-                entrySignal: meta.entrySignal || 'AI_PROB_THRESHOLD',
-                modelVersion: meta.modelVersion || MODEL_VERSION,
-                features,
-                featuresAtEntry: features,
-                featureVectorAtEntry,
-                highestPrice: entryPrice,
-                lowestPrice: entryPrice,
-                botId: BOT_ID,
-                note: JSON.stringify({
-                    paperVersion: 'V19_LIVE_PARITY',
-                    entryFill: fill,
-                    walletAfterOpen: this.walletBalance
-                })
-            });
-
-            newPosition.dbId = dbRecord._id;
-        } catch (err) {
-            console.error('❌ [MONGO] Lỗi lưu lệnh OPEN:', err.message);
-            newPosition.executionError = `MONGO_OPEN_ERROR: ${err.message}`;
+            // QUAN TRỌNG: Mongo phải lưu OPEN thành công trước.
+            dbRecord = await ScoutTrade.create(payload);
+        } catch (error) {
+            console.error(`❌ [MONGO] Lỗi lưu lệnh OPEN ${symbol}:`, error.message);
+            console.error('⛔ [SÀN ẢO FIXED] Không trừ ví, không mở position vì Mongo lưu thất bại.');
+            return false;
         }
 
-        this._publishDashboardUpdate();
-        return true;
+        try {
+            // Chỉ sau khi Mongo OK mới trừ entry fee và set active position.
+            this.wallet.balance -= entryFee;
+            await this.persistWallet();
+
+            position.dbId = dbRecord._id;
+            this.activePositions.set(symbol, position);
+
+            console.log(`✅ [SÀN ẢO FIXED] Open ${type} ${symbol} entry=${entryPrice} size=${size} lev=${leverage} fee=${entryFee.toFixed(6)} wallet=${this.wallet.balance.toFixed(4)}`);
+            return true;
+        } catch (error) {
+            // Nếu Redis/wallet fail sau Mongo OK, đánh dấu trade FAILED để không treo trạng thái.
+            console.error(`❌ [SÀN ẢO FIXED] Lỗi sau khi Mongo đã lưu OPEN ${symbol}:`, error.message);
+
+            try {
+                await ScoutTrade.findByIdAndUpdate(dbRecord._id, {
+                    status: 'FAILED',
+                    reason: 'POST_MONGO_OPEN_FAILED',
+                    error: error.message,
+                    closeTime: new Date(),
+                    closeTs: Date.now()
+                }, { returnDocument: 'before' });
+            } catch (updateError) {
+                console.error(`❌ [MONGO] Không đánh dấu FAILED được ${symbol}:`, updateError.message);
+            }
+
+            return false;
+        }
     }
 
     // ========================================================
-    // 6. CLOSE TRADE
+    // 5. CLOSE TRADE - MONGO UPDATE FIRST, WALLET SECOND
     // ========================================================
-    async closeTrade(symbol, closePrice, reason, exitFeatures = null) {
+    async closeTrade(symbol, closePrice, reason = 'UNKNOWN', exitFeatures = null) {
         await this.ensureReady();
 
-        symbol = this._normalizeSymbol(symbol);
-        closePrice = this._safeNumber(closePrice);
+        symbol = this.normalizeSymbol(symbol);
+        closePrice = this.safeNumber(closePrice, 0);
         reason = reason || 'UNKNOWN';
 
-        if (!this.activePositions.has(symbol)) {
-            console.warn(`⚠️ [SÀN ẢO V19] Không thể đóng ${symbol}: không có vị thế active`);
-            return null;
-        }
-
         const position = this.activePositions.get(symbol);
-        if (closePrice <= 0) {
-            console.warn(`⚠️ [SÀN ẢO V19] Không thể đóng ${symbol}: closePrice không hợp lệ ${closePrice}`);
+        if (!position) {
+            console.warn(`⚠️ [SÀN ẢO FIXED] Không có active position để đóng ${symbol}`);
             return null;
         }
 
-        const exitSide = this._exitSideFromType(position.type);
-        const fill = this._simulateMarketFill({
-            symbol,
-            side: exitSide,
-            quantity: position.size,
-            fallbackPrice: closePrice,
-            features: exitFeatures,
-            purpose: 'EXIT'
-        });
-
-        if (!fill.ok) {
-            console.warn(`⚠️ [SÀN ẢO V19] Exit fill lỗi ${symbol}: ${fill.reason}. Fallback closePrice=${closePrice}`);
+        if (closePrice <= 0) {
+            console.warn(`⚠️ [SÀN ẢO FIXED] Reject close ${symbol}: BAD_CLOSE_PRICE`);
+            return null;
         }
 
-        const executedClosePrice = fill.ok ? fill.fillPrice : exchangeRules.normalizePrice(symbol, closePrice, 'nearest');
-        const closeTs = this._now();
-        const exitNotional = position.size * executedClosePrice;
+        const executedClosePrice = this.getExecutionPrice(position.type, closePrice, exitFeatures, 'EXIT');
+        const exitNotional = executedClosePrice * position.size;
         const exitFee = exitNotional * this.FEE_TAKER;
-        const grossPnL = this._calculateGrossPnl(position, executedClosePrice);
 
-        let fundingFeeDeducted = 0;
-        const hoursHeld = (closeTs - position.openTime) / (1000 * 60 * 60);
-        if (hoursHeld >= 8) {
-            // V19 vẫn dùng funding mock đơn giản. FundingEngine thật sẽ làm ở bước sau.
-            fundingFeeDeducted = (exitNotional * this.MOCK_FUNDING_RATE) * Math.floor(hoursHeld / 8);
-        }
+        const grossPnl = position.type === 'LONG'
+            ? (executedClosePrice - position.entryPrice) * position.size
+            : (position.entryPrice - executedClosePrice) * position.size;
 
-        const netPnL = grossPnL - position.entryFee - exitFee - fundingFeeDeducted;
-
-        // Vì margin + entryFee đã bị trừ khi mở lệnh,
-        // khi đóng chỉ hoàn margin + grossPnL - exitFee - funding.
-        const walletCredit = position.margin + grossPnL - exitFee - fundingFeeDeducted;
-        this.walletBalance += walletCredit;
-        this.walletBalance = Math.max(0, this.walletBalance);
-        await this.persistWalletBalance();
-
-        const roiPercent = position.margin > 0 ? (netPnL / position.margin) * 100 : 0;
-        const { mfePercent, maePercent } = this._calculateMaeMfe(position);
+        const netPnl = grossPnl - position.entryFee - exitFee;
+        const roiPercent = position.margin > 0 ? (netPnl / position.margin) * 100 : 0;
+        const closeTs = Date.now();
         const durationMs = Math.max(0, closeTs - position.openTime);
-        const featureVectorAtExit = this._buildFeatureVector(exitFeatures);
+        const { maePercent, mfePercent } = this.calculateMaeMfe(position);
+        const featureVectorAtExit = this.buildFeatureVector(exitFeatures);
         const finalStatus = reason === 'LIQUIDATED' ? 'LIQUIDATED' : 'CLOSED';
 
-        console.log(
-            `💳 [SÀN ẢO V19] Đóng ${position.type} ${symbol} (${reason}) | Fill=${executedClosePrice.toFixed(8)} | Gross=${grossPnL.toFixed(5)}$ | Net=${netPnL.toFixed(5)}$ | ROI=${roiPercent.toFixed(2)}% | Ví=${this.walletBalance.toFixed(2)}$`
-        );
-
-        try {
-            const updatePayload = {
-                status: finalStatus,
-                closePrice: executedClosePrice,
+        const updatePayload = {
+            status: finalStatus,
+            closePrice: executedClosePrice,
+            executedClosePrice,
+            exitFee,
+            closeTime: new Date(closeTs),
+            closeTs,
+            durationMs,
+            reason,
+            pnl: netPnl,
+            roi: roiPercent,
+            grossPnl,
+            netPnl,
+            mae: maePercent,
+            mfe: mfePercent,
+            highestPrice: position.highestPrice,
+            lowestPrice: position.lowestPrice,
+            features: position.features,
+            featuresAtEntry: position.features,
+            featuresAtExit: exitFeatures,
+            featureVectorAtEntry: position.featureVectorAtEntry,
+            featureVectorAtExit,
+            note: JSON.stringify({
+                paperVersion: 'FIXED_MONGO_FIRST',
+                reason,
+                closePrice,
                 executedClosePrice,
                 exitFee,
-                fundingFee: fundingFeeDeducted,
-                closeTime: new Date(closeTs),
-                closeTs,
-                durationMs,
-                reason,
-                pnl: netPnL,
-                roi: roiPercent,
-                grossPnl: grossPnL,
-                netPnl: netPnL,
-                mae: maePercent,
-                mfe: mfePercent,
-                highestPrice: position.highestPrice,
-                lowestPrice: position.lowestPrice,
-                features: position.features,
-                featuresAtEntry: position.features,
-                featuresAtExit: exitFeatures,
-                featureVectorAtEntry: position.featureVectorAtEntry,
-                featureVectorAtExit,
-                note: JSON.stringify({
-                    paperVersion: 'V19_LIVE_PARITY',
-                    entryFill: position.entryFill,
-                    exitFill: fill,
-                    walletAfterClose: this.walletBalance
-                })
-            };
+                walletBefore: this.wallet.balance
+            })
+        };
 
-            if (position.dbId) {
-                await ScoutTrade.findByIdAndUpdate(position.dbId, updatePayload, { new: false });
-            } else {
-                await ScoutTrade.findOneAndUpdate(
-                    { symbol, status: 'OPEN', mode: PAPER_MODE, botId: BOT_ID },
-                    updatePayload,
-                    { sort: { openTime: -1 }, new: false }
-                );
+        try {
+            // QUAN TRỌNG: Mongo update CLOSED phải thành công trước khi cộng/trừ ví.
+            if (!position.dbId) {
+                throw new Error('Missing dbId on active position. Refuse to close to avoid wallet drift.');
             }
-        } catch (err) {
-            console.error('❌ [MONGO] Lỗi update lệnh CLOSED:', err.message);
+
+            await ScoutTrade.findByIdAndUpdate(position.dbId, updatePayload, { returnDocument: 'before' });
+        } catch (error) {
+            console.error(`❌ [MONGO] Lỗi update lệnh CLOSED ${symbol}:`, error.message);
+            console.error('⛔ [SÀN ẢO FIXED] Không cập nhật ví, không xóa active position để tránh lệch trạng thái.');
+            return null;
         }
 
-        this.activePositions.delete(symbol);
-        this._publishDashboardUpdate();
+        try {
+            // Paper wallet: khi mở đã chỉ trừ entryFee, margin không bị khóa thật trong ví này.
+            // Khi đóng cộng netPnl đã bao gồm entryFee và exitFee.
+            // Vì entryFee đã trừ trước đó, để không trừ entryFee hai lần, cộng grossPnl - exitFee.
+            const walletDelta = grossPnl - exitFee;
+            this.wallet.balance += walletDelta;
+            await this.persistWallet();
 
-        return {
-            symbol,
-            type: position.type,
-            closed: true,
-            reason,
-            closePrice: executedClosePrice,
-            grossPnL,
-            netPnL,
-            roiPercent,
-            maePercent,
-            mfePercent,
-            durationMs,
-            walletBalance: this.walletBalance
-        };
+            this.activePositions.delete(symbol);
+
+            console.log(`✅ [SÀN ẢO FIXED] Close ${position.type} ${symbol} exit=${executedClosePrice} gross=${grossPnl.toFixed(6)} net=${netPnl.toFixed(6)} roi=${roiPercent.toFixed(2)}% wallet=${this.wallet.balance.toFixed(4)}`);
+
+            return {
+                symbol,
+                type: position.type,
+                closed: true,
+                reason,
+                closePrice: executedClosePrice,
+                grossPnL: grossPnl,
+                netPnL: netPnl,
+                grossPnl,
+                netPnl,
+                roiPercent,
+                roi: roiPercent,
+                maePercent,
+                mfePercent,
+                durationMs
+            };
+        } catch (error) {
+            console.error(`❌ [SÀN ẢO FIXED] Lỗi cập nhật ví sau khi close Mongo OK ${symbol}:`, error.message);
+            // Lúc này Mongo đã CLOSED nhưng ví chưa cập nhật được. Đây là lỗi cần can thiệp.
+            // Không restore lại Mongo vì CLOSED là sự kiện thật trong paper execution.
+            this.activePositions.delete(symbol);
+            return null;
+        }
     }
 
     // ========================================================
-    // 7. UPDATE TICK / LIQUIDATION CHECK
+    // 6. UPDATE TICK
     // ========================================================
     async updateTick(symbol, currentPrice, exitFeatures = null) {
         await this.ensureReady();
 
-        symbol = this._normalizeSymbol(symbol);
-        currentPrice = this._safeNumber(currentPrice);
-
-        if (!this.activePositions.has(symbol) || currentPrice <= 0) {
-            return null;
-        }
+        symbol = this.normalizeSymbol(symbol);
+        currentPrice = this.safeNumber(currentPrice, 0);
 
         const position = this.activePositions.get(symbol);
-        const book = this._getBookFromFeature(exitFeatures, currentPrice);
-        const markPrice = this._safeNumber(exitFeatures?.mark_price, book.mark || currentPrice);
+        if (!position || currentPrice <= 0) return null;
 
-        // Dùng markPrice để cập nhật MFE/MAE gần với cơ chế Futures hơn.
-        const evaluationPrice = markPrice > 0 ? markPrice : currentPrice;
+        const markOrLast = this.safeNumber(exitFeatures?.mark_price, currentPrice);
 
-        if (evaluationPrice > position.highestPrice) position.highestPrice = evaluationPrice;
-        if (evaluationPrice < position.lowestPrice) position.lowestPrice = evaluationPrice;
-
-        if (position.liquidationPrice <= 0) {
-            return { closed: false, symbol, highestPrice: position.highestPrice, lowestPrice: position.lowestPrice };
+        if (markOrLast > position.highestPrice) {
+            position.highestPrice = markOrLast;
         }
 
-        const longLiquidated = position.type === 'LONG' && evaluationPrice <= position.liquidationPrice;
-        const shortLiquidated = position.type === 'SHORT' && evaluationPrice >= position.liquidationPrice;
-
-        if (longLiquidated || shortLiquidated) {
-            console.log(`💀 [LIQUIDATED V19] ${symbol} mark=${evaluationPrice.toFixed(8)} chạm liquidation=${position.liquidationPrice.toFixed(8)}`);
-            const result = await this.closeTrade(symbol, currentPrice, 'LIQUIDATED', exitFeatures);
-            return {
-                closed: true,
-                reason: 'LIQUIDATED',
-                symbol,
-                closePrice: result?.closePrice || currentPrice,
-                result
-            };
+        if (markOrLast < position.lowestPrice) {
+            position.lowestPrice = markOrLast;
         }
 
+        // PaperExchange không tự quyết định SL/TP ở đây.
+        // OrderManager quản trị trailing/reversal rồi gọi closeTrade().
         return {
             closed: false,
             symbol,
@@ -734,28 +574,19 @@ class PaperExchange extends IExchange {
     }
 
     // ========================================================
-    // 8. GETTERS / COMMANDS
+    // 7. GETTERS
     // ========================================================
-    getWalletBalance() {
-        return this.walletBalance;
-    }
-
-    hasActivePosition(symbol) {
-        symbol = this._normalizeSymbol(symbol);
-        return this.activePositions.has(symbol);
+    getActivePositions() {
+        return new Map(this.activePositions);
     }
 
     getPosition(symbol) {
-        symbol = this._normalizeSymbol(symbol);
-        return this.activePositions.get(symbol) || null;
+        return this.activePositions.get(this.normalizeSymbol(symbol)) || null;
     }
 
-    async resetPaperWallet(amount = this.initialCapital) {
-        this.walletBalance = this._safeNumber(amount, this.initialCapital);
-        await this.persistWalletBalance();
-        console.log(`♻️ [SÀN ẢO V19] Reset ví PAPER về ${this.walletBalance.toFixed(4)} USDT`);
-        return this.walletBalance;
+    hasActivePosition(symbol) {
+        return this.activePositions.has(this.normalizeSymbol(symbol));
     }
 }
 
-module.exports = new PaperExchange(DEFAULT_INITIAL_CAPITAL);
+module.exports = new PaperExchange();

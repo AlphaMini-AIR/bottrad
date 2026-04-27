@@ -1,181 +1,130 @@
 const mongoose = require('mongoose');
 
 // ============================================================
-// SCOUT TRADE MODEL V18 - TRADE MEMORY 10/10
+// SCOUT TRADE MODEL - FIXED LIVE/PAPER READY
 // ------------------------------------------------------------
-// Vai trò:
-// 1. Lưu toàn bộ vòng đời một lệnh giao dịch PAPER / LIVE / BACKTEST.
-// 2. Giữ tương thích với code cũ đang dùng field `features`.
-// 3. Bổ sung dữ liệu cần thiết cho dashboard, audit, training lại ONNX.
-// 4. Tách rõ snapshot feature lúc vào lệnh và lúc thoát lệnh.
-// 5. Hỗ trợ truy vấn nhanh theo status, mode, symbol, type, closeTime.
-//
-// Lưu ý tương thích:
-// - PaperExchange cũ đang lưu `features`, nên field này vẫn được giữ.
-// - Các field mới không required để dữ liệu cũ trong MongoDB không bị lỗi.
+// Mục tiêu của file này:
+// 1. Lưu toàn bộ lệnh PAPER / LIVE / BACKTEST của luồng Scout.
+// 2. Không dùng middleware kiểu async function(next) để tránh lỗi:
+//    "next is not a function" trên Mongoose bản mới.
+// 3. Chấp nhận đầy đủ field mới từ PaperExchange_V19, LiveExchange_V19,
+//    OrderManager_Final và NightlyTrainingDatasetBuilder.
+// 4. Cho phép thêm field mới trong tương lai bằng strict:false,
+//    nhưng vẫn khai báo các field quan trọng để query/dashboard/training ổn định.
+// 5. Tạo index cho dashboard, nightly training và phân tích hiệu suất.
 // ============================================================
 
-const scoutTradeSchema = new mongoose.Schema(
+const ScoutTradeSchema = new mongoose.Schema(
     {
         // ====================================================
-        // 1. THÔNG TIN ĐỊNH DANH LỆNH
+        // 1. THÔNG TIN LỆNH CƠ BẢN
         // ====================================================
         symbol: {
             type: String,
             required: true,
+            index: true,
             uppercase: true,
-            trim: true,
-            index: true
+            trim: true
         },
 
-        // Hướng đánh do OrderManager quyết định sau khi ONNX inference.
+        // LONG / SHORT
         type: {
             type: String,
-            required: true,
             enum: ['LONG', 'SHORT'],
+            required: true,
             index: true
         },
 
-        // Môi trường giao dịch.
-        // PAPER: sàn ảo
-        // LIVE: sàn thật
-        // BACKTEST: dữ liệu backtest/offline
+        // PAPER / LIVE / BACKTEST
         mode: {
             type: String,
-            enum: ['PAPER', 'LIVE', 'BACKTEST'],
+            enum: ['PAPER', 'LIVE', 'BACKTEST', 'LIVE_DRY_RUN'],
             default: 'PAPER',
             index: true
         },
 
-        // MARKET, LIMIT_MAKER, LIMIT_FOK...
+        // MARKET / LIMIT / STOP_MARKET...
         orderType: {
             type: String,
-            required: true,
-            trim: true
+            default: 'MARKET'
         },
 
-        // Trạng thái vòng đời lệnh.
+        // OPEN / CLOSED / LIQUIDATED / FAILED / CANCELLED
         status: {
             type: String,
-            required: true,
-            enum: ['OPEN', 'CLOSED', 'CANCELLED', 'FAILED', 'LIQUIDATED'],
+            enum: ['OPEN', 'CLOSED', 'LIQUIDATED', 'FAILED', 'CANCELLED', 'CANCELED'],
             default: 'OPEN',
             index: true
         },
 
         // ====================================================
-        // 2. THÔNG TIN AI / RADAR TẠI THỜI ĐIỂM VÀO LỆNH
-        // ====================================================
-
-        // Xác suất cuối cùng được dùng để bóp cò.
-        // Ví dụ LONG 0.78 hoặc SHORT 0.74.
-        prob: {
-            type: Number,
-            min: 0,
-            max: 1
-        },
-
-        // Nếu OrderManager sau này muốn lưu cả 2 output của ONNX.
-        probLong: {
-            type: Number,
-            min: 0,
-            max: 1
-        },
-
-        probShort: {
-            type: Number,
-            min: 0,
-            max: 1
-        },
-
-        // Điểm radar / macro score tại thời điểm vào lệnh.
-        // Dùng để phân tích sau này: macroScore cao có thật sự hiệu quả không.
-        macroScore: {
-            type: Number,
-            min: 0,
-            max: 1
-        },
-
-        // Lý do/tín hiệu đầu vào nếu có.
-        // Ví dụ: AI_PROB_THRESHOLD, EV_SWITCH_ENTRY, MANUAL_ENTRY...
-        entrySignal: {
-            type: String,
-            trim: true
-        },
-
-        // Phiên bản model ONNX dùng để ra quyết định.
-        // Rất quan trọng khi bạn tự học/reload model nhiều lần.
-        modelVersion: {
-            type: String,
-            trim: true
-        },
-
-        // ====================================================
-        // 3. THÔNG SỐ VỐN / KHỐI LƯỢNG
+        // 2. POSITION / SIZE / LEVERAGE
         // ====================================================
         leverage: {
             type: Number,
-            required: true,
-            min: 1
+            default: 1
         },
 
         margin: {
             type: Number,
-            required: true,
-            min: 0
+            default: 0
         },
 
-        // Số lượng coin/base asset.
         size: {
-            type: Number,
-            required: true,
-            min: 0
-        },
-
-        // Giá trị danh nghĩa vị thế = size * entryPrice.
-        notionalValue: {
-            type: Number,
-            min: 0
-        },
-
-        // Giá thanh lý ước tính, đặc biệt hữu ích cho dashboard/risk audit.
-        liquidationPrice: {
-            type: Number,
-            min: 0
-        },
-
-        // ====================================================
-        // 4. THÔNG SỐ VÀO LỆNH
-        // ====================================================
-        entryPrice: {
-            type: Number,
-            required: true,
-            min: 0
-        },
-
-        entryFee: {
             type: Number,
             default: 0
         },
 
-        openTime: {
-            type: Date,
-            required: true,
-            index: true
-        },
-
-        // Dạng number để Python/training xử lý nhanh hơn.
-        openTs: {
+        notionalValue: {
             type: Number,
-            index: true
+            default: 0
+        },
+
+        liquidationPrice: {
+            type: Number,
+            default: 0
         },
 
         // ====================================================
-        // 5. THÔNG SỐ RA LỆNH
+        // 3. ENTRY / EXIT PRICE
         // ====================================================
+        entryPrice: {
+            type: Number,
+            required: true
+        },
+
         closePrice: {
             type: Number,
-            min: 0
+            default: null
+        },
+
+        // Giá thực thi sau slippage/fill thực tế.
+        executedEntryPrice: {
+            type: Number,
+            default: null
+        },
+
+        executedClosePrice: {
+            type: Number,
+            default: null
+        },
+
+        highestPrice: {
+            type: Number,
+            default: null
+        },
+
+        lowestPrice: {
+            type: Number,
+            default: null
+        },
+
+        // ====================================================
+        // 4. FEES / PNL / ROI
+        // ====================================================
+        entryFee: {
+            type: Number,
+            default: 0
         },
 
         exitFee: {
@@ -183,58 +132,130 @@ const scoutTradeSchema = new mongoose.Schema(
             default: 0
         },
 
-        fundingFee: {
+        grossPnl: {
             type: Number,
             default: 0
         },
 
+        netPnl: {
+            type: Number,
+            default: 0
+        },
+
+        // Giữ lại alias pnl để dashboard/query cũ vẫn đọc được.
+        pnl: {
+            type: Number,
+            default: 0,
+            index: true
+        },
+
+        roi: {
+            type: Number,
+            default: 0
+        },
+
+        mae: {
+            type: Number,
+            default: 0
+        },
+
+        mfe: {
+            type: Number,
+            default: 0
+        },
+
+        // ====================================================
+        // 5. THỜI GIAN
+        // ====================================================
+        openTime: {
+            type: Date,
+            default: Date.now,
+            index: true
+        },
+
         closeTime: {
             type: Date,
+            default: null,
+            index: true
+        },
+
+        // Timestamp dạng number để training lấy window nhanh.
+        openTs: {
+            type: Number,
+            default: null,
             index: true
         },
 
         closeTs: {
             type: Number,
+            default: null,
             index: true
         },
 
-        // Thời gian giữ lệnh, tính bằng millisecond.
         durationMs: {
             type: Number,
-            min: 0
+            default: 0
         },
 
-        // Lý do đóng lệnh.
-        // Ví dụ: Trailing Stop, EV Switch, LIQUIDATED, PANIC_SELL...
-        reason: {
+        // ====================================================
+        // 6. AI / MODEL / SIGNAL
+        // ====================================================
+        prob: {
+            type: Number,
+            default: 0,
+            index: true
+        },
+
+        probLong: {
+            type: Number,
+            default: null
+        },
+
+        probShort: {
+            type: Number,
+            default: null
+        },
+
+        macroScore: {
+            type: Number,
+            default: null
+        },
+
+        entrySignal: {
             type: String,
-            trim: true
+            default: 'AI_PROB_THRESHOLD'
+        },
+
+        modelVersion: {
+            type: String,
+            default: 'Universal_Scout.onnx',
+            index: true
+        },
+
+        botId: {
+            type: String,
+            default: 'scout-main',
+            index: true
         },
 
         // ====================================================
-        // 6. SNAPSHOT FEATURE CHO AI / TRAINING
+        // 7. FEATURE SNAPSHOT / TRAINING DATA
         // ====================================================
-
-        // Field cũ: giữ nguyên để không phá code/dashboard/training cũ.
-        // Quy ước mới: `features` vẫn nên hiểu là snapshot tại entry.
         features: {
-            type: Object,
-            required: false
+            type: mongoose.Schema.Types.Mixed,
+            default: null
         },
 
-        // Field mới rõ nghĩa hơn.
         featuresAtEntry: {
-            type: Object,
-            required: false
+            type: mongoose.Schema.Types.Mixed,
+            default: null
         },
 
         featuresAtExit: {
-            type: Object,
-            required: false
+            type: mongoose.Schema.Types.Mixed,
+            default: null
         },
 
-        // Có thể lưu thêm feature đã chuẩn hóa đúng thứ tự 13 input của ONNX.
-        // Dùng cho audit/training để tránh lệch schema khi feature object thay đổi.
         featureVectorAtEntry: {
             type: [Number],
             default: undefined
@@ -245,238 +266,242 @@ const scoutTradeSchema = new mongoose.Schema(
             default: undefined
         },
 
-        // ====================================================
-        // 7. KPI HIỆU QUẢ
-        // ====================================================
-        pnl: {
-            type: Number
-        },
-
-        // ROI tính theo %, ví dụ 5.2 nghĩa là +5.2% trên margin.
-        roi: {
-            type: Number
-        },
-
-        // PnL thô trước phí/funding nếu muốn audit chi tiết.
-        grossPnl: {
-            type: Number
-        },
-
-        // PnL sau phí/funding.
-        netPnl: {
-            type: Number
-        },
-
-        // Maximum Adverse Excursion (%).
-        mae: {
-            type: Number
-        },
-
-        // Maximum Favorable Excursion (%).
-        mfe: {
-            type: Number
-        },
-
-        // Giá cao nhất/thấp nhất trong vòng đời lệnh.
-        highestPrice: {
-            type: Number,
-            min: 0
-        },
-
-        lowestPrice: {
-            type: Number,
-            min: 0
-        },
-
-        // ====================================================
-        // 8. AUDIT EXECUTION CHO LIVE/PAPER
-        // ====================================================
-
-        // ID lệnh thật từ Binance nếu chạy LIVE.
-        entryOrderId: {
-            type: String,
-            trim: true
-        },
-
-        closeOrderId: {
-            type: String,
-            trim: true
-        },
-
-        slOrderId: {
-            type: String,
-            trim: true
-        },
-
-        tpOrderId: {
-            type: String,
-            trim: true
-        },
-
-        // Giá khớp thực tế nếu live exchange trả về khác giá dự kiến.
-        executedEntryPrice: {
-            type: Number,
-            min: 0
-        },
-
-        executedClosePrice: {
-            type: Number,
-            min: 0
-        },
-
-        // Dùng để lưu lỗi execution nếu lệnh bị reject/failed.
-        executionError: {
-            type: String,
-            trim: true
-        },
-
-        // Số lần retry khi bắn lệnh live.
-        executionRetries: {
-            type: Number,
-            default: 0,
-            min: 0
-        },
-
-        // ====================================================
-        // 9. AUDIT HỆ THỐNG / DASHBOARD
-        // ====================================================
-
-        // Bot/session ID nếu sau này chạy nhiều bot song song.
-        botId: {
-            type: String,
-            default: 'scout-main',
-            trim: true,
-            index: true
-        },
-
-        // Ghi chú tùy chọn cho dashboard/manual review.
-        note: {
-            type: String,
-            trim: true
-        },
-
-        // Đánh dấu record đã được dùng để train hay chưa.
-        trained: {
+        // NightlyTrainingDatasetBuilder có thể đánh dấu đã dùng để build dataset.
+        trainingUsed: {
             type: Boolean,
             default: false,
             index: true
         },
 
-        trainedAt: {
-            type: Date
+        trainingDatasetId: {
+            type: String,
+            default: null,
+            index: true
         },
 
-        // Label training nếu pipeline tự học muốn ghi lại.
-        // Ví dụ: WIN, LOSS, BREAKEVEN, BAD_ENTRY, GOOD_EXIT...
         trainingLabel: {
             type: String,
-            trim: true,
+            default: null,
             index: true
+        },
+
+        // ====================================================
+        // 8. EXCHANGE ORDER IDS
+        // ====================================================
+        entryOrderId: {
+            type: String,
+            default: null,
+            index: true
+        },
+
+        closeOrderId: {
+            type: String,
+            default: null,
+            index: true
+        },
+
+        entryClientOrderId: {
+            type: String,
+            default: null,
+            index: true
+        },
+
+        closeClientOrderId: {
+            type: String,
+            default: null,
+            index: true
+        },
+
+        // ====================================================
+        // 9. CLOSE REASON / NOTE
+        // ====================================================
+        reason: {
+            type: String,
+            default: null,
+            index: true
+        },
+
+        note: {
+            type: String,
+            default: null
+        },
+
+        error: {
+            type: String,
+            default: null
         }
     },
     {
+        // timestamps tự tạo createdAt / updatedAt.
         timestamps: true,
-        minimize: false,
-        versionKey: false
+
+        // Cho phép field mới phát sinh từ các module mới mà không làm vỡ schema.
+        // Điều này quan trọng vì đây là bot đang tiến hóa liên tục.
+        strict: false,
+
+        // Giảm overhead nếu không cần virtual trong JSON.
+        minimize: false
     }
 );
 
 // ============================================================
-// 10. INDEX TỐI ƯU TRUY VẤN DASHBOARD / TRAINING
+// INDEXES
+// ------------------------------------------------------------
+// Các index này phục vụ:
+// - Dashboard query OPEN/CLOSED nhanh.
+// - Nightly training query trade vừa đóng.
+// - Phân tích theo symbol/model/bot.
 // ============================================================
 
-// Query lệnh đang mở/đã đóng mới nhất.
-scoutTradeSchema.index({ status: 1, closeTime: -1 });
-
-// Query theo symbol và trạng thái.
-scoutTradeSchema.index({ symbol: 1, status: 1, openTime: -1 });
-
-// Query theo môi trường PAPER/LIVE/BACKTEST.
-scoutTradeSchema.index({ mode: 1, status: 1, closeTime: -1 });
-
-// Query hiệu quả LONG/SHORT.
-scoutTradeSchema.index({ type: 1, status: 1, closeTime: -1 });
-
-// Query dữ liệu chưa train.
-scoutTradeSchema.index({ trained: 1, status: 1, closeTime: -1 });
-
-// Query theo bot nếu chạy nhiều bot/process.
-scoutTradeSchema.index({ botId: 1, status: 1, closeTime: -1 });
+ScoutTradeSchema.index({ status: 1, openTime: -1 });
+ScoutTradeSchema.index({ status: 1, closeTime: -1 });
+ScoutTradeSchema.index({ symbol: 1, status: 1, openTime: -1 });
+ScoutTradeSchema.index({ symbol: 1, closeTime: -1 });
+ScoutTradeSchema.index({ mode: 1, status: 1, closeTime: -1 });
+ScoutTradeSchema.index({ trainingUsed: 1, closeTime: -1 });
+ScoutTradeSchema.index({ botId: 1, modelVersion: 1, closeTime: -1 });
 
 // ============================================================
-// 11. HOOK TỰ ĐỘNG CHUẨN HÓA DỮ LIỆU TRƯỚC KHI LƯU
+// SAFE MIDDLEWARE
+// ------------------------------------------------------------
+// Tuyệt đối KHÔNG dùng async function(next) trong file này.
+// Lỗi trước đó "next is not a function" nhiều khả năng đến từ middleware
+// trộn async + next ở Mongoose bản mới.
+//
+// Các middleware dưới đây dùng style sync + next đúng chuẩn.
 // ============================================================
-scoutTradeSchema.pre('validate', function preValidate(next) {
-    // Luôn uppercase symbol để tránh BTCUSDT/btcusdt bị tách record.
-    if (this.symbol) {
-        this.symbol = String(this.symbol).toUpperCase().trim();
-    }
 
-    // Tự sinh timestamp number nếu chưa có.
-    if (this.openTime && !this.openTs) {
-        this.openTs = new Date(this.openTime).getTime();
-    }
+ScoutTradeSchema.pre('validate', function (next) {
+    try {
+        // Chuẩn hóa symbol.
+        if (this.symbol) {
+            this.symbol = String(this.symbol).toUpperCase().trim();
+        }
 
-    if (this.closeTime && !this.closeTs) {
-        this.closeTs = new Date(this.closeTime).getTime();
-    }
+        // Đồng bộ openTs/openTime.
+        if (!this.openTime) {
+            this.openTime = new Date();
+        }
 
-    // Tự tính duration nếu đủ open/close.
-    if (this.openTs && this.closeTs && !this.durationMs) {
-        this.durationMs = Math.max(0, this.closeTs - this.openTs);
-    }
+        if (!this.openTs && this.openTime) {
+            this.openTs = new Date(this.openTime).getTime();
+        }
 
-    // Nếu code cũ chỉ truyền `features`, tự copy sang featuresAtEntry.
-    if (this.features && !this.featuresAtEntry) {
-        this.featuresAtEntry = this.features;
-    }
+        // Nếu có closeTime nhưng chưa có closeTs.
+        if (this.closeTime && !this.closeTs) {
+            this.closeTs = new Date(this.closeTime).getTime();
+        }
 
-    // Nếu code mới chỉ truyền featuresAtEntry, vẫn copy ngược về features để tương thích code cũ.
-    if (this.featuresAtEntry && !this.features) {
-        this.features = this.featuresAtEntry;
-    }
+        // Đồng bộ executed price nếu chưa truyền.
+        if (this.executedEntryPrice == null && this.entryPrice != null) {
+            this.executedEntryPrice = this.entryPrice;
+        }
 
-    // Tự tính notional nếu chưa có.
-    if (!this.notionalValue && this.size && this.entryPrice) {
-        this.notionalValue = this.size * this.entryPrice;
-    }
+        if (this.closePrice != null && this.executedClosePrice == null) {
+            this.executedClosePrice = this.closePrice;
+        }
 
-    // Nếu status LIQUIDATED thì vẫn xem là CLOSED về mặt vòng đời.
-    // Không ép đổi status để giữ ngữ nghĩa, nhưng closeTime nên có ở tầng Exchange.
-    next();
+        // Đồng bộ pnl/netPnl hai chiều để dashboard và query cũ không vỡ.
+        if (this.netPnl == null && this.pnl != null) {
+            this.netPnl = this.pnl;
+        }
+
+        if (this.pnl == null && this.netPnl != null) {
+            this.pnl = this.netPnl;
+        }
+
+        // highest/lowest mặc định bằng entry.
+        if (this.highestPrice == null && this.entryPrice != null) {
+            this.highestPrice = this.entryPrice;
+        }
+
+        if (this.lowestPrice == null && this.entryPrice != null) {
+            this.lowestPrice = this.entryPrice;
+        }
+
+        next();
+    } catch (error) {
+        next(error);
+    }
+});
+
+ScoutTradeSchema.pre('findOneAndUpdate', function (next) {
+    try {
+        const update = this.getUpdate() || {};
+        const set = update.$set || update;
+
+        // Nếu update closeTime mà chưa có closeTs thì tự thêm.
+        if (set.closeTime && !set.closeTs) {
+            set.closeTs = new Date(set.closeTime).getTime();
+        }
+
+        // Nếu update closePrice mà chưa có executedClosePrice thì tự thêm.
+        if (set.closePrice != null && set.executedClosePrice == null) {
+            set.executedClosePrice = set.closePrice;
+        }
+
+        // Đồng bộ pnl/netPnl trong update.
+        if (set.netPnl == null && set.pnl != null) {
+            set.netPnl = set.pnl;
+        }
+
+        if (set.pnl == null && set.netPnl != null) {
+            set.pnl = set.netPnl;
+        }
+
+        // Mongoose timestamps sẽ tự set updatedAt, nhưng giữ lại để chắc chắn.
+        set.updatedAt = new Date();
+
+        if (update.$set) {
+            update.$set = set;
+            this.setUpdate(update);
+        } else {
+            this.setUpdate(set);
+        }
+
+        next();
+    } catch (error) {
+        next(error);
+    }
+});
+
+ScoutTradeSchema.pre('updateOne', function (next) {
+    try {
+        const update = this.getUpdate() || {};
+        const set = update.$set || update;
+        set.updatedAt = new Date();
+
+        if (update.$set) {
+            update.$set = set;
+            this.setUpdate(update);
+        } else {
+            this.setUpdate(set);
+        }
+
+        next();
+    } catch (error) {
+        next(error);
+    }
 });
 
 // ============================================================
-// 12. STATIC HELPERS CHO TRAINING/DASHBOARD
+// STATIC HELPERS
 // ============================================================
-scoutTradeSchema.statics.findClosedForTraining = function findClosedForTraining(limit = 1000, mode = 'PAPER') {
-    return this.find({
-        status: { $in: ['CLOSED', 'LIQUIDATED'] },
-        mode,
-        featuresAtEntry: { $exists: true, $ne: null }
-    })
-        .sort({ closeTime: -1 })
-        .limit(limit)
-        .lean();
+
+ScoutTradeSchema.statics.findOpenTrades = function () {
+    return this.find({ status: 'OPEN' }).sort({ openTime: -1 });
 };
 
-scoutTradeSchema.statics.findOpenTrades = function findOpenTrades(mode = 'PAPER') {
-    return this.find({
-        status: 'OPEN',
-        mode
-    })
-        .sort({ openTime: -1 })
-        .lean();
+ScoutTradeSchema.statics.findRecentClosedTrades = function (limit = 100) {
+    return this.find({ status: { $in: ['CLOSED', 'LIQUIDATED', 'FAILED', 'CANCELLED', 'CANCELED'] } })
+        .sort({ closeTime: -1, updatedAt: -1 })
+        .limit(limit);
 };
 
 // ============================================================
-// 13. INSTANCE HELPER
+// EXPORT MODEL
+// ------------------------------------------------------------
+// Dùng mongoose.models để tránh OverwriteModelError khi PM2/dev reload.
 // ============================================================
-scoutTradeSchema.methods.markTrained = async function markTrained(label = null) {
-    this.trained = true;
-    this.trainedAt = new Date();
-    if (label) this.trainingLabel = label;
-    return this.save();
-};
 
-module.exports = mongoose.model('ScoutTrade', scoutTradeSchema);
+module.exports = mongoose.models.ScoutTrade || mongoose.model('ScoutTrade', ScoutTradeSchema);

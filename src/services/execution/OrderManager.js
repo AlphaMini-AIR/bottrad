@@ -8,27 +8,31 @@ const mongoose = require('mongoose');
 require('dotenv').config({ path: path.join(__dirname, '../../../.env') });
 
 // ============================================================
-// ORDER MANAGER FINAL - LIVE READY MASTER EXECUTION BRAIN
+// ORDER MANAGER FINAL - FIXED REVERSAL + TEST THRESHOLD 0.6
 // ------------------------------------------------------------
-// Vai trò:
-// 1. Nhận feature realtime từ FeedHandler V19.
-// 2. Validate feature trước khi chạy ONNX.
-// 3. Chạy Universal_Scout.onnx với đúng 13 input cũ.
-// 4. Gọi RiskGuard trước khi mở lệnh.
-// 5. Chọn PaperExchange hoặc LiveExchange bằng EXCHANGE_MODE.
-// 6. Đồng bộ ENTER_TRADE / EXIT_TRADE với FeedHandler.
-// 7. Hỗ trợ PAUSE_TRADING / RESUME_TRADING / CLOSE_ALL / FORCE_CLOSE.
-// 8. Ghi accounting cho RiskGuard sau khi mở/đóng lệnh.
-// 9. Restore lệnh PAPER/LIVE nếu exchange hỗ trợ.
+// Bản này cập nhật từ OrderManager_Final_LiveReady trước đó.
 //
-// EXCHANGE_MODE:
-// - PAPER        : dùng PaperExchange.js
-// - LIVE_DRY_RUN : dùng LiveExchange.js nhưng LIVE_DRY_RUN=true
-// - LIVE         : dùng LiveExchange.js, yêu cầu LIVE_DRY_RUN=false
+// Các lỗi/vấn đề đã sửa:
+// 1. Hạ ngưỡng vào lệnh giai đoạn test xuống 0.6.
+//    Sau này bạn có thể chỉnh lại trong system_config.json.
+// 2. Coin đang có lệnh vẫn chạy ONNX mỗi nhịp để AI tiếp tục suy luận.
+// 3. Không mở thêm lệnh cùng symbol nếu lệnh cũ còn mở.
+// 4. Cắt lệnh vì đảo chiều chỉ khi AI xác nhận rõ:
+//    - Hướng ngược >= 0.6
+//    - Hướng ngược hơn hướng hiện tại >= 0.12
+//    - Xác nhận liên tiếp >= 3 nhịp
+//    - Giữ lệnh tối thiểu >= 30 giây
+// 5. MFA không tự đóng lệnh một mình nữa.
+//    MFA chỉ đóng khi cực đoan VÀ AI cũng xác nhận hướng ngược.
+// 6. Giữ tương thích PaperExchange_Fixed_SafeMongoFirst.
+// 7. Giữ luồng ENTER_TRADE / EXIT_TRADE cho FeedHandler.
+// 8. Giữ RiskGuard accounting.
+// 9. Giữ dashboard:predictions / dashboard:logs.
 //
-// CẢNH BÁO:
-// - Không bật LIVE nếu chưa chạy LIVE_DRY_RUN đủ lâu.
-// - Không đổi thứ tự 13 input ONNX.
+// Lưu ý quan trọng:
+// - File này dùng cho giai đoạn PAPER test nhanh.
+// - Khi hệ thống ổn, tăng AI_LONG_THRESHOLD / AI_SHORT_THRESHOLD
+//   và RISK.MIN_ENTRY_PROB từ 0.6 lên 0.7 hoặc cao hơn.
 // ============================================================
 
 // ============================================================
@@ -49,16 +53,26 @@ const REDIS_URL = config.REDIS_URL || process.env.REDIS_URL || 'redis://localhos
 const CHANNELS = {
     FEATURES: config.CHANNELS?.FEATURES || 'market:features:*',
     MACRO_SCORES: config.CHANNELS?.MACRO_SCORES || 'macro:scores',
-    SUBSCRIPTIONS: config.CHANNELS?.SUBSCRIPTIONS || 'system:subscriptions'
+    SUBSCRIPTIONS: config.CHANNELS?.SUBSCRIPTIONS || 'system:subscriptions',
+    COMMANDS: config.CHANNELS?.COMMANDS || 'system:commands'
 };
 
 const TRADING = config.TRADING || {};
 
 const EXCHANGE_MODE = String(process.env.EXCHANGE_MODE || TRADING.EXCHANGE_MODE || 'PAPER').toUpperCase();
 const MAX_ACTIVE_TRADES = Number(TRADING.MAX_ACTIVE_TRADES || 3);
-const AI_LONG_THRESHOLD = Number(TRADING.AI_LONG_THRESHOLD || 0.70);
-const AI_SHORT_THRESHOLD = Number(TRADING.AI_SHORT_THRESHOLD || 0.70);
+
+// ============================================================
+// TEST MODE THRESHOLD
+// ------------------------------------------------------------
+// Giai đoạn debug/test: mặc định 0.6 để bot vào lệnh nhiều hơn,
+// giúp kiểm tra Mongo/Paper/Dashboard/FeatureRecorder nhanh hơn.
+// Khi ổn định, sửa trong system_config.json lên 0.7.
+// ============================================================
+const AI_LONG_THRESHOLD = Number(TRADING.AI_LONG_THRESHOLD || 0.60);
+const AI_SHORT_THRESHOLD = Number(TRADING.AI_SHORT_THRESHOLD || 0.60);
 const MIN_MACRO_SCORE = Number(TRADING.MIN_MACRO_SCORE || 0.40);
+
 const MAX_SPREAD_CLOSE = Number(TRADING.MAX_SPREAD_CLOSE || 0.002);
 const MAX_ATR_PERCENT = Number(TRADING.MAX_ATR_PERCENT || 0.20);
 const MIN_ATR_PERCENT = Number(TRADING.MIN_ATR_PERCENT || 0.00001);
@@ -71,10 +85,20 @@ const COOLDOWN_CLEAN_INTERVAL_MS = Number(TRADING.COOLDOWN_CLEAN_INTERVAL_MS || 
 const EV_SWITCH_MIN_PROB_DELTA = Number(TRADING.EV_SWITCH_MIN_PROB_DELTA || 0.10);
 const EV_SWITCH_PROTECT_PROFIT_ROI = Number(TRADING.EV_SWITCH_PROTECT_PROFIT_ROI || 10);
 const DEFAULT_ATR_PERCENT = Number(TRADING.DEFAULT_ATR_PERCENT || 0.003);
-const MFA_PANIC_THRESHOLD = Number(TRADING.MFA_PANIC_THRESHOLD || 5.0);
-const MFA_TIGHTEN_THRESHOLD = Number(TRADING.MFA_TIGHTEN_THRESHOLD || 4.0);
+
+// MFA giờ chỉ là xác nhận phụ, không tự đóng lệnh một mình.
+const MFA_PANIC_THRESHOLD = Number(TRADING.MFA_PANIC_THRESHOLD || 10.0);
+const MFA_TIGHTEN_THRESHOLD = Number(TRADING.MFA_TIGHTEN_THRESHOLD || 6.0);
 const TRAILING_MULTIPLIER_NORMAL = Number(TRADING.TRAILING_MULTIPLIER_NORMAL || 3.0);
 const TRAILING_MULTIPLIER_TIGHT = Number(TRADING.TRAILING_MULTIPLIER_TIGHT || 1.5);
+
+// Reversal AI confirmation.
+const REVERSAL_EXIT_ENABLED = TRADING.REVERSAL_EXIT_ENABLED !== false;
+const REVERSAL_OPPOSITE_PROB = Number(TRADING.REVERSAL_OPPOSITE_PROB || 0.60);
+const REVERSAL_MIN_PROB_GAP = Number(TRADING.REVERSAL_MIN_PROB_GAP || 0.12);
+const REVERSAL_CONFIRM_TICKS = Number(TRADING.REVERSAL_CONFIRM_TICKS || 3);
+const REVERSAL_MIN_HOLD_MS = Number(TRADING.REVERSAL_MIN_HOLD_MS || 30 * 1000);
+
 const MODEL_VERSION = process.env.MODEL_VERSION || TRADING.MODEL_VERSION || 'Universal_Scout.onnx';
 
 // ============================================================
@@ -167,6 +191,8 @@ const cooldowns = new Map();
 const isExecuting = new Set();
 const predictionEmitTimestamps = new Map();
 const recentlyClosed = new Map();
+const reversalState = new Map();
+
 const RECENT_CLOSE_TTL_MS = 10 * 1000;
 
 let tradingPaused = false;
@@ -311,6 +337,18 @@ function parseOnnxOutput(output) {
     return { probShort, probLong };
 }
 
+async function runAiInference(feature) {
+    if (!aiReady || !aiSession) return null;
+
+    const inputData = buildFeatureVector(feature);
+    const tensor = new ort.Tensor('float32', inputData, [1, 13]);
+    const feeds = {};
+    feeds[aiInputName] = tensor;
+
+    const output = await aiSession.run(feeds);
+    return parseOnnxOutput(output);
+}
+
 // ============================================================
 // 9. EXPERIENCE / DASHBOARD
 // ============================================================
@@ -390,8 +428,12 @@ async function restoreStateFromExchange() {
                 lowestPrice: safeNumber(position.lowestPrice, position.entryPrice),
                 type: position.type === 'SHORT' ? 'SHORT' : 'LONG',
                 prob: safeNumber(position.prob, 0),
+                probLong: position.probLong,
+                probShort: position.probShort,
+                macroScore: position.macroScore,
                 leverage: safeNumber(position.leverage, 1),
                 features: position.features || null,
+                openTime: safeNumber(position.openTime, nowMs()),
                 restored: true
             });
 
@@ -449,7 +491,96 @@ async function riskResume() {
 }
 
 // ============================================================
-// 13. CLOSE TRADE HELPER
+// 13. CONFIRMED REVERSAL LOGIC
+// ============================================================
+function checkConfirmedReversal(symbol, trade, probLong, probShort) {
+    const sym = normalizeSymbol(symbol);
+
+    if (!REVERSAL_EXIT_ENABLED) {
+        reversalState.delete(sym);
+        return { shouldClose: false };
+    }
+
+    const now = nowMs();
+    const holdMs = now - safeNumber(trade.openTime, now);
+
+    // Không cắt đảo chiều khi lệnh mới mở để tránh bị nhiễu vài giây đầu.
+    if (holdMs < REVERSAL_MIN_HOLD_MS) {
+        reversalState.delete(sym);
+        return { shouldClose: false, reason: 'REVERSAL_MIN_HOLD_NOT_MET' };
+    }
+
+    let oppositeProb = 0;
+    let currentSideProb = 0;
+    let reversalDirection = '';
+
+    if (trade.type === 'SHORT') {
+        oppositeProb = safeNumber(probLong, 0);
+        currentSideProb = safeNumber(probShort, 0);
+        reversalDirection = 'LONG';
+    } else {
+        oppositeProb = safeNumber(probShort, 0);
+        currentSideProb = safeNumber(probLong, 0);
+        reversalDirection = 'SHORT';
+    }
+
+    const gap = oppositeProb - currentSideProb;
+    const isClearReversal = oppositeProb >= REVERSAL_OPPOSITE_PROB && gap >= REVERSAL_MIN_PROB_GAP;
+
+    if (!isClearReversal) {
+        reversalState.delete(sym);
+        return {
+            shouldClose: false,
+            reason: 'NO_CLEAR_REVERSAL',
+            oppositeProb,
+            currentSideProb,
+            gap,
+            reversalDirection,
+            confirmCount: 0
+        };
+    }
+
+    const prev = reversalState.get(sym) || {
+        direction: reversalDirection,
+        count: 0,
+        firstSeenAt: now
+    };
+
+    if (prev.direction !== reversalDirection) {
+        prev.direction = reversalDirection;
+        prev.count = 0;
+        prev.firstSeenAt = now;
+    }
+
+    prev.count += 1;
+    prev.lastSeenAt = now;
+    prev.oppositeProb = oppositeProb;
+    prev.currentSideProb = currentSideProb;
+    prev.gap = gap;
+
+    reversalState.set(sym, prev);
+
+    if (prev.count >= REVERSAL_CONFIRM_TICKS) {
+        reversalState.delete(sym);
+        return {
+            shouldClose: true,
+            reason: `${trade.type}: AI đảo chiều rõ sang ${reversalDirection} | opposite=${(oppositeProb * 100).toFixed(1)}% current=${(currentSideProb * 100).toFixed(1)}% gap=${(gap * 100).toFixed(1)}% confirm=${prev.count}`
+        };
+    }
+
+    return {
+        shouldClose: false,
+        reason: 'REVERSAL_CONFIRMING',
+        oppositeProb,
+        currentSideProb,
+        gap,
+        reversalDirection,
+        confirmCount: prev.count
+    };
+}
+
+// ============================================================
+// 14. CLOSE TRADE HELPER
 // ============================================================
 async function closeActiveTrade(symbol, currentPrice, reason, exitFeature = null, options = {}) {
     const sym = normalizeSymbol(symbol);
@@ -463,11 +594,19 @@ async function closeActiveTrade(symbol, currentPrice, reason, exitFeature = null
         logThought(sym, `🛑 [ĐÓNG LỆNH] ${reason} @ ${safeNumber(currentPrice).toFixed(6)}`);
         const result = await exchange.closeTrade(sym, currentPrice, reason, exitFeature);
 
+        // PaperExchange_Fixed nếu Mongo close lỗi sẽ return null.
+        // Khi result null, KHÔNG xóa activeTrades để tránh lệch trạng thái.
+        if (!result) {
+            logThought(sym, `⛔ [CLOSE FAILED] Exchange không xác nhận đóng. Giữ active trade để tránh lệch.`);
+            return null;
+        }
+
         activeTrades.delete(sym);
+        reversalState.delete(sym);
         syncStream(sym, 'EXIT_TRADE');
 
         logExperience(sym, trade.type, trade.entryPrice, currentPrice, trade.prob, trade.features, reason);
-        await riskRecordClosed(sym, safeNumber(result?.netPnL || result?.netPnl || 0));
+        await riskRecordClosed(sym, safeNumber(result?.netPnL ?? result?.netPnl ?? result?.netPnL ?? 0));
 
         setCooldown(sym, options.cooldownMs ?? COOLDOWN_AFTER_CLOSE_MS, reason);
         markRecentlyClosed(sym);
@@ -491,6 +630,7 @@ async function handleExchangeClosedEvent(symbol, tickEvent, feature) {
     }
 
     activeTrades.delete(sym);
+    reversalState.delete(sym);
     syncStream(sym, 'EXIT_TRADE');
 
     const closePrice = safeNumber(tickEvent.closePrice || tickEvent.result?.closePrice || feature.last_price);
@@ -506,9 +646,9 @@ async function handleExchangeClosedEvent(symbol, tickEvent, feature) {
 }
 
 // ============================================================
-// 14. ACTIVE TRADE MANAGEMENT
+// 15. ACTIVE TRADE MANAGEMENT
 // ============================================================
-async function manageActiveTrade(symbol, feature) {
+async function manageActiveTrade(symbol, feature, aiProb = null) {
     const sym = normalizeSymbol(symbol);
     const trade = activeTrades.get(sym);
     if (!trade) return false;
@@ -516,6 +656,7 @@ async function manageActiveTrade(symbol, feature) {
     const currentPrice = safeNumber(feature.last_price);
     if (currentPrice <= 0) return true;
 
+    // Để PaperExchange/LiveExchange update high/low hoặc phát hiện event đặc biệt nếu có.
     if (typeof exchange.updateTick === 'function') {
         const tickEvent = await exchange.updateTick(sym, currentPrice, feature);
         if (tickEvent?.closed) {
@@ -532,8 +673,19 @@ async function manageActiveTrade(symbol, feature) {
 
     const atrPercent = safeNumber(feature.ATR14, DEFAULT_ATR_PERCENT);
     const mfa = safeNumber(feature.MFA, 0);
+
+    // Nếu MFA mạnh thì chỉ siết trailing, không tự đóng đơn độc.
     const stopMultiplier = Math.abs(mfa) > MFA_TIGHTEN_THRESHOLD ? TRAILING_MULTIPLIER_TIGHT : TRAILING_MULTIPLIER_NORMAL;
     const stopDistance = atrPercent * stopMultiplier;
+
+    // 1. Đóng khi AI đảo chiều rõ ràng đã xác nhận.
+    if (aiProb) {
+        const reversal = checkConfirmedReversal(sym, trade, aiProb.probLong, aiProb.probShort);
+        if (reversal.shouldClose) {
+            await closeActiveTrade(sym, currentPrice, reversal.reason, feature);
+            return true;
+        }
+    }
 
     let shouldClose = false;
     let closeReason = '';
@@ -542,19 +694,29 @@ async function manageActiveTrade(symbol, feature) {
         const slPrice = trade.highestPrice * (1 - stopDistance);
         if (evalPrice <= slPrice) {
             shouldClose = true;
-            closeReason = 'LONG: Trailing Stop Hit';
-        } else if (mfa < -MFA_PANIC_THRESHOLD) {
+            closeReason = `LONG: Trailing Stop Hit | stop=${slPrice.toFixed(8)} eval=${evalPrice.toFixed(8)} atr=${(atrPercent * 100).toFixed(3)}%`;
+        } else if (
+            mfa < -MFA_PANIC_THRESHOLD &&
+            aiProb &&
+            safeNumber(aiProb.probShort, 0) >= REVERSAL_OPPOSITE_PROB &&
+            safeNumber(aiProb.probShort, 0) - safeNumber(aiProb.probLong, 0) >= REVERSAL_MIN_PROB_GAP
+        ) {
             shouldClose = true;
-            closeReason = 'LONG: Dump mạnh (MFA âm sâu)';
+            closeReason = `LONG: MFA dump cực mạnh + AI xác nhận SHORT ${(aiProb.probShort * 100).toFixed(1)}%`;
         }
     } else {
         const slPrice = trade.lowestPrice * (1 + stopDistance);
         if (evalPrice >= slPrice) {
             shouldClose = true;
-            closeReason = 'SHORT: Trailing Stop Hit';
-        } else if (mfa > MFA_PANIC_THRESHOLD) {
+            closeReason = `SHORT: Trailing Stop Hit | stop=${slPrice.toFixed(8)} eval=${evalPrice.toFixed(8)} atr=${(atrPercent * 100).toFixed(3)}%`;
+        } else if (
+            mfa > MFA_PANIC_THRESHOLD &&
+            aiProb &&
+            safeNumber(aiProb.probLong, 0) >= REVERSAL_OPPOSITE_PROB &&
+            safeNumber(aiProb.probLong, 0) - safeNumber(aiProb.probShort, 0) >= REVERSAL_MIN_PROB_GAP
+        ) {
             shouldClose = true;
-            closeReason = 'SHORT: Pump mạnh (MFA dương gắt)';
+            closeReason = `SHORT: MFA pump cực mạnh + AI xác nhận LONG ${(aiProb.probLong * 100).toFixed(1)}%`;
         }
     }
 
@@ -563,7 +725,7 @@ async function manageActiveTrade(symbol, feature) {
 }
 
 // ============================================================
-// 15. EV SWITCH
+// 16. EV SWITCH
 // ============================================================
 async function tryEvSwitchForSlot(newSymbol, finalProb, currentFeature) {
     if (activeTrades.size < MAX_ACTIVE_TRADES) return true;
@@ -599,7 +761,7 @@ async function tryEvSwitchForSlot(newSymbol, finalProb, currentFeature) {
 }
 
 // ============================================================
-// 16. ENTRY EXECUTION
+// 17. ENTRY EXECUTION
 // ============================================================
 async function openNewTrade(symbol, tradeAction, currentPrice, finalProb, probLong, probShort, macroScore, feature) {
     const sym = normalizeSymbol(symbol);
@@ -609,6 +771,8 @@ async function openNewTrade(symbol, tradeAction, currentPrice, finalProb, probLo
     isExecuting.add(sym);
 
     try {
+        // Kelly đơn giản đang giữ như bản cũ.
+        // Giai đoạn test vẫn clamp 5x - 20x.
         const kelly = (finalProb * 2 - (1 - finalProb)) / 2;
         let finalLev = Math.floor(kelly * 20);
         finalLev = Math.max(5, Math.min(finalLev, 20));
@@ -621,7 +785,9 @@ async function openNewTrade(symbol, tradeAction, currentPrice, finalProb, probLo
             activeTrades: activeTrades.size,
             maxActiveTrades: MAX_ACTIVE_TRADES,
             leverage: finalLev,
-            exchangeMode: EXCHANGE_MODE
+            exchangeMode: EXCHANGE_MODE,
+            aiThresholdLong: AI_LONG_THRESHOLD,
+            aiThresholdShort: AI_SHORT_THRESHOLD
         });
 
         if (riskDecision && riskDecision.allowed === false) {
@@ -630,7 +796,7 @@ async function openNewTrade(symbol, tradeAction, currentPrice, finalProb, probLo
             return;
         }
 
-        logThought(sym, `🧠 [AI BÓP CÒ] ${tradeAction} Prob=${(finalProb * 100).toFixed(1)}% Lev=${finalLev}x Macro=${macroScore.toFixed(3)} Mode=${EXCHANGE_MODE}`);
+        logThought(sym, `🧠 [AI BÓP CÒ] ${tradeAction} Prob=${(finalProb * 100).toFixed(1)}% L=${(probLong * 100).toFixed(1)}% S=${(probShort * 100).toFixed(1)}% Lev=${finalLev}x Macro=${macroScore.toFixed(3)} Mode=${EXCHANGE_MODE}`);
 
         const success = await exchange.openTrade(
             sym,
@@ -644,7 +810,7 @@ async function openNewTrade(symbol, tradeAction, currentPrice, finalProb, probLo
                 macroScore,
                 probLong,
                 probShort,
-                entrySignal: 'AI_PROB_THRESHOLD',
+                entrySignal: 'AI_PROB_THRESHOLD_TEST_06',
                 modelVersion: MODEL_VERSION
             }
         );
@@ -664,6 +830,7 @@ async function openNewTrade(symbol, tradeAction, currentPrice, finalProb, probLo
                 openTime: nowMs()
             });
 
+            reversalState.delete(sym);
             syncStream(sym, 'ENTER_TRADE');
             await riskRecordOpened(sym);
             logThought(sym, `✅ [VÀO LỆNH THÀNH CÔNG] ${tradeAction} ${sym}`);
@@ -680,7 +847,7 @@ async function openNewTrade(symbol, tradeAction, currentPrice, finalProb, probLo
 }
 
 // ============================================================
-// 17. MAIN FEATURE HANDLER
+// 18. MAIN FEATURE HANDLER
 // ============================================================
 async function handleFeatureMessage(messageBuffer) {
     let feature;
@@ -698,8 +865,25 @@ async function handleFeatureMessage(messageBuffer) {
     const currentPrice = safeNumber(feature.last_price, 0);
     latestFeatures.set(symbol, feature);
 
+    let parsed;
+    try {
+        // QUAN TRỌNG:
+        // Dù symbol đang có lệnh, vẫn chạy ONNX để biết AI còn giữ hướng cũ
+        // hay đã đảo chiều rõ ràng.
+        parsed = await runAiInference(feature);
+    } catch (err) {
+        console.error(`❌ [AI] Inference error ${symbol}:`, err.message);
+        return;
+    }
+
+    if (!parsed) return;
+
+    const { probShort, probLong } = parsed;
+    emitPrediction(symbol, probLong, probShort);
+
+    // Nếu đang có lệnh, chỉ quản trị lệnh; tuyệt đối không mở thêm lệnh cùng symbol.
     if (activeTrades.has(symbol)) {
-        await manageActiveTrade(symbol, feature);
+        await manageActiveTrade(symbol, feature, { probLong, probShort });
         return;
     }
 
@@ -711,43 +895,27 @@ async function handleFeatureMessage(messageBuffer) {
     const macroScore = safeNumber(macroCache.get(symbol), 0.5);
     if (macroScore < MIN_MACRO_SCORE) return;
 
-    try {
-        const inputData = buildFeatureVector(feature);
-        const tensor = new ort.Tensor('float32', inputData, [1, 13]);
-        const feeds = {};
-        feeds[aiInputName] = tensor;
+    let tradeAction = null;
+    let finalProb = 0;
 
-        const output = await aiSession.run(feeds);
-        const parsed = parseOnnxOutput(output);
-        if (!parsed) return;
-
-        const { probShort, probLong } = parsed;
-        emitPrediction(symbol, probLong, probShort);
-
-        let tradeAction = null;
-        let finalProb = 0;
-
-        if (probLong >= AI_LONG_THRESHOLD && probLong >= probShort) {
-            tradeAction = 'LONG';
-            finalProb = probLong;
-        } else if (probShort >= AI_SHORT_THRESHOLD && probShort > probLong) {
-            tradeAction = 'SHORT';
-            finalProb = probShort;
-        }
-
-        if (!tradeAction) return;
-
-        const slotAvailable = await tryEvSwitchForSlot(symbol, finalProb, feature);
-        if (!slotAvailable) return;
-
-        await openNewTrade(symbol, tradeAction, currentPrice, finalProb, probLong, probShort, macroScore, feature);
-    } catch (err) {
-        console.error(`❌ [AI] Inference error ${symbol}:`, err.message);
+    if (probLong >= AI_LONG_THRESHOLD && probLong >= probShort) {
+        tradeAction = 'LONG';
+        finalProb = probLong;
+    } else if (probShort >= AI_SHORT_THRESHOLD && probShort > probLong) {
+        tradeAction = 'SHORT';
+        finalProb = probShort;
     }
+
+    if (!tradeAction) return;
+
+    const slotAvailable = await tryEvSwitchForSlot(symbol, finalProb, feature);
+    if (!slotAvailable) return;
+
+    await openNewTrade(symbol, tradeAction, currentPrice, finalProb, probLong, probShort, macroScore, feature);
 }
 
 // ============================================================
-// 18. SYSTEM COMMANDS
+// 19. SYSTEM COMMANDS
 // ============================================================
 async function closeAll(reason = 'MANUAL_CLOSE_ALL') {
     const symbols = [...activeTrades.keys()];
@@ -781,6 +949,7 @@ async function handleSystemCommand(message) {
         }
 
         if (cmd.action === 'CLOSE_ALL') {
+            // Live-safe: Close All đồng thời pause để tránh vừa đóng xong bot mở lại ngay.
             await riskPause(cmd.reason || 'close_all');
             await closeAll(cmd.reason || 'MANUAL_CLOSE_ALL');
             return;
@@ -789,6 +958,7 @@ async function handleSystemCommand(message) {
         if (cmd.action === 'RESET_PAPER_WALLET' && typeof exchange.resetPaperWallet === 'function') {
             const amount = safeNumber(cmd.amount, undefined);
             await exchange.resetPaperWallet(amount);
+            logThought('SYSTEM', `🔄 Reset paper wallet to ${amount}`);
             return;
         }
 
@@ -800,11 +970,13 @@ async function handleSystemCommand(message) {
                 await closeActiveTrade(symbol, price, cmd.reason || 'MANUAL_FORCE_CLOSE', feature, { force: true });
             }
         }
-    } catch (e) {}
+    } catch (e) {
+        console.error('⚠️ [SYSTEM COMMAND] Invalid command:', e.message);
+    }
 }
 
 // ============================================================
-// 19. SUBSCRIPTIONS INIT
+// 20. SUBSCRIPTIONS INIT
 // ============================================================
 function startFeatureSubscription() {
     subClient.psubscribe(CHANNELS.FEATURES, (err) => {
@@ -825,21 +997,21 @@ function startFeatureSubscription() {
 }
 
 function startCommandSubscription() {
-    cmdClient.subscribe('system:commands', (err) => {
+    cmdClient.subscribe(CHANNELS.COMMANDS, (err) => {
         if (err) {
             console.error('❌ [REDIS] subscribe commands error:', err.message);
             return;
         }
-        console.log('📡 [REDIS] Listening system:commands');
+        console.log(`📡 [REDIS] Listening ${CHANNELS.COMMANDS}`);
     });
 
     cmdClient.on('message', async (channel, message) => {
-        if (channel === 'system:commands') await handleSystemCommand(message);
+        if (channel === CHANNELS.COMMANDS) await handleSystemCommand(message);
     });
 }
 
 // ============================================================
-// 20. HOUSEKEEPING
+// 21. HOUSEKEEPING
 // ============================================================
 function startHousekeeping() {
     setInterval(() => {
@@ -854,7 +1026,7 @@ function startHousekeeping() {
 }
 
 // ============================================================
-// 21. STARTUP CHECKS
+// 22. STARTUP CHECKS
 // ============================================================
 function validateModeSafety() {
     if (EXCHANGE_MODE === 'LIVE') {
@@ -870,11 +1042,12 @@ function validateModeSafety() {
 }
 
 // ============================================================
-// 22. MAIN
+// 23. MAIN
 // ============================================================
 async function main() {
-    console.log('🚀 [ORDER MANAGER FINAL] Starting...');
+    console.log('🚀 [ORDER MANAGER FINAL FIXED] Starting...');
     console.log(`⚙️ [CONFIG] exchangeMode=${EXCHANGE_MODE}, maxTrades=${MAX_ACTIVE_TRADES}, long>=${AI_LONG_THRESHOLD}, short>=${AI_SHORT_THRESHOLD}, macro>=${MIN_MACRO_SCORE}`);
+    console.log(`⚙️ [REVERSAL] enabled=${REVERSAL_EXIT_ENABLED}, opposite>=${REVERSAL_OPPOSITE_PROB}, gap>=${REVERSAL_MIN_PROB_GAP}, confirm=${REVERSAL_CONFIRM_TICKS}, minHold=${REVERSAL_MIN_HOLD_MS}ms`);
 
     validateModeSafety();
 
@@ -892,14 +1065,14 @@ async function main() {
     startCommandSubscription();
     startHousekeeping();
 
-    console.log('✅ [ORDER MANAGER FINAL] Ready');
+    console.log('✅ [ORDER MANAGER FINAL FIXED] Ready');
 }
 
 // ============================================================
-// 23. SHUTDOWN
+// 24. SHUTDOWN
 // ============================================================
 async function shutdown() {
-    console.log('\n🛑 [ORDER MANAGER FINAL] Shutting down...');
+    console.log('\n🛑 [ORDER MANAGER FINAL FIXED] Shutting down...');
 
     try { await subClient.quit(); } catch (e) {}
     try { await cmdClient.quit(); } catch (e) {}
