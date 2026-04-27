@@ -96,6 +96,18 @@ module.exports = {
         DASHBOARD_HOST: "0.0.0.0",
         DASHBOARD_PORT: 3010
       }
+    },
+
+    {
+      name: "hourly-learning",
+      script: "src/training/hourly_self_learning.py",
+      interpreter: "python3",
+      autorestart: true,
+      watch: false,
+      max_memory_restart: "1200M",
+      env: {
+        PYTHONIOENCODING: "utf-8"
+      }
     }
   ]
 };
