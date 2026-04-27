@@ -882,14 +882,15 @@ def train_candidate(df: pd.DataFrame, cfg: SelfLearningConfig, run_id: str) -> T
         "objective": "multi:softprob",
         "num_class": 2,
         "eval_metric": ["mlogloss", "merror"],
-        "max_depth": 4,
+        # ĐÃ SỬA: Giảm max_depth và tăng reg_lambda để Não Gốc không bị nhiễu 1s phá hỏng
+        "max_depth": 3, 
         "learning_rate": 0.035,
         "subsample": 0.85,
         "colsample_bytree": 0.85,
-        "min_child_weight": 8,
+        "min_child_weight": 10,
         "gamma": 0.25,
         "reg_alpha": 0.08,
-        "reg_lambda": 1.8,
+        "reg_lambda": 3.0, 
         "tree_method": "hist",
         "seed": cfg.random_seed,
         "missing": np.nan,
@@ -898,13 +899,30 @@ def train_candidate(df: pd.DataFrame, cfg: SelfLearningConfig, run_id: str) -> T
     dtrain = xgb.DMatrix(train_df[FEATURES].values.astype(np.float32), label=train_df["target"].values.astype(int), weight=compute_weights(train_df, cfg))
     dvalid = xgb.DMatrix(valid_df[FEATURES].values.astype(np.float32), label=valid_df["target"].values.astype(int), weight=compute_weights(valid_df, cfg))
 
+    # --- BẮT ĐẦU CẬP NHẬT: LOGIC CONTINUAL LEARNING ---
+    base_model_path = "model_universal_canonical_v3.xgb"
+    boost_rounds_to_use = cfg.num_boost_round
+    xgb_model_arg = None
+
+    if os.path.exists(base_model_path):
+        log(f"🧠 KẾ THỪA TRÍ NHỚ: Tìm thấy não gốc tại {base_model_path}")
+        xgb_model_arg = base_model_path
+        # Chỉ train thêm 35 vòng (trees) để học phản xạ, không train 220 vòng gây hỏng não gốc
+        boost_rounds_to_use = 35 
+        log(f"⚙️ Chuyển sang chế độ Update Weights với {boost_rounds_to_use} boost rounds.")
+    else:
+        log("⚠️ CẢNH BÁO: Không tìm thấy file não gốc (.xgb). Sẽ train não mới hoàn toàn từ con số 0!")
+    # --- KẾT THÚC CẬP NHẬT ---
+
     model = xgb.train(
         params,
         dtrain,
-        num_boost_round=cfg.num_boost_round,
+        # ĐÃ SỬA: Gọi biến số vòng lặp mới và truyền file não gốc vào hàm train
+        num_boost_round=boost_rounds_to_use, 
         evals=[(dtrain, "train"), (dvalid, "valid")],
         early_stopping_rounds=cfg.early_stopping_rounds,
-        verbose_eval=25,
+        xgb_model=xgb_model_arg, # <- THAM SỐ CỨU MẠNG
+        verbose_eval=10,
     )
 
     candidate_onnx = str(Path(cfg.candidates_dir) / f"Universal_Scout_candidate_{run_id}.onnx")
@@ -922,6 +940,11 @@ def train_candidate(df: pd.DataFrame, cfg: SelfLearningConfig, run_id: str) -> T
         "class_map": CLASS_MAP,
         "features": FEATURES,
         "config": asdict(cfg),
+        # ĐÃ SỬA: Ghi log lại quá trình Kế thừa để theo dõi trong file JSON
+        "continual_learning": {
+            "used_base_model": xgb_model_arg is not None,
+            "boost_rounds": boost_rounds_to_use
+        },
         "dataset": {
             "samples": int(len(df)),
             "symbols": int(df["symbol"].nunique()),
