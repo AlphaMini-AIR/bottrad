@@ -1,13 +1,13 @@
 // ============================================================
-// DASHBOARD APP JS - TRADING CONTROL ROOM FRONTEND
+// DASHBOARD APP JS V2 - TRADING CONTROL ROOM FRONTEND
 // ------------------------------------------------------------
-// Vai trò:
-// 1. Kết nối Socket.IO với DashboardServer.
-// 2. Render watchlist coin đang theo dõi.
-// 3. Vẽ live candle chart bằng Lightweight Charts.
-// 4. Hiển thị AI long/short probability theo symbol đang chọn.
-// 5. Render thông số coin, lệnh open/closed, account, health, logs.
-// 6. Gửi command an toàn: PAUSE, RESUME, CLOSE_ALL, RELOAD_AI.
+// Mục tiêu V2:
+// 1. Không hiển thị coin LOST trong watchlist.
+// 2. Đọc candles + markers + tooltip từ DashboardServer V2.
+// 3. Chart không fitContent liên tục khi live update để tránh bị giật/cắt.
+// 4. Tooltip rõ từng nến: OHLC, volumeProxy, AI long/short, spread, funding...
+// 5. Marker IN/OUT ưu tiên payload.markers từ backend.
+// 6. Giao diện responsive tốt hơn cho mobile/desktop.
 // ============================================================
 
 const socket = io();
@@ -18,6 +18,7 @@ const state = {
     symbolSnapshots: new Map(),
     candles: [],
     aiTimeline: [],
+    chartMarkers: [],
     openTrades: [],
     closedTrades: [],
     logs: [],
@@ -25,7 +26,9 @@ const state = {
     health: null,
     chart: null,
     candleSeries: null,
-    markerMap: new Map()
+    tooltipEl: null,
+    lastFitSymbol: null,
+    userHasInteractedWithChart: false
 };
 
 // ============================================================
@@ -41,10 +44,25 @@ function fmtNumber(value, digits = 4) {
     return n.toFixed(digits);
 }
 
+function fmtPrice(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return '--';
+    if (n >= 100) return n.toFixed(2);
+    if (n >= 1) return n.toFixed(4);
+    if (n >= 0.01) return n.toFixed(6);
+    return n.toFixed(8);
+}
+
 function fmtPct(value, digits = 2) {
     const n = Number(value);
     if (!Number.isFinite(n)) return '--';
     return `${(n * 100).toFixed(digits)}%`;
+}
+
+function fmtPctRaw(value, digits = 2) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return '--';
+    return `${n.toFixed(digits)}%`;
 }
 
 function fmtProb(value) {
@@ -63,27 +81,44 @@ function fmtAge(ms) {
     const n = Number(ms);
     if (!Number.isFinite(n)) return '--';
     if (n < 1000) return `${Math.round(n)}ms`;
-    return `${(n / 1000).toFixed(1)}s`;
+    if (n < 60_000) return `${(n / 1000).toFixed(1)}s`;
+    return `${Math.floor(n / 60_000)}m${Math.floor((n % 60_000) / 1000)}s`;
 }
 
 function fmtTime(value) {
     if (!value) return '--';
-    const d = new Date(value);
+    const v = Number(value);
+    const d = Number.isFinite(v)
+        ? new Date(v < 1e12 ? v * 1000 : v)
+        : new Date(value);
     if (Number.isNaN(d.getTime())) return '--';
     return d.toLocaleTimeString('vi-VN', { hour12: false });
 }
 
+function fmtDuration(ms) {
+    const n = Number(ms);
+    if (!Number.isFinite(n) || n < 0) return '--';
+    const s = Math.floor(n / 1000);
+    const m = Math.floor(s / 60);
+    const h = Math.floor(m / 60);
+    if (h > 0) return `${h}h ${m % 60}m`;
+    if (m > 0) return `${m}m ${s % 60}s`;
+    return `${s}s`;
+}
+
 function classForStatus(status) {
-    if (status === 'LIVE') return 'status-live';
-    if (status === 'IN_TRADE') return 'status-trade';
-    if (status === 'STALE') return 'status-stale';
-    if (status === 'LOST') return 'status-lost';
+    const s = String(status || '').toUpperCase();
+    if (s === 'LIVE') return 'status-live';
+    if (s === 'IN_TRADE') return 'status-trade';
+    if (s === 'STALE') return 'status-stale';
+    if (s === 'LOST') return 'status-lost';
     return 'status-wait';
 }
 
 function classForBias(bias) {
-    if (bias === 'LONG') return 'bias-long';
-    if (bias === 'SHORT') return 'bias-short';
+    const b = String(bias || '').toUpperCase();
+    if (b === 'LONG') return 'bias-long';
+    if (b === 'SHORT') return 'bias-short';
     return 'bias-wait';
 }
 
@@ -108,8 +143,26 @@ function escapeHtml(str) {
         .replace(/'/g, '&#039;');
 }
 
+function getTradeTimeMs(t, open = true) {
+    const value = open ? (t.openTime || t.openTs) : (t.closeTime || t.closeTs);
+    if (!value) return null;
+    if (value instanceof Date) return value.getTime();
+    const n = Number(value);
+    if (Number.isFinite(n)) return n < 1e12 ? n * 1000 : n;
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function getFeatureValue(obj, keys, fallback = 0) {
+    if (!obj) return fallback;
+    for (const key of keys) {
+        if (obj[key] !== undefined && obj[key] !== null) return obj[key];
+    }
+    return fallback;
+}
+
 // ============================================================
-// 2. CHART INIT
+// 2. CHART INIT + TOOLTIP
 // ============================================================
 function initChart() {
     const container = $('chartContainer');
@@ -117,7 +170,7 @@ function initChart() {
 
     state.chart = LightweightCharts.createChart(container, {
         width: container.clientWidth,
-        height: container.clientHeight,
+        height: Math.max(container.clientHeight, 360),
         layout: {
             background: { color: '#0f172a' },
             textColor: '#cbd5e1'
@@ -129,13 +182,25 @@ function initChart() {
         timeScale: {
             timeVisible: true,
             secondsVisible: true,
-            borderColor: 'rgba(148, 163, 184, 0.2)'
+            borderColor: 'rgba(148, 163, 184, 0.2)',
+            rightOffset: 8,
+            barSpacing: 7,
+            minBarSpacing: 3,
+            fixLeftEdge: false,
+            fixRightEdge: false
         },
         rightPriceScale: {
-            borderColor: 'rgba(148, 163, 184, 0.2)'
+            borderColor: 'rgba(148, 163, 184, 0.2)',
+            scaleMargins: {
+                top: 0.12,
+                bottom: 0.16
+            }
         },
         crosshair: {
             mode: LightweightCharts.CrosshairMode.Normal
+        },
+        localization: {
+            priceFormatter: price => fmtPrice(price)
         }
     });
 
@@ -145,78 +210,237 @@ function initChart() {
         borderUpColor: '#22c55e',
         borderDownColor: '#ef4444',
         wickUpColor: '#22c55e',
-        wickDownColor: '#ef4444'
+        wickDownColor: '#ef4444',
+        priceLineVisible: true,
+        lastValueVisible: true
     });
 
-    window.addEventListener('resize', () => {
-        if (!state.chart || !container) return;
-        state.chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
+    createChartTooltip(container);
+
+    state.chart.subscribeCrosshairMove(param => handleCrosshairMove(param, container));
+
+    container.addEventListener('wheel', () => {
+        state.userHasInteractedWithChart = true;
+    }, { passive: true });
+
+    container.addEventListener('mousedown', () => {
+        state.userHasInteractedWithChart = true;
     });
+
+    window.addEventListener('resize', () => resizeChart());
+    resizeChart();
 }
 
-function setChartCandles(candles = []) {
-    state.candles = candles || [];
-    if (!state.candleSeries) return;
-    state.candleSeries.setData(state.candles.map(c => ({
-        time: c.time,
+function resizeChart() {
+    const container = $('chartContainer');
+    if (!state.chart || !container) return;
+    const rect = container.getBoundingClientRect();
+    const width = Math.max(320, Math.floor(rect.width));
+    const height = Math.max(320, Math.floor(rect.height || container.clientHeight || 420));
+    state.chart.applyOptions({ width, height });
+}
+
+function createChartTooltip(container) {
+    const existing = $('chartTooltip');
+    if (existing) {
+        state.tooltipEl = existing;
+        return;
+    }
+
+    const tooltip = document.createElement('div');
+    tooltip.id = 'chartTooltip';
+    tooltip.className = 'chart-tooltip hidden';
+    container.style.position = 'relative';
+    container.appendChild(tooltip);
+    state.tooltipEl = tooltip;
+}
+
+function candleByTime(time) {
+    if (!time) return null;
+    const target = typeof time === 'object'
+        ? Date.UTC(time.year, time.month - 1, time.day) / 1000
+        : Number(time);
+    return state.candles.find(c => Number(c.time) === target) || null;
+}
+
+function handleCrosshairMove(param, container) {
+    const tooltip = state.tooltipEl;
+    if (!tooltip || !param || !param.time || !param.point) {
+        if (tooltip) tooltip.classList.add('hidden');
+        return;
+    }
+
+    const candle = candleByTime(param.time);
+    if (!candle) {
+        tooltip.classList.add('hidden');
+        return;
+    }
+
+    tooltip.innerHTML = buildCandleTooltipHtml(candle);
+    tooltip.classList.remove('hidden');
+
+    const width = 245;
+    const height = tooltip.offsetHeight || 150;
+    const x = param.point.x + 18;
+    const y = param.point.y + 18;
+
+    const left = x + width > container.clientWidth ? param.point.x - width - 18 : x;
+    const top = y + height > container.clientHeight ? param.point.y - height - 18 : y;
+
+    tooltip.style.left = `${Math.max(8, left)}px`;
+    tooltip.style.top = `${Math.max(8, top)}px`;
+}
+
+function buildCandleTooltipHtml(c) {
+    const open = Number(c.open);
+    const close = Number(c.close);
+    const changePct = Number.isFinite(open) && open !== 0
+        ? ((close - open) / open) * 100
+        : 0;
+    const tip = c.tooltip || {};
+
+    return `
+        <div class="tooltip-title">
+            <strong>${fmtTime(c.time)}</strong>
+            <span class="${c.isSynthetic ? 'text-warning' : 'text-long'}">${c.isSynthetic ? 'Synthetic' : 'Live'}</span>
+        </div>
+        <div class="tooltip-grid">
+            <span>O</span><strong>${fmtPrice(c.open)}</strong>
+            <span>H</span><strong>${fmtPrice(c.high)}</strong>
+            <span>L</span><strong>${fmtPrice(c.low)}</strong>
+            <span>C</span><strong>${fmtPrice(c.close)}</strong>
+            <span>Change</span><strong class="${changePct >= 0 ? 'text-long' : 'text-short'}">${fmtPctRaw(changePct, 3)}</strong>
+            <span>Ticks</span><strong>${fmtNumber(c.tickCount ?? c.volumeProxy, 0)}</strong>
+            <span>AI Long</span><strong class="text-long">${fmtProb(tip.aiLong)}</strong>
+            <span>AI Short</span><strong class="text-short">${fmtProb(tip.aiShort)}</strong>
+            <span>Spread</span><strong>${fmtPct(tip.spread, 3)}</strong>
+            <span>Funding</span><strong>${fmtPct(tip.fundingRate, 4)}</strong>
+            <span>BTC Rel</span><strong>${fmtPctRaw(tip.btcRelativeStrength, 4)}</strong>
+        </div>
+        ${c.isSynthetic ? '<div class="tooltip-note">Nến nội suy để giữ chart không bị đứt.</div>' : ''}
+    `;
+}
+
+function normalizeCandleForChart(c) {
+    return {
+        time: Number(c.time),
         open: Number(c.open),
         high: Number(c.high),
         low: Number(c.low),
         close: Number(c.close)
-    })));
+    };
+}
+
+function setChartCandles(candles = [], markers = []) {
+    state.candles = (candles || [])
+        .filter(c => c && Number.isFinite(Number(c.time)) && Number(c.open) > 0 && Number(c.high) > 0 && Number(c.low) > 0 && Number(c.close) > 0)
+        .sort((a, b) => Number(a.time) - Number(b.time));
+
+    state.chartMarkers = markers || [];
+
+    if (!state.candleSeries) return;
+
+    state.candleSeries.setData(state.candles.map(normalizeCandleForChart));
     updateTradeMarkers();
-    state.chart?.timeScale().fitContent();
+
+    if (state.selectedSymbol !== state.lastFitSymbol) {
+        state.lastFitSymbol = state.selectedSymbol;
+        state.userHasInteractedWithChart = false;
+        state.chart?.timeScale().fitContent();
+    } else if (!state.userHasInteractedWithChart) {
+        state.chart?.timeScale().scrollToRealTime();
+    }
 }
 
 function updateLiveCandle(candle) {
     if (!candle || !state.candleSeries) return;
-    const item = {
-        time: candle.time,
-        open: Number(candle.open),
-        high: Number(candle.high),
-        low: Number(candle.low),
-        close: Number(candle.close)
-    };
-    state.candleSeries.update(item);
+
+    const normalized = normalizeCandleForChart(candle);
+    if (!Number.isFinite(normalized.time) || normalized.close <= 0) return;
+
+    state.candleSeries.update(normalized);
 
     const last = state.candles[state.candles.length - 1];
-    if (!last || last.time !== item.time) state.candles.push(item);
-    else Object.assign(last, item);
+    if (!last || Number(last.time) !== normalized.time) {
+        state.candles.push(candle);
+    } else {
+        Object.assign(last, candle);
+    }
+
+    const cutoff = Math.floor((Date.now() - 60 * 60 * 1000) / 1000);
+    state.candles = state.candles.filter(c => Number(c.time) >= cutoff);
+
+    if (!state.userHasInteractedWithChart) {
+        state.chart?.timeScale().scrollToRealTime();
+    }
+}
+
+function markerColor(marker) {
+    if (marker.type === 'EXIT') return Number(marker.pnl) >= 0 ? '#38bdf8' : '#f97316';
+    if (marker.side === 'LONG') return '#22c55e';
+    if (marker.side === 'SHORT') return '#ef4444';
+    return '#f59e0b';
 }
 
 function updateTradeMarkers() {
     if (!state.candleSeries || !state.selectedSymbol) return;
 
-    const markers = [];
-    const symbol = state.selectedSymbol;
+    let markers = [];
 
-    for (const t of state.openTrades.filter(x => x.symbol === symbol)) {
-        if (t.openTs) {
-            markers.push({
-                time: Math.floor(Number(t.openTs) / 1000),
-                position: t.type === 'LONG' ? 'belowBar' : 'aboveBar',
-                color: t.type === 'LONG' ? '#22c55e' : '#ef4444',
-                shape: t.type === 'LONG' ? 'arrowUp' : 'arrowDown',
-                text: `OPEN ${t.type} ${fmtProb(t.prob)}`
-            });
-        }
+    if (Array.isArray(state.chartMarkers) && state.chartMarkers.length > 0) {
+        markers = state.chartMarkers.map(m => ({
+            time: Number(m.time),
+            position: m.position || (m.side === 'LONG' ? 'belowBar' : 'aboveBar'),
+            color: markerColor(m),
+            shape: m.shape || (m.type === 'EXIT' ? 'circle' : (m.side === 'LONG' ? 'arrowUp' : 'arrowDown')),
+            text: m.text || `${m.type || ''} ${m.side || ''}`.trim()
+        }));
+    } else {
+        markers = buildMarkersFallbackFromTrades(state.selectedSymbol);
     }
 
-    for (const t of state.closedTrades.filter(x => x.symbol === symbol).slice(0, 30)) {
-        if (t.openTs) {
+    markers = markers
+        .filter(m => Number.isFinite(Number(m.time)))
+        .sort((a, b) => Number(a.time) - Number(b.time));
+
+    if (typeof state.candleSeries.setMarkers === 'function') {
+        state.candleSeries.setMarkers(markers);
+    }
+}
+
+function buildMarkersFallbackFromTrades(symbol) {
+    const markers = [];
+    const cutoff = Date.now() - 60 * 60 * 1000;
+
+    for (const t of state.openTrades.filter(x => x.symbol === symbol)) {
+        const openMs = getTradeTimeMs(t, true);
+        if (!openMs || openMs < cutoff) continue;
+        markers.push({
+            time: Math.floor(openMs / 1000),
+            position: t.type === 'LONG' ? 'belowBar' : 'aboveBar',
+            color: t.type === 'LONG' ? '#22c55e' : '#ef4444',
+            shape: t.type === 'LONG' ? 'arrowUp' : 'arrowDown',
+            text: `IN ${t.type} ${fmtProb(t.prob)}`
+        });
+    }
+
+    for (const t of state.closedTrades.filter(x => x.symbol === symbol).slice(0, 60)) {
+        const openMs = getTradeTimeMs(t, true);
+        const closeMs = getTradeTimeMs(t, false);
+        if (openMs && openMs >= cutoff) {
             markers.push({
-                time: Math.floor(Number(t.openTs) / 1000),
+                time: Math.floor(openMs / 1000),
                 position: t.type === 'LONG' ? 'belowBar' : 'aboveBar',
                 color: t.type === 'LONG' ? '#22c55e' : '#ef4444',
                 shape: t.type === 'LONG' ? 'arrowUp' : 'arrowDown',
                 text: `IN ${t.type}`
             });
         }
-        if (t.closeTs) {
+        if (closeMs && closeMs >= cutoff) {
             const pnl = Number(t.pnl ?? t.netPnl ?? 0);
             markers.push({
-                time: Math.floor(Number(t.closeTs) / 1000),
-                position: 'aboveBar',
+                time: Math.floor(closeMs / 1000),
+                position: t.type === 'LONG' ? 'aboveBar' : 'belowBar',
                 color: pnl >= 0 ? '#38bdf8' : '#f97316',
                 shape: 'circle',
                 text: `OUT ${fmtNumber(pnl, 3)}`
@@ -224,8 +448,7 @@ function updateTradeMarkers() {
         }
     }
 
-    markers.sort((a, b) => a.time - b.time);
-    state.candleSeries.setMarkers(markers);
+    return markers;
 }
 
 // ============================================================
@@ -236,28 +459,30 @@ function renderWatchlist() {
     if (!body) return;
 
     const search = ($('watchlistSearch')?.value || '').toUpperCase().trim();
-    const items = state.watchlist.filter(item => !search || item.symbol.includes(search));
+    const cleanList = (state.watchlist || []).filter(item => String(item.status).toUpperCase() !== 'LOST');
+    const items = cleanList.filter(item => !search || item.symbol.includes(search));
     setText('watchlistSubtitle', `${items.length} symbols`);
 
     if (items.length === 0) {
-        body.innerHTML = '<tr><td colspan="6" class="empty-cell">Chưa có dữ liệu feature...</td></tr>';
+        body.innerHTML = '<tr><td colspan="6" class="empty-cell">Chưa có dữ liệu live...</td></tr>';
         return;
     }
 
     body.innerHTML = items.map(item => {
         const selected = item.symbol === state.selectedSymbol ? 'selected-row' : '';
+        const score = Math.max(Number(item.aiLong || 0), Number(item.aiShort || 0));
         return `
             <tr class="${selected}" data-symbol="${escapeHtml(item.symbol)}">
                 <td>
                     <div class="symbol-cell">
                         <strong>${escapeHtml(item.symbol)}</strong>
-                        <small>${fmtAge(item.ageMs)}</small>
+                        <small>${fmtAge(item.ageMs)} · ${fmtPrice(item.price)}</small>
                     </div>
                 </td>
                 <td><span class="bias-pill ${classForBias(item.bias)}">${escapeHtml(item.bias || 'WAIT')}</span></td>
                 <td>${fmtProb(item.aiLong)}</td>
                 <td>${fmtProb(item.aiShort)}</td>
-                <td>${fmtPct(item.spread, 3)}</td>
+                <td>${fmtProb(score)}</td>
                 <td><span class="status-pill ${classForStatus(item.status)}">${escapeHtml(item.status)}</span></td>
             </tr>
         `;
@@ -269,9 +494,13 @@ function renderWatchlist() {
 }
 
 async function selectSymbol(symbol) {
-    state.selectedSymbol = symbol;
-    setText('selectedSymbolTitle', symbol);
-    socket.emit('symbol:select', symbol);
+    const normalized = String(symbol || '').toUpperCase().trim();
+    if (!normalized) return;
+
+    state.selectedSymbol = normalized;
+    state.lastFitSymbol = null;
+    setText('selectedSymbolTitle', normalized);
+    socket.emit('symbol:select', normalized);
     renderWatchlist();
 }
 
@@ -286,10 +515,11 @@ function renderSelectedSymbolFromState() {
     const prediction = snapshot?.state?.prediction || item || null;
 
     if (item) {
+        const badge = $('selectedStatusBadge');
         setText('selectedStatusBadge', item.status || '--');
-        $('selectedStatusBadge').className = `pill ${classForStatus(item.status)}`;
-        setText('selectedPriceBadge', `Price: ${fmtNumber(item.price, 8)}`);
-        setText('selectedMarkBadge', `Mark: ${fmtNumber(item.markPrice, 8)}`);
+        if (badge) badge.className = `pill ${classForStatus(item.status)}`;
+        setText('selectedPriceBadge', `Price: ${fmtPrice(item.price)}`);
+        setText('selectedMarkBadge', `Mark: ${fmtPrice(item.markPrice)}`);
     }
 
     if (feature) renderMetrics(feature, snapshot?.openTrade || item?.activeTrade);
@@ -318,17 +548,17 @@ function renderAi(longValue, shortValue) {
 }
 
 function renderMetrics(feature, activeTrade) {
-    setText('metricSpread', fmtPct(feature.spread_close, 3));
-    setText('metricFunding', fmtPct(feature.funding_rate, 4));
-    setText('metricAtr', fmtPct(feature.ATR14, 3));
-    setText('metricMfa', fmtNumber(feature.MFA, 4));
-    setText('metricOfi', fmtNumber(feature.OFI, 4));
-    setText('metricVpin', fmtNumber(feature.VPIN, 4));
-    setText('metricWhale', fmtNumber(feature.WHALE_NET, 6));
-    setText('metricBtcRel', `${fmtNumber(feature.btc_relative_strength, 4)}%`);
-    setText('metricLiqLong', fmtNumber(feature.liq_long_vol, 6));
-    setText('metricLiqShort', fmtNumber(feature.liq_short_vol, 6));
-    setText('metricTakerBuy', fmtPct(feature.taker_buy_ratio, 2));
+    setText('metricSpread', fmtPct(getFeatureValue(feature, ['spread_close', 'spread'], 0), 3));
+    setText('metricFunding', fmtPct(getFeatureValue(feature, ['funding_rate', 'fundingRate'], 0), 4));
+    setText('metricAtr', fmtPct(getFeatureValue(feature, ['ATR14', 'atr14'], 0), 3));
+    setText('metricMfa', fmtNumber(getFeatureValue(feature, ['MFA', 'mfa'], 0), 4));
+    setText('metricOfi', fmtNumber(getFeatureValue(feature, ['OFI', 'ofi'], 0), 4));
+    setText('metricVpin', fmtNumber(getFeatureValue(feature, ['VPIN', 'vpin'], 0), 4));
+    setText('metricWhale', fmtNumber(getFeatureValue(feature, ['WHALE_NET', 'whaleNet'], 0), 6));
+    setText('metricBtcRel', `${fmtNumber(getFeatureValue(feature, ['btc_relative_strength', 'btcRelativeStrength'], 0), 4)}%`);
+    setText('metricLiqLong', fmtNumber(getFeatureValue(feature, ['liq_long_vol', 'liqLongVol'], 0), 6));
+    setText('metricLiqShort', fmtNumber(getFeatureValue(feature, ['liq_short_vol', 'liqShortVol'], 0), 6));
+    setText('metricTakerBuy', fmtPct(getFeatureValue(feature, ['taker_buy_ratio', 'takerBuyRatio'], 0), 2));
     setText('metricAge', `P:${fmtAge(feature.price_age_ms)} D:${fmtAge(feature.depth_age_ms)} M:${fmtAge(feature.mark_price_age_ms)}`);
 
     renderActiveTradeBox(activeTrade);
@@ -343,15 +573,18 @@ function renderActiveTradeBox(activeTrade) {
         return;
     }
 
+    const openMs = getTradeTimeMs(activeTrade, true);
+    const duration = openMs ? Date.now() - openMs : activeTrade.durationMs;
+
     box.innerHTML = `
         <h3>Lệnh đang mở</h3>
         <div class="active-trade-grid">
-            <div><span>Side</span><strong class="${activeTrade.type === 'LONG' ? 'text-long' : 'text-short'}">${activeTrade.type}</strong></div>
-            <div><span>Entry</span><strong>${fmtNumber(activeTrade.entryPrice, 8)}</strong></div>
+            <div><span>Side</span><strong class="${activeTrade.type === 'LONG' ? 'text-long' : 'text-short'}">${escapeHtml(activeTrade.type)}</strong></div>
+            <div><span>Entry</span><strong>${fmtPrice(activeTrade.executedEntryPrice ?? activeTrade.entryPrice)}</strong></div>
             <div><span>Lev</span><strong>${activeTrade.leverage || '--'}x</strong></div>
             <div><span>Prob</span><strong>${fmtProb(activeTrade.prob)}</strong></div>
             <div><span>Margin</span><strong>${fmtNumber(activeTrade.margin, 3)}</strong></div>
-            <div><span>Mode</span><strong>${activeTrade.mode || '--'}</strong></div>
+            <div><span>Age</span><strong>${fmtDuration(duration)}</strong></div>
         </div>
     `;
 }
@@ -368,24 +601,30 @@ function renderTrades() {
 function renderOpenTrades() {
     const body = $('openTradesBody');
     if (!body) return;
-    setText('openTradesSubtitle', `${state.openTrades.length} open trades`);
 
-    if (state.openTrades.length === 0) {
-        body.innerHTML = '<tr><td colspan="7" class="empty-cell">Chưa có lệnh mở.</td></tr>';
+    const openTrades = (state.openTrades || []).filter(t => String(t.status || 'OPEN').toUpperCase() === 'OPEN');
+    setText('openTradesSubtitle', `${openTrades.length} open trades`);
+
+    if (openTrades.length === 0) {
+        body.innerHTML = '<tr><td colspan="8" class="empty-cell">Chưa có lệnh mở.</td></tr>';
         return;
     }
 
-    body.innerHTML = state.openTrades.map(t => `
-        <tr data-symbol="${escapeHtml(t.symbol)}">
-            <td><strong>${escapeHtml(t.symbol)}</strong></td>
-            <td class="${t.type === 'LONG' ? 'text-long' : 'text-short'}">${escapeHtml(t.type)}</td>
-            <td>${fmtNumber(t.entryPrice, 8)}</td>
-            <td>${t.leverage || '--'}x</td>
-            <td>${fmtProb(t.prob)}</td>
-            <td>${fmtNumber(t.margin, 3)}</td>
-            <td>${escapeHtml(t.mode || '--')}</td>
-        </tr>
-    `).join('');
+    body.innerHTML = openTrades.map(t => {
+        const openMs = getTradeTimeMs(t, true);
+        return `
+            <tr data-symbol="${escapeHtml(t.symbol)}">
+                <td><strong>${escapeHtml(t.symbol)}</strong></td>
+                <td class="${t.type === 'LONG' ? 'text-long' : 'text-short'}">${escapeHtml(t.type)}</td>
+                <td>${fmtPrice(t.executedEntryPrice ?? t.entryPrice)}</td>
+                <td>${t.leverage || '--'}x</td>
+                <td>${fmtProb(t.prob)}</td>
+                <td>${fmtNumber(t.margin, 3)}</td>
+                <td>${fmtDuration(openMs ? Date.now() - openMs : t.durationMs)}</td>
+                <td>${escapeHtml(t.mode || '--')}</td>
+            </tr>
+        `;
+    }).join('');
 
     body.querySelectorAll('tr[data-symbol]').forEach(row => row.addEventListener('click', () => selectSymbol(row.dataset.symbol)));
 }
@@ -396,7 +635,7 @@ function renderClosedTrades() {
     setText('closedTradesSubtitle', `${state.closedTrades.length} recent closed trades`);
 
     if (state.closedTrades.length === 0) {
-        body.innerHTML = '<tr><td colspan="7" class="empty-cell">Chưa có lịch sử lệnh.</td></tr>';
+        body.innerHTML = '<tr><td colspan="8" class="empty-cell">Chưa có lịch sử lệnh.</td></tr>';
         return;
     }
 
@@ -406,10 +645,11 @@ function renderClosedTrades() {
             <tr data-symbol="${escapeHtml(t.symbol)}">
                 <td><strong>${escapeHtml(t.symbol)}</strong></td>
                 <td class="${t.type === 'LONG' ? 'text-long' : 'text-short'}">${escapeHtml(t.type)}</td>
-                <td>${fmtNumber(t.entryPrice, 8)}</td>
-                <td>${fmtNumber(t.closePrice, 8)}</td>
+                <td>${fmtPrice(t.executedEntryPrice ?? t.entryPrice)}</td>
+                <td>${fmtPrice(t.executedClosePrice ?? t.closePrice)}</td>
                 <td class="${pnl >= 0 ? 'text-long' : 'text-short'}">${fmtNumber(pnl, 4)}</td>
                 <td>${fmtNumber(t.roi, 2)}%</td>
+                <td>${fmtDuration(t.durationMs)}</td>
                 <td title="${escapeHtml(t.reason || '')}">${escapeHtml(t.reason || '--')}</td>
             </tr>
         `;
@@ -479,7 +719,7 @@ socket.on('disconnect', () => {
 });
 
 socket.on('watchlist:update', payload => {
-    state.watchlist = payload?.symbols || [];
+    state.watchlist = (payload?.symbols || []).filter(item => String(item.status || '').toUpperCase() !== 'LOST');
     renderWatchlist();
     renderSelectedSymbolFromState();
 
@@ -493,8 +733,9 @@ socket.on('symbol:snapshot', payload => {
     state.symbolSnapshots.set(payload.symbol, payload);
 
     if (payload.symbol === state.selectedSymbol) {
-        setChartCandles(payload.candles || []);
+        setChartCandles(payload.candles || [], payload.markers || []);
         state.aiTimeline = payload.aiTimeline || [];
+        state.chartMarkers = payload.markers || [];
         renderActiveTradeBox(payload.openTrade);
         if (payload.state?.feature) renderMetrics(payload.state.feature, payload.openTrade);
         if (payload.state?.prediction) renderAi(payload.state.prediction.long, payload.state.prediction.short);
@@ -511,22 +752,31 @@ socket.on('symbol:update', payload => {
         prediction: payload.prediction,
         status: payload.status
     };
-    existing.openTrade = payload.activeTrade || existing.openTrade || null;
+    existing.openTrade = payload.activeTrade || null;
     state.symbolSnapshots.set(payload.symbol, existing);
 
     if (payload.symbol === state.selectedSymbol) {
         updateLiveCandle(payload.candle);
         renderMetrics(payload.feature, payload.activeTrade);
         renderAi(payload.prediction?.long, payload.prediction?.short);
-        setText('selectedPriceBadge', `Price: ${fmtNumber(payload.feature?.last_price, 8)}`);
-        setText('selectedMarkBadge', `Mark: ${fmtNumber(payload.feature?.mark_price, 8)}`);
+        setText('selectedPriceBadge', `Price: ${fmtPrice(getFeatureValue(payload.feature, ['last_price', 'lastPrice', 'price', 'close'], null))}`);
+        setText('selectedMarkBadge', `Mark: ${fmtPrice(getFeatureValue(payload.feature, ['mark_price', 'markPrice'], null))}`);
         setText('selectedStatusBadge', payload.status || '--');
-        $('selectedStatusBadge').className = `pill ${classForStatus(payload.status)}`;
+        const badge = $('selectedStatusBadge');
+        if (badge) badge.className = `pill ${classForStatus(payload.status)}`;
     }
 });
 
 socket.on('prediction:update', payload => {
     if (!payload || !payload.symbol) return;
+
+    const existing = state.symbolSnapshots.get(payload.symbol) || { symbol: payload.symbol };
+    existing.state = {
+        ...(existing.state || {}),
+        prediction: payload.prediction
+    };
+    state.symbolSnapshots.set(payload.symbol, existing);
+
     if (payload.symbol === state.selectedSymbol) {
         renderAi(payload.prediction?.long, payload.prediction?.short);
     }
@@ -537,6 +787,10 @@ socket.on('trades:update', payload => {
     state.closedTrades = payload?.closed || [];
     renderTrades();
     renderSelectedSymbolFromState();
+
+    if (state.selectedSymbol) {
+        socket.emit('symbol:select', state.selectedSymbol);
+    }
 });
 
 socket.on('account:update', payload => {
