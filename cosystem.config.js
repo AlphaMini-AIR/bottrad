@@ -101,7 +101,8 @@ module.exports = {
     {
       name: "hourly-learning",
       script: "src/training/hourly_self_learning.py",
-      interpreter: "python3",
+      interpreter: "/root/bottrad/.venv/bin/python",
+      args: "--loop",
       autorestart: true,
       watch: false,
       max_memory_restart: "1200M",
