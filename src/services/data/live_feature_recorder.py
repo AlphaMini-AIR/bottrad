@@ -1,13 +1,16 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import asyncio
+import gc
 import gzip
 import json
 import os
-import signal
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict, List, Tuple, Optional
 
 import msgpack
 import redis.asyncio as aioredis
@@ -17,65 +20,64 @@ load_dotenv()
 
 
 # ============================================================
-# LIVE FEATURE RECORDER V1
+# REDIS ARCHIVE EXPORTER V1 - SAFE SSD EXPORT
 # ------------------------------------------------------------
-# Vai trò:
-# 1. Nghe Redis pubsub market:features:* từ FeedHandler.
-# 2. Decode msgpack feature realtime.
-# 3. Chỉ lấy latest snapshot mỗi symbol theo nhịp 1 giây.
-# 4. Ghi ra file .jsonl.gz để tải về train thủ công.
-# 5. Không can thiệp OrderManager, không ảnh hưởng trading.
+# Nhiệm vụ:
+# 1. Đọc dữ liệu từ Redis Stream features:archive.
+# 2. Không lấy dữ liệu 1 giờ gần nhất.
+# 3. Ghi ra SSD dạng .jsonl.gz:
+#    - ghi file .tmp trước
+#    - đóng gzip hoàn chỉnh
+#    - fsync
+#    - rename atomically thành .jsonl.gz
+#    - ghi manifest
+# 4. Sau khi file + manifest thành công mới XDEL dữ liệu Redis.
+# 5. Sau khi export xong, XTRIM MINID để Redis dọn RAM.
+# 6. Log rõ tiến độ.
 #
-# Output:
-# data/live_features/YYYY-MM-DD/HH/SYMBOL.jsonl.gz
-#
-# Mỗi dòng là 1 JSON record:
-# {
-#   "_capture_id": "...",
-#   "_snapshot_ts": 1710000000000,
-#   "_recorder_ts": 1710000000123,
-#   "_channel": "market:features:BTCUSDT",
-#   "symbol": "BTCUSDT",
-#   "feature_ts": ...,
-#   ...
-# }
+# Lưu ý:
+# - File này dành cho Redis Stream.
+# - Key mặc định: features:archive.
+# - Không dùng Pub/Sub.
 # ============================================================
 
 
 # ============================================================
-# 1. CONFIG
+# 1. CẤU HÌNH CỨNG
 # ============================================================
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-FEATURE_PATTERN = os.getenv("FEATURE_PATTERN", "market:features:*")
+# Redis vẫn có thể lấy từ .env để bạn không phải hard-code host nếu đổi VPS.
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379")
 
-DATA_DIR = Path(os.getenv("RECORDER_DATA_DIR", "./data/live_features"))
+# Redis Stream chứa dữ liệu live archive.
+ARCHIVE_KEY = "features:archive"
 
-# Nhịp ghi snapshot. Với mục tiêu train 1s, để 1.0.
-SNAPSHOT_INTERVAL_SEC = float(os.getenv("SNAPSHOT_INTERVAL_SEC", "1.0"))
+# Thư mục SSD lưu dữ liệu đã export.
+EXPORT_DIR = Path("./data/live_features_archive")
 
-# Nếu feature cũ quá số giây này thì không ghi.
-MAX_FEATURE_STALE_SEC = float(os.getenv("MAX_FEATURE_STALE_SEC", "3.0"))
+# File manifest ghi lại các batch đã export thành công.
+MANIFEST_FILE = Path("./data/live_features_archive/_manifest.jsonl")
 
-# Flush file mỗi N dòng để giảm mất dữ liệu nếu crash.
-FLUSH_EVERY_N_RECORDS = int(os.getenv("FLUSH_EVERY_N_RECORDS", "100"))
+# Không export dữ liệu 1 giờ gần nhất để tránh đụng dữ liệu đang ghi realtime.
+SKIP_RECENT_SEC = 3600
 
-# Log thống kê mỗi N giây.
-STATS_INTERVAL_SEC = float(os.getenv("STATS_INTERVAL_SEC", "30"))
+# Mỗi batch đọc bao nhiêu dòng từ Redis Stream.
+BATCH_SIZE = 5000
 
-# Giới hạn số symbol đang giữ trong RAM để tránh lỗi bất thường.
-MAX_SYMBOLS_IN_RAM = int(os.getenv("MAX_SYMBOLS_IN_RAM", "500"))
+# Sau khi export file thành công thì xóa từng ID khỏi Redis.
+DELETE_AFTER_EXPORT = True
 
-# Nếu disk free thấp hơn mức này thì cảnh báo.
-MIN_FREE_DISK_GB = float(os.getenv("MIN_FREE_DISK_GB", "2.0"))
+# Sau khi export hết dữ liệu cũ hơn cutoff thì XTRIM MINID để Redis dọn RAM.
+TRIM_AFTER_EXPORT = True
 
-# Có ghi cả feature không warm không?
-# Khuyên false để dataset sạch hơn.
-RECORD_NOT_WARM = os.getenv("RECORD_NOT_WARM", "false").lower() == "true"
+# Dừng nếu ổ cứng trống dưới ngưỡng này.
+MIN_FREE_DISK_GB = 2.0
 
-# Có ghi pretty JSON không?
-# Luôn false khi chạy thật để tiết kiệm dung lượng.
-PRETTY_JSON = os.getenv("PRETTY_JSON", "false").lower() == "true"
+# Chạy thử, không ghi/xóa. Khi chạy thật để False.
+DRY_RUN = False
+
+# Version.
+EXPORT_VERSION = "redis_archive_exporter_v1_hardcoded"
 
 
 # ============================================================
@@ -85,60 +87,105 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def utc_date_hour(ts_ms: Optional[int] = None):
+def utc_parts(ts_ms: Optional[int] = None) -> Dict[str, str]:
     if ts_ms is None:
         ts_ms = now_ms()
 
     dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
-    date_str = dt.strftime("%Y-%m-%d")
-    hour_str = dt.strftime("%H")
-    iso_str = dt.isoformat()
-    return date_str, hour_str, iso_str
+
+    return {
+        "date": dt.strftime("%Y-%m-%d"),
+        "hour": dt.strftime("%H"),
+        "iso": dt.isoformat(),
+        "compact": dt.strftime("%Y%m%dT%H%M%S")
+    }
 
 
-def normalize_symbol(symbol: Any) -> str:
-    return str(symbol or "").upper().strip()
+def stream_id_to_ms(stream_id: Any) -> int:
+    if isinstance(stream_id, bytes):
+        stream_id = stream_id.decode("utf-8", errors="replace")
 
+    text = str(stream_id)
 
-def safe_number(value, fallback=0):
     try:
-        if value is None:
-            return fallback
-        n = float(value)
-        if n != n:
-            return fallback
-        return n
+        return int(text.split("-")[0])
     except Exception:
-        return fallback
+        return 0
 
 
-def get_feature_ts_ms(feature: Dict[str, Any]) -> int:
+def stream_id_to_str(stream_id: Any) -> str:
+    if isinstance(stream_id, bytes):
+        return stream_id.decode("utf-8", errors="replace")
+    return str(stream_id)
+
+
+def safe_decode_bytes(value: Any) -> Any:
+    if not isinstance(value, (bytes, bytearray)):
+        return value
+
+    raw = bytes(value)
+
+    # 1. Thử decode msgpack.
+    try:
+        return msgpack.unpackb(raw, raw=False)
+    except Exception:
+        pass
+
+    # 2. Thử decode UTF-8 / JSON.
+    try:
+        text = raw.decode("utf-8", errors="replace")
+        stripped = text.strip()
+
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                return json.loads(stripped)
+            except Exception:
+                return text
+
+        return text
+    except Exception:
+        return str(raw)
+
+
+def normalize_stream_fields(fields: Dict[Any, Any]) -> Dict[str, Any]:
     """
-    Feed V20 có feature_ts.
-    Nếu thiếu thì fallback sang timestamp/ts.
-    Nếu vẫn thiếu thì dùng recorder time.
+    Redis Stream có thể lưu theo nhiều kiểu:
+    - data: msgpack bytes
+    - feature: json/msgpack
+    - payload: json/msgpack
+    - hoặc nhiều field flat.
+    Hàm này cố decode linh hoạt.
     """
-    candidates = [
-        feature.get("feature_ts"),
-        feature.get("ts"),
-        feature.get("timestamp"),
-        feature.get("event_time"),
-        feature.get("last_update_ts"),
-    ]
+    clean = {}
 
-    for value in candidates:
-        n = safe_number(value, 0)
-        if n > 0:
-            # Nếu timestamp dạng giây.
-            if n < 1e12:
-                return int(n * 1000)
-            return int(n)
+    for k, v in fields.items():
+        key = k.decode("utf-8", errors="replace") if isinstance(k, bytes) else str(k)
+        clean[key] = safe_decode_bytes(v)
 
-    return now_ms()
+    # Nếu toàn bộ feature nằm trong một field container.
+    for container_key in ["data", "feature", "payload", "json", "msgpack"]:
+        val = clean.get(container_key)
+
+        if isinstance(val, dict):
+            merged = dict(val)
+            merged["_archive_container_key"] = container_key
+            return merged
+
+        if isinstance(val, str):
+            stripped = val.strip()
+            if stripped.startswith("{"):
+                try:
+                    merged = json.loads(stripped)
+                    merged["_archive_container_key"] = container_key
+                    return merged
+                except Exception:
+                    pass
+
+    return clean
 
 
-def is_feature_warm(feature: Dict[str, Any]) -> bool:
-    return bool(feature.get("is_warm", False))
+def json_dumps(record: Dict[str, Any]) -> str:
+    return json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
 def disk_free_gb(path: Path) -> float:
@@ -150,79 +197,44 @@ def disk_free_gb(path: Path) -> float:
         return 999.0
 
 
-def json_dumps(record: Dict[str, Any]) -> str:
-    if PRETTY_JSON:
-        return json.dumps(record, ensure_ascii=False, indent=2, default=str)
-    return json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str)
+def fsync_file(path: Path):
+    with open(path, "rb") as f:
+        os.fsync(f.fileno())
+
+
+def append_manifest(record: Dict[str, Any]):
+    MANIFEST_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(MANIFEST_FILE, "a", encoding="utf-8") as f:
+        f.write(json_dumps(record))
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def build_export_paths(start_id: str, end_id: str, count: int, cutoff_ms: int) -> Tuple[Path, Path]:
+    start_ms = stream_id_to_ms(start_id) or cutoff_ms
+    parts = utc_parts(start_ms)
+
+    folder = EXPORT_DIR / parts["date"] / parts["hour"]
+    folder.mkdir(parents=True, exist_ok=True)
+
+    safe_start = start_id.replace("-", "_")
+    safe_end = end_id.replace("-", "_")
+
+    base_name = f"{ARCHIVE_KEY.replace(':', '_')}_{safe_start}_{safe_end}_{count}"
+    final_path = folder / f"{base_name}.jsonl.gz"
+    tmp_path = folder / f"{base_name}.jsonl.gz.tmp"
+
+    return tmp_path, final_path
 
 
 # ============================================================
-# 3. ROTATING JSONL.GZ WRITER
+# 3. EXPORTER
 # ============================================================
-class JsonlGzipWriter:
-    """
-    Giữ file handle mở theo path hiện tại để giảm overhead.
-    Mỗi symbol mỗi giờ là một file riêng:
-    data/live_features/YYYY-MM-DD/HH/SYMBOL.jsonl.gz
-    """
-
-    def __init__(self, base_dir: Path):
-        self.base_dir = base_dir
-        self.handles = {}
-        self.write_counts = {}
-        self.total_written = 0
-
-    def _get_path(self, symbol: str, snapshot_ts: int) -> Path:
-        date_str, hour_str, _ = utc_date_hour(snapshot_ts)
-        folder = self.base_dir / date_str / hour_str
-        folder.mkdir(parents=True, exist_ok=True)
-        return folder / f"{symbol}.jsonl.gz"
-
-    def write(self, symbol: str, snapshot_ts: int, record: Dict[str, Any]):
-        path = self._get_path(symbol, snapshot_ts)
-        key = str(path)
-
-        handle = self.handles.get(key)
-        if handle is None:
-            handle = gzip.open(path, mode="at", encoding="utf-8")
-            self.handles[key] = handle
-            self.write_counts[key] = 0
-
-        line = json_dumps(record)
-        handle.write(line)
-        handle.write("\n")
-
-        self.write_counts[key] += 1
-        self.total_written += 1
-
-        if self.write_counts[key] % FLUSH_EVERY_N_RECORDS == 0:
-            handle.flush()
-
-    def flush_all(self):
-        for handle in self.handles.values():
-            try:
-                handle.flush()
-            except Exception:
-                pass
-
-    def close_all(self):
-        for handle in self.handles.values():
-            try:
-                handle.flush()
-                handle.close()
-            except Exception:
-                pass
-
-        self.handles.clear()
-        self.write_counts.clear()
-
-
-# ============================================================
-# 4. RECORDER
-# ============================================================
-class LiveFeatureRecorder:
+class RedisArchiveExporter:
     def __init__(self):
-        self.capture_id = str(uuid.uuid4())
+        self.export_id = str(uuid.uuid4())
 
         self.redis = aioredis.from_url(
             REDIS_URL,
@@ -232,284 +244,293 @@ class LiveFeatureRecorder:
             retry_on_timeout=True,
         )
 
-        self.writer = JsonlGzipWriter(DATA_DIR)
-
-        # latest_by_symbol chỉ giữ snapshot mới nhất trong RAM.
-        self.latest_by_symbol: Dict[str, Dict[str, Any]] = {}
-
-        # Chống ghi trùng cùng feature_ts/symbol.
-        self.last_written_feature_ts: Dict[str, int] = {}
-
-        self.running = True
-
         self.stats = {
-            "received": 0,
-            "decoded": 0,
-            "invalid": 0,
-            "written": 0,
-            "skipped_stale": 0,
-            "skipped_not_warm": 0,
-            "skipped_duplicate": 0,
-            "started_at": now_ms(),
-            "last_log_at": now_ms(),
+            "read": 0,
+            "exported": 0,
+            "deleted": 0,
+            "batches": 0,
+            "files": 0,
+            "errors": 0,
+            "started_at_ms": now_ms()
         }
 
-    async def stop(self):
-        self.running = False
-        self.writer.flush_all()
-        self.writer.close_all()
-
+    async def close(self):
         try:
             await self.redis.close()
         except Exception:
             pass
 
-    def _extract_symbol_from_channel(self, channel: bytes) -> str:
-        try:
-            text = channel.decode("utf-8") if isinstance(channel, bytes) else str(channel)
-            # market:features:BTCUSDT
-            return normalize_symbol(text.split(":")[-1])
-        except Exception:
-            return ""
+    async def check_key(self):
+        key_type = await self.redis.type(ARCHIVE_KEY)
 
-    def _sanitize_feature(self, feature: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Giữ gần như toàn bộ field Feed V20 để train.
-        Chỉ thêm metadata recorder.
-        """
-        if not isinstance(feature, dict):
-            return {}
+        if isinstance(key_type, bytes):
+            key_type = key_type.decode("utf-8", errors="replace")
 
-        # Convert bytes key/value nếu có.
-        clean = {}
-
-        for k, v in feature.items():
-            key = k.decode("utf-8") if isinstance(k, bytes) else str(k)
-
-            if isinstance(v, bytes):
-                try:
-                    clean[key] = v.decode("utf-8")
-                except Exception:
-                    clean[key] = str(v)
-            else:
-                clean[key] = v
-
-        return clean
-
-    async def handle_message(self, channel: bytes, message: bytes):
-        self.stats["received"] += 1
-
-        try:
-            feature = msgpack.unpackb(message, raw=False)
-        except Exception:
-            self.stats["invalid"] += 1
-            return
-
-        feature = self._sanitize_feature(feature)
-        if not feature:
-            self.stats["invalid"] += 1
-            return
-
-        symbol = normalize_symbol(feature.get("symbol")) or self._extract_symbol_from_channel(channel)
-        if not symbol:
-            self.stats["invalid"] += 1
-            return
-
-        if len(self.latest_by_symbol) >= MAX_SYMBOLS_IN_RAM and symbol not in self.latest_by_symbol:
-            self.stats["invalid"] += 1
-            return
-
-        recorder_ts = now_ms()
-        feature_ts = get_feature_ts_ms(feature)
-
-        feature["_capture_id"] = self.capture_id
-        feature["_recorder_ts"] = recorder_ts
-        feature["_channel"] = channel.decode("utf-8") if isinstance(channel, bytes) else str(channel)
-        feature["_feature_age_ms_at_receive"] = max(0, recorder_ts - feature_ts)
-
-        self.latest_by_symbol[symbol] = feature
-        self.stats["decoded"] += 1
-
-    def _build_snapshot_record(self, symbol: str, feature: Dict[str, Any], snapshot_ts: int) -> Optional[Dict[str, Any]]:
-        feature_ts = get_feature_ts_ms(feature)
-        age_sec = (snapshot_ts - feature_ts) / 1000
-
-        if age_sec > MAX_FEATURE_STALE_SEC:
-            self.stats["skipped_stale"] += 1
-            return None
-
-        if not RECORD_NOT_WARM and not is_feature_warm(feature):
-            self.stats["skipped_not_warm"] += 1
-            return None
-
-        last_feature_ts = self.last_written_feature_ts.get(symbol)
-        if last_feature_ts == feature_ts:
-            self.stats["skipped_duplicate"] += 1
-            return None
-
-        _, _, snapshot_iso = utc_date_hour(snapshot_ts)
-
-        record = dict(feature)
-
-        record["_capture_id"] = self.capture_id
-        record["_snapshot_ts"] = snapshot_ts
-        record["_snapshot_iso"] = snapshot_iso
-        record["_snapshot_interval_sec"] = SNAPSHOT_INTERVAL_SEC
-        record["_feature_age_ms_at_snapshot"] = max(0, snapshot_ts - feature_ts)
-        record["_recorder_version"] = "live_feature_recorder_v1"
-
-        # Đảm bảo symbol chuẩn.
-        record["symbol"] = symbol
-
-        self.last_written_feature_ts[symbol] = feature_ts
-        return record
-
-    async def snapshot_loop(self):
-        print("💾 [RECORDER] Snapshot loop started")
-
-        next_tick = time.time()
-
-        while self.running:
-            now = time.time()
-
-            if now < next_tick:
-                await asyncio.sleep(min(0.05, next_tick - now))
-                continue
-
-            snapshot_ts = now_ms()
-
-            free_gb = disk_free_gb(DATA_DIR)
-            if free_gb < MIN_FREE_DISK_GB:
-                print(f"🚨 [DISK] Free disk thấp: {free_gb:.2f}GB < {MIN_FREE_DISK_GB}GB. Tạm ngưng ghi vòng này.")
-                await asyncio.sleep(5)
-                next_tick = time.time() + SNAPSHOT_INTERVAL_SEC
-                continue
-
-            items = list(self.latest_by_symbol.items())
-
-            for symbol, feature in items:
-                record = self._build_snapshot_record(symbol, feature, snapshot_ts)
-                if not record:
-                    continue
-
-                try:
-                    self.writer.write(symbol, snapshot_ts, record)
-                    self.stats["written"] += 1
-                except Exception as e:
-                    print(f"⚠️ [WRITE] Lỗi ghi {symbol}: {e}")
-
-            next_tick += SNAPSHOT_INTERVAL_SEC
-
-            # Nếu loop bị trễ quá nhiều, reset lại nhịp để không backlog.
-            if time.time() - next_tick > 3:
-                next_tick = time.time() + SNAPSHOT_INTERVAL_SEC
-
-    async def redis_listener_loop(self):
-        print(f"📡 [REDIS] Connecting {REDIS_URL}")
-        print(f"📡 [REDIS] PSubscribe {FEATURE_PATTERN}")
-
-        while self.running:
-            pubsub = None
-
-            try:
-                pubsub = self.redis.pubsub()
-                await pubsub.psubscribe(FEATURE_PATTERN)
-
-                print("✅ [REDIS] Recorder listening")
-
-                async for message in pubsub.listen():
-                    if not self.running:
-                        break
-
-                    if message.get("type") != "pmessage":
-                        continue
-
-                    channel = message.get("channel")
-                    data = message.get("data")
-
-                    if not channel or not data:
-                        continue
-
-                    await self.handle_message(channel, data)
-
-            except Exception as e:
-                print(f"⚠️ [REDIS] Listener error: {e}. Retry sau 3s...")
-                await asyncio.sleep(3)
-
-            finally:
-                try:
-                    if pubsub:
-                        await pubsub.close()
-                except Exception:
-                    pass
-
-    async def stats_loop(self):
-        while self.running:
-            await asyncio.sleep(STATS_INTERVAL_SEC)
-
-            uptime_sec = max(1, (now_ms() - self.stats["started_at"]) / 1000)
-            active_symbols = len(self.latest_by_symbol)
-            free_gb = disk_free_gb(DATA_DIR)
-
-            print(
-                "📊 [RECORDER] "
-                f"uptime={uptime_sec:.0f}s "
-                f"symbols={active_symbols} "
-                f"received={self.stats['received']} "
-                f"decoded={self.stats['decoded']} "
-                f"written={self.stats['written']} "
-                f"stale={self.stats['skipped_stale']} "
-                f"notWarm={self.stats['skipped_not_warm']} "
-                f"dup={self.stats['skipped_duplicate']} "
-                f"openFiles={len(self.writer.handles)} "
-                f"diskFree={free_gb:.2f}GB "
-                f"dir={DATA_DIR}"
+        if key_type != "stream":
+            raise RuntimeError(
+                f"Redis key {ARCHIVE_KEY} hiện là type={key_type}, không phải stream. "
+                f"File này chỉ dùng cho Redis Stream."
             )
 
-            self.writer.flush_all()
+        length = await self.redis.xlen(ARCHIVE_KEY)
+        return key_type, length
 
-    async def run(self):
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-        print("🚀 [LIVE FEATURE RECORDER V1] Starting...")
-        print(f"⚙️ capture_id={self.capture_id}")
-        print(f"⚙️ redis={REDIS_URL}")
-        print(f"⚙️ pattern={FEATURE_PATTERN}")
-        print(f"⚙️ data_dir={DATA_DIR.resolve()}")
-        print(f"⚙️ snapshot={SNAPSHOT_INTERVAL_SEC}s stale<={MAX_FEATURE_STALE_SEC}s warmOnly={not RECORD_NOT_WARM}")
-
-        await asyncio.gather(
-            self.redis_listener_loop(),
-            self.snapshot_loop(),
-            self.stats_loop(),
+    async def fetch_batch(self, cutoff_id: str):
+        """
+        Luôn đọc từ đầu stream đến cutoff.
+        Vì mỗi batch export xong sẽ XDEL, batch sau lại đọc từ đầu.
+        """
+        return await self.redis.xrange(
+            ARCHIVE_KEY,
+            min="-",
+            max=cutoff_id,
+            count=BATCH_SIZE
         )
 
+    def convert_entries_to_records(self, entries) -> List[Dict[str, Any]]:
+        records = []
+        seen_ids = set()
+
+        for stream_id_raw, fields in entries:
+            stream_id = stream_id_to_str(stream_id_raw)
+
+            if stream_id in seen_ids:
+                continue
+
+            seen_ids.add(stream_id)
+
+            feature = normalize_stream_fields(fields)
+
+            if not isinstance(feature, dict):
+                feature = {
+                    "raw_value": str(feature)
+                }
+
+            record = dict(feature)
+
+            record["_redis_key"] = ARCHIVE_KEY
+            record["_redis_stream_id"] = stream_id
+            record["_redis_stream_ms"] = stream_id_to_ms(stream_id)
+            record["_export_id"] = self.export_id
+            record["_export_version"] = EXPORT_VERSION
+            record["_exported_at_ms"] = now_ms()
+            record["_exported_at_iso"] = utc_parts(now_ms())["iso"]
+
+            records.append(record)
+
+        return records
+
+    def write_records_atomic(self, records: List[Dict[str, Any]], cutoff_ms: int) -> Path:
+        if not records:
+            raise RuntimeError("No records to write")
+
+        start_id = records[0]["_redis_stream_id"]
+        end_id = records[-1]["_redis_stream_id"]
+
+        tmp_path, final_path = build_export_paths(start_id, end_id, len(records), cutoff_ms)
+
+        # Nếu final đã tồn tại nghĩa là batch id-range này đã ghi trước đó.
+        # Không ghi lại để tránh trùng file.
+        if final_path.exists():
+            print(f"♻️ [SKIP FILE EXISTS] {final_path}")
+            return final_path
+
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+        with gzip.open(tmp_path, "wt", encoding="utf-8") as f:
+            for record in records:
+                f.write(json_dumps(record))
+                f.write("\n")
+
+            f.flush()
+
+        # Gzip đã close. Fsync file .tmp.
+        fsync_file(tmp_path)
+
+        # Atomic rename.
+        os.replace(tmp_path, final_path)
+
+        # Fsync file final.
+        fsync_file(final_path)
+
+        return final_path
+
+    async def delete_stream_ids(self, ids: List[str]) -> int:
+        if not ids:
+            return 0
+
+        if DRY_RUN or not DELETE_AFTER_EXPORT:
+            return 0
+
+        deleted = 0
+        chunk_size = 1000
+
+        for i in range(0, len(ids), chunk_size):
+            chunk = ids[i:i + chunk_size]
+            result = await self.redis.xdel(ARCHIVE_KEY, *chunk)
+            deleted += int(result or 0)
+
+        return deleted
+
+    async def trim_stream(self, cutoff_id: str):
+        if DRY_RUN or not TRIM_AFTER_EXPORT:
+            return
+
+        try:
+            # MINID giúp Redis dọn entries cũ hơn cutoff.
+            result = await self.redis.execute_command("XTRIM", ARCHIVE_KEY, "MINID", cutoff_id)
+            print(f"🧹 [XTRIM] MINID {cutoff_id} result={result}")
+        except Exception as e:
+            print(f"⚠️ [XTRIM] Không trim được: {e}")
+
+    async def export_once(self):
+        key_type, initial_len = await self.check_key()
+
+        cutoff_ms = now_ms() - SKIP_RECENT_SEC * 1000
+        cutoff_id = f"{cutoff_ms}-999999"
+
+        print("")
+        print("============================================================")
+        print("🚚 REDIS ARCHIVE EXPORT START")
+        print("============================================================")
+        print(f"redis={REDIS_URL}")
+        print(f"key={ARCHIVE_KEY} type={key_type} initial_len={initial_len}")
+        print(f"output_dir={EXPORT_DIR.resolve()}")
+        print(f"manifest={MANIFEST_FILE.resolve()}")
+        print(f"skip_recent={SKIP_RECENT_SEC}s")
+        print(f"cutoff_id={cutoff_id} cutoff_iso={utc_parts(cutoff_ms)['iso']}")
+        print(f"batch_size={BATCH_SIZE}")
+        print(f"delete_after_export={DELETE_AFTER_EXPORT}")
+        print(f"trim_after_export={TRIM_AFTER_EXPORT}")
+        print(f"dry_run={DRY_RUN}")
+        print("============================================================")
+        print("")
+
+        if initial_len <= 0:
+            print("ℹ️ Stream rỗng, không có gì để export")
+            return
+
+        while True:
+            free_gb = disk_free_gb(EXPORT_DIR)
+
+            if free_gb < MIN_FREE_DISK_GB:
+                raise RuntimeError(
+                    f"Disk free thấp: {free_gb:.2f}GB < {MIN_FREE_DISK_GB}GB. Dừng để an toàn."
+                )
+
+            entries = await self.fetch_batch(cutoff_id)
+
+            if not entries:
+                print("✅ Không còn dữ liệu cũ hơn cutoff để export")
+                break
+
+            self.stats["batches"] += 1
+            batch_no = self.stats["batches"]
+
+            ids = [stream_id_to_str(e[0]) for e in entries]
+            first_id = ids[0]
+            last_id = ids[-1]
+
+            current_len_before = await self.redis.xlen(ARCHIVE_KEY)
+
+            print(
+                f"📥 [BATCH {batch_no}] "
+                f"read={len(entries)} "
+                f"range={first_id} → {last_id} "
+                f"stream_len_before={current_len_before}"
+            )
+
+            records = self.convert_entries_to_records(entries)
+            self.stats["read"] += len(records)
+
+            if DRY_RUN:
+                print(f"🧪 [DRY RUN] would_export={len(records)} would_delete={len(ids)}")
+                break
+
+            try:
+                final_path = self.write_records_atomic(records, cutoff_ms)
+
+                manifest_record = {
+                    "export_id": self.export_id,
+                    "export_version": EXPORT_VERSION,
+                    "redis_key": ARCHIVE_KEY,
+                    "first_id": first_id,
+                    "last_id": last_id,
+                    "records": len(records),
+                    "file": str(final_path),
+                    "cutoff_id": cutoff_id,
+                    "cutoff_ms": cutoff_ms,
+                    "cutoff_iso": utc_parts(cutoff_ms)["iso"],
+                    "completed_at_ms": now_ms(),
+                    "completed_at_iso": utc_parts(now_ms())["iso"]
+                }
+
+                append_manifest(manifest_record)
+
+                deleted = await self.delete_stream_ids(ids)
+
+                self.stats["exported"] += len(records)
+                self.stats["deleted"] += deleted
+                self.stats["files"] += 1
+
+                current_len_after = await self.redis.xlen(ARCHIVE_KEY)
+
+                print(
+                    f"✅ [BATCH {batch_no} DONE] "
+                    f"file={final_path} "
+                    f"exported={len(records)} "
+                    f"deleted={deleted} "
+                    f"stream_len_after={current_len_after} "
+                    f"total_exported={self.stats['exported']} "
+                    f"total_deleted={self.stats['deleted']}"
+                )
+
+            except Exception as e:
+                self.stats["errors"] += 1
+                print(f"❌ [BATCH {batch_no} ERROR] {e}")
+                print("⚠️ Không xóa Redis IDs vì export batch chưa hoàn tất")
+                raise
+
+            # Dọn RAM Python sau mỗi batch.
+            del entries
+            del records
+            del ids
+            gc.collect()
+
+        await self.trim_stream(cutoff_id)
+
+        final_len = await self.redis.xlen(ARCHIVE_KEY)
+        runtime_sec = (now_ms() - self.stats["started_at_ms"]) / 1000
+
+        print("")
+        print("============================================================")
+        print("✅ REDIS ARCHIVE EXPORT DONE")
+        print("============================================================")
+        print(f"initial_len={initial_len}")
+        print(f"final_len={final_len}")
+        print(f"batches={self.stats['batches']}")
+        print(f"files={self.stats['files']}")
+        print(f"read={self.stats['read']}")
+        print(f"exported={self.stats['exported']}")
+        print(f"deleted={self.stats['deleted']}")
+        print(f"errors={self.stats['errors']}")
+        print(f"runtime={runtime_sec:.1f}s")
+        print(f"manifest={MANIFEST_FILE}")
+        print("============================================================")
+        print("")
+
 
 # ============================================================
-# 5. MAIN
+# 4. MAIN
 # ============================================================
 async def main():
-    recorder = LiveFeatureRecorder()
-
-    loop = asyncio.get_running_loop()
-
-    async def shutdown():
-        print("\n🛑 [RECORDER] Shutting down...")
-        await recorder.stop()
-
-    def _handle_signal():
-        asyncio.create_task(shutdown())
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, _handle_signal)
-        except NotImplementedError:
-            pass
+    exporter = RedisArchiveExporter()
 
     try:
-        await recorder.run()
+        await exporter.export_once()
     finally:
-        await recorder.stop()
+        await exporter.close()
 
 
 if __name__ == "__main__":
