@@ -4,6 +4,7 @@
 import asyncio
 import gc
 import gzip
+import hashlib
 import json
 import os
 import time
@@ -20,7 +21,7 @@ load_dotenv()
 
 
 # ============================================================
-# REDIS MULTI-KEY ARCHIVE EXPORTER V2 - SAFE SSD EXPORT
+# REDIS MULTI-KEY ARCHIVE EXPORTER V2.1.1 - CURSOR SAFE + NO DUPLICATE READ PATCH
 # ------------------------------------------------------------
 # Dành cho key dạng:
 # features:archive:BTCUSDT
@@ -29,49 +30,90 @@ load_dotenv()
 #
 # Nhiệm vụ:
 # 1. Scan toàn bộ Redis Stream theo pattern features:archive:*.
-# 2. Không lấy dữ liệu 1 giờ gần nhất.
+# 2. Không lấy dữ liệu gần nhất theo SKIP_RECENT_SEC.
 # 3. Export từng batch ra SSD dạng .jsonl.gz.
-# 4. Ghi .tmp.gz trước, đóng gzip, fsync, rename final.
-# 5. Ghi manifest.
-# 6. Sau khi file + manifest thành công mới XDEL Redis IDs.
-# 7. XTRIM từng stream để Redis dọn RAM.
-# 8. Log rõ tiến độ theo coin / batch / tổng dòng.
+# 4. Ghi .tmp trước, đóng gzip, fsync file, rename final, fsync directory.
+# 5. Validate gzip/jsonl sau khi ghi.
+# 6. Ghi manifest sau khi file hợp lệ.
+# 7. Sau khi file + manifest thành công mới XDEL Redis IDs.
+# 8. XTRIM từng stream để Redis dọn RAM.
+# 9. Giữ record phẳng để train_dual_brain.py V3.1.4 đọc trực tiếp.
 # ============================================================
 
 
 # ============================================================
-# 1. CẤU HÌNH CỨNG
+# 1. CONFIG HELPERS
+# ============================================================
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    text = str(raw).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+
+    return default
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    try:
+        return int(float(raw))
+    except Exception:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
+
+# ============================================================
+# 2. RUNTIME CONFIG
 # ============================================================
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379")
 
-ARCHIVE_PATTERN = "features:archive:*"
+ARCHIVE_PATTERN = os.getenv("REDIS_ARCHIVE_PATTERN", "features:archive:*")
 
-EXPORT_DIR = Path("./data/live_features_archive")
-MANIFEST_FILE = Path("./data/live_features_archive/_manifest.jsonl")
+EXPORT_DIR = Path(os.getenv("REDIS_ARCHIVE_EXPORT_DIR", "./data/live_features_archive"))
+MANIFEST_FILE = Path(os.getenv("REDIS_ARCHIVE_MANIFEST_FILE", "./data/live_features_archive/_manifest.jsonl"))
 
-# Không export dữ liệu 1 giờ gần nhất để tránh đụng dữ liệu đang ghi.
-SKIP_RECENT_SEC = 3600
+# Không export dữ liệu gần nhất để tránh đụng dữ liệu đang ghi.
+SKIP_RECENT_SEC = env_int("REDIS_ARCHIVE_SKIP_RECENT_SEC", 3600)
 
 # Mỗi batch đọc tối đa N dòng / 1 stream coin.
-BATCH_SIZE = 5000
+BATCH_SIZE = env_int("REDIS_ARCHIVE_BATCH_SIZE", 5000)
 
-# Sau khi export file thành công thì xóa các ID khỏi Redis.
-DELETE_AFTER_EXPORT = True
+# Sau khi export file + manifest thành công thì xóa các ID khỏi Redis.
+DELETE_AFTER_EXPORT = env_bool("REDIS_ARCHIVE_DELETE_AFTER_EXPORT", True)
 
 # Sau khi xử lý xong một stream, XTRIM MINID để Redis dọn RAM.
-TRIM_AFTER_EXPORT = True
+TRIM_AFTER_EXPORT = env_bool("REDIS_ARCHIVE_TRIM_AFTER_EXPORT", True)
 
 # Dừng nếu ổ cứng trống dưới mức này.
-MIN_FREE_DISK_GB = 2.0
+MIN_FREE_DISK_GB = env_float("REDIS_ARCHIVE_MIN_FREE_DISK_GB", 2.0)
 
-# Nếu True: chỉ scan/log, không ghi file, không xóa Redis.
-DRY_RUN = False
+# Nếu True: chỉ scan/log/convert, không ghi file, không xóa Redis, không trim.
+DRY_RUN = env_bool("REDIS_ARCHIVE_DRY_RUN", False)
+DRY_RUN_MAX_BATCHES_PER_KEY = env_int("REDIS_ARCHIVE_DRY_RUN_MAX_BATCHES_PER_KEY", 1)
 
-EXPORT_VERSION = "redis_archive_multi_key_exporter_v2"
+EXPORT_VERSION = "redis_archive_multi_key_exporter_v2_1_1_cursor_safe_train_v3_1_4_aligned"
 
 
 # ============================================================
-# 2. UTILS
+# 3. UTILS
 # ============================================================
 def now_ms() -> int:
     return int(time.time() * 1000)
@@ -109,6 +151,14 @@ def stream_id_to_str(stream_id: Any) -> str:
     return str(stream_id)
 
 
+def next_stream_id(stream_id: str) -> str:
+    try:
+        ms, seq = str(stream_id).split("-", 1)
+        return f"{int(ms)}-{int(seq) + 1}"
+    except Exception:
+        return stream_id
+
+
 def key_to_str(key: Any) -> str:
     if isinstance(key, bytes):
         return key.decode("utf-8", errors="replace")
@@ -116,8 +166,14 @@ def key_to_str(key: Any) -> str:
 
 
 def symbol_from_key(key: str) -> str:
-    # features:archive:BTCUSDT -> BTCUSDT
     return key.split(":")[-1].upper().strip()
+
+
+def exporter_hostname() -> str:
+    try:
+        return os.uname().nodename
+    except Exception:
+        return os.getenv("HOSTNAME", "")
 
 
 def safe_decode_bytes(value: Any) -> Any:
@@ -147,7 +203,7 @@ def safe_decode_bytes(value: Any) -> Any:
 
 
 def normalize_stream_fields(fields: Dict[Any, Any]) -> Dict[str, Any]:
-    clean = {}
+    clean: Dict[str, Any] = {}
 
     for k, v in fields.items():
         key = k.decode("utf-8", errors="replace") if isinstance(k, bytes) else str(k)
@@ -193,6 +249,60 @@ def fsync_file(path: Path):
         os.fsync(f.fileno())
 
 
+def fsync_dir(path: Path):
+    fd = None
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+        os.fsync(fd)
+    except Exception:
+        pass
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
+
+def file_sha1(path: Path) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def validate_gzip_jsonl_file(path: Path, expected_count: int) -> Tuple[bool, int, str]:
+    if not path.exists():
+        return False, 0, "FILE_NOT_FOUND"
+
+    count = 0
+
+    try:
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if not isinstance(obj, dict):
+                        return False, count, "JSON_NOT_OBJECT"
+                    count += 1
+                except Exception as e:
+                    return False, count, f"JSON_ERROR:{e}"
+    except Exception as e:
+        return False, count, f"GZIP_ERROR:{e}"
+
+    if count != expected_count:
+        return False, count, f"COUNT_MISMATCH expected={expected_count} got={count}"
+
+    return True, count, "OK"
+
+
 def append_manifest(record: Dict[str, Any]):
     MANIFEST_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -221,11 +331,12 @@ def build_export_paths(redis_key: str, symbol: str, start_id: str, end_id: str, 
 
 
 # ============================================================
-# 3. EXPORTER
+# 4. EXPORTER
 # ============================================================
 class RedisArchiveExporter:
     def __init__(self):
         self.export_id = str(uuid.uuid4())
+        started_at_ms = now_ms()
 
         self.redis = aioredis.from_url(
             REDIS_URL,
@@ -245,8 +356,19 @@ class RedisArchiveExporter:
             "deleted": 0,
             "batches": 0,
             "files": 0,
+            "files_written": 0,
             "errors": 0,
-            "started_at_ms": now_ms()
+            "bytes_written": 0,
+            "manifest_written": 0,
+            "files_existing_valid": 0,
+            "files_corrupt_rewritten": 0,
+            "dry_run_batches": 0,
+            "symbol_mismatch": 0,
+            "validate_errors": 0,
+            "started_at_ms": started_at_ms,
+            "started_at_iso": utc_parts(started_at_ms)["iso"],
+            "completed_at_ms": 0,
+            "completed_at_iso": "",
         }
 
     async def close(self):
@@ -279,15 +401,21 @@ class RedisArchiveExporter:
 
         return key_type, int(length or 0)
 
-    async def fetch_batch(self, key: str, cutoff_id: str):
+    async def fetch_batch(self, key: str, start_id: str, cutoff_id: str):
         return await self.redis.xrange(
             key,
-            min="-",
+            min=start_id,
             max=cutoff_id,
             count=BATCH_SIZE
         )
 
-    def convert_entries_to_records(self, redis_key: str, symbol: str, entries) -> List[Dict[str, Any]]:
+    def convert_entries_to_records(
+        self,
+        redis_key: str,
+        symbol: str,
+        entries,
+        cutoff_ms: int
+    ) -> List[Dict[str, Any]]:
         records = []
         seen_ids = set()
 
@@ -308,22 +436,38 @@ class RedisArchiveExporter:
 
             record = dict(feature)
 
-            # Đảm bảo symbol luôn có.
-            record["symbol"] = str(record.get("symbol") or symbol).upper().strip()
+            record_symbol = str(record.get("symbol") or "").upper().strip()
+            key_symbol = str(symbol or "").upper().strip()
+
+            if record_symbol:
+                record["symbol"] = record_symbol
+                record["_archive_symbol_from_key"] = key_symbol
+                record["_archive_symbol_mismatch"] = bool(record_symbol != key_symbol)
+
+                if record_symbol != key_symbol:
+                    self.stats["symbol_mismatch"] += 1
+            else:
+                record["symbol"] = key_symbol
+                record["_archive_symbol_from_key"] = key_symbol
+                record["_archive_symbol_mismatch"] = False
+
+            stream_ms = stream_id_to_ms(stream_id)
 
             record["_redis_key"] = redis_key
             record["_redis_stream_id"] = stream_id
-            record["_redis_stream_ms"] = stream_id_to_ms(stream_id)
+            record["_redis_stream_ms"] = stream_ms
             record["_export_id"] = self.export_id
             record["_export_version"] = EXPORT_VERSION
             record["_exported_at_ms"] = now_ms()
             record["_exported_at_iso"] = utc_parts(now_ms())["iso"]
+            record["_archive_key_type"] = "stream"
+            record["_archive_cutoff_safe"] = bool(stream_ms <= cutoff_ms)
 
             records.append(record)
 
         return records
 
-    def write_records_atomic(self, redis_key: str, symbol: str, records: List[Dict[str, Any]], cutoff_ms: int) -> Path:
+    def write_records_atomic(self, redis_key: str, symbol: str, records: List[Dict[str, Any]], cutoff_ms: int) -> Tuple[Path, int, int, bool, bool]:
         if not records:
             raise RuntimeError("No records to write")
 
@@ -332,10 +476,23 @@ class RedisArchiveExporter:
 
         tmp_path, final_path = build_export_paths(redis_key, symbol, start_id, end_id, len(records), cutoff_ms)
 
-        # Nếu file final đã tồn tại, coi như batch này đã từng export.
+        existing_valid = False
+        corrupt_rewritten = False
+
         if final_path.exists():
-            print(f"♻️ [SKIP FILE EXISTS] {final_path}")
-            return final_path
+            ok, count, reason = validate_gzip_jsonl_file(final_path, len(records))
+
+            if ok:
+                print(f"♻️ [SKIP FILE EXISTS VALID] {final_path} count={count}")
+                return final_path, count, final_path.stat().st_size, True, False
+
+            self.stats["validate_errors"] += 1
+            corrupt_ts = utc_parts(now_ms())["compact"]
+            corrupt_path = final_path.with_name(f"{final_path.name}.corrupt.{corrupt_ts}")
+            os.replace(final_path, corrupt_path)
+            fsync_dir(final_path.parent)
+            corrupt_rewritten = True
+            print(f"⚠️ [CORRUPT FILE] {final_path} reason={reason} -> {corrupt_path}")
 
         if tmp_path.exists():
             tmp_path.unlink()
@@ -349,10 +506,17 @@ class RedisArchiveExporter:
         fsync_file(tmp_path)
 
         os.replace(tmp_path, final_path)
-
+        fsync_dir(final_path.parent)
         fsync_file(final_path)
 
-        return final_path
+        ok, valid_count, reason = validate_gzip_jsonl_file(final_path, len(records))
+        if not ok:
+            self.stats["validate_errors"] += 1
+            raise RuntimeError(f"Final gzip validation failed: {final_path} reason={reason}")
+
+        file_size = final_path.stat().st_size
+
+        return final_path, valid_count, file_size, existing_valid, corrupt_rewritten
 
     async def delete_stream_ids(self, key: str, ids: List[str]) -> int:
         if not ids:
@@ -372,14 +536,21 @@ class RedisArchiveExporter:
         return deleted
 
     async def trim_stream(self, key: str, cutoff_id: str):
-        if DRY_RUN or not TRIM_AFTER_EXPORT:
+        if DRY_RUN:
+            return
+
+        if not DELETE_AFTER_EXPORT:
+            print(f"🧹 [XTRIM] key={key} skip trim because DELETE_AFTER_EXPORT=False")
+            return
+
+        if not TRIM_AFTER_EXPORT:
             return
 
         try:
             result = await self.redis.execute_command("XTRIM", key, "MINID", cutoff_id)
-            print(f"🧹 [XTRIM] key={key} MINID={cutoff_id} result={result}")
+            print(f"🧹 [XTRIM] key={key} cutoff_id={cutoff_id} result={result}")
         except Exception as e:
-            print(f"⚠️ [XTRIM] key={key} không trim được: {e}")
+            print(f"⚠️ [XTRIM] key={key} cutoff_id={cutoff_id} không trim được: {e}")
 
     async def export_key(self, key: str, cutoff_id: str, cutoff_ms: int, index: int, total_keys: int):
         symbol = symbol_from_key(key)
@@ -404,6 +575,8 @@ class RedisArchiveExporter:
         key_exported = 0
         key_deleted = 0
         key_batches = 0
+        key_failed = False
+        next_min_id = "-"
 
         while True:
             free_gb = disk_free_gb(EXPORT_DIR)
@@ -413,7 +586,7 @@ class RedisArchiveExporter:
                     f"Disk free thấp: {free_gb:.2f}GB < {MIN_FREE_DISK_GB}GB. Dừng để an toàn."
                 )
 
-            entries = await self.fetch_batch(key, cutoff_id)
+            entries = await self.fetch_batch(key, next_min_id, cutoff_id)
 
             if not entries:
                 print(
@@ -427,6 +600,7 @@ class RedisArchiveExporter:
             ids = [stream_id_to_str(e[0]) for e in entries]
             first_id = ids[0]
             last_id = ids[-1]
+            next_min_id = next_stream_id(last_id)
 
             current_len_before = await self.redis.xlen(key)
 
@@ -438,18 +612,50 @@ class RedisArchiveExporter:
                 f"stream_len_before={current_len_before}"
             )
 
-            records = self.convert_entries_to_records(key, symbol, entries)
+            records = self.convert_entries_to_records(key, symbol, entries, cutoff_ms)
 
             self.stats["read"] += len(records)
 
             if DRY_RUN:
-                print(f"🧪 [DRY RUN] key={key} would_export={len(records)} would_delete={len(ids)}")
-                break
+                self.stats["dry_run_batches"] += 1
+                print(
+                    f"🧪 [DRY RUN] key={key} "
+                    f"batch={key_batches} "
+                    f"would_export={len(records)} "
+                    f"would_delete={len(ids)} "
+                    f"first_id={first_id} "
+                    f"last_id={last_id}"
+                )
+
+                if key_batches >= max(1, DRY_RUN_MAX_BATCHES_PER_KEY):
+                    print(f"🧪 [DRY RUN] key={key} stop after {key_batches} batches")
+                    break
+
+                del entries
+                del records
+                del ids
+                gc.collect()
+                continue
 
             try:
-                final_path = self.write_records_atomic(key, symbol, records, cutoff_ms)
+                final_path, valid_count, file_size, existing_valid, corrupt_rewritten = self.write_records_atomic(
+                    key,
+                    symbol,
+                    records,
+                    cutoff_ms
+                )
+
+                if existing_valid:
+                    self.stats["files_existing_valid"] += 1
+                else:
+                    self.stats["files_written"] += 1
+                    self.stats["bytes_written"] += file_size
+
+                if corrupt_rewritten:
+                    self.stats["files_corrupt_rewritten"] += 1
 
                 manifest_record = {
+                    "manifest_key": f"{key}:{first_id}:{last_id}:{len(records)}",
                     "export_id": self.export_id,
                     "export_version": EXPORT_VERSION,
                     "redis_key": key,
@@ -457,7 +663,13 @@ class RedisArchiveExporter:
                     "first_id": first_id,
                     "last_id": last_id,
                     "records": len(records),
+                    "record_count_validated": valid_count,
                     "file": str(final_path),
+                    "file_size_bytes": file_size,
+                    "file_sha1": file_sha1(final_path),
+                    "redis_stream_ms_start": stream_id_to_ms(first_id),
+                    "redis_stream_ms_end": stream_id_to_ms(last_id),
+                    "exporter_hostname": exporter_hostname(),
                     "cutoff_id": cutoff_id,
                     "cutoff_ms": cutoff_ms,
                     "cutoff_iso": utc_parts(cutoff_ms)["iso"],
@@ -472,6 +684,7 @@ class RedisArchiveExporter:
                 self.stats["exported"] += len(records)
                 self.stats["deleted"] += deleted
                 self.stats["files"] += 1
+                self.stats["manifest_written"] += 1
 
                 key_exported += len(records)
                 key_deleted += deleted
@@ -482,6 +695,8 @@ class RedisArchiveExporter:
                     f"✅ [BATCH DONE] key={key} "
                     f"file={final_path} "
                     f"exported={len(records)} "
+                    f"validated={valid_count} "
+                    f"bytes={file_size} "
                     f"deleted={deleted} "
                     f"stream_len_after={current_len_after} "
                     f"total_exported={self.stats['exported']} "
@@ -490,17 +705,20 @@ class RedisArchiveExporter:
 
             except Exception as e:
                 self.stats["errors"] += 1
+                key_failed = True
                 print(f"❌ [BATCH ERROR] key={key} error={e}")
-                print("⚠️ Không xóa Redis IDs vì export batch chưa hoàn tất")
+                print("⚠️ Không xóa Redis IDs vì export/manifest batch chưa hoàn tất")
                 raise
 
-            del entries
-            del records
-            del ids
-            gc.collect()
+            finally:
+                del entries
+                del records
+                del ids
+                gc.collect()
 
-        await self.trim_stream(key, cutoff_id)
-        self.stats["keys_completed"] += 1
+        if not key_failed:
+            await self.trim_stream(key, cutoff_id)
+            self.stats["keys_completed"] += 1
 
     async def export_once(self):
         cutoff_ms = now_ms() - SKIP_RECENT_SEC * 1000
@@ -510,10 +728,11 @@ class RedisArchiveExporter:
 
         print("")
         print("============================================================")
-        print("🚚 REDIS MULTI-KEY ARCHIVE EXPORT START")
+        print("🚚 REDIS MULTI-KEY ARCHIVE EXPORT START V2.1.1")
         print("============================================================")
         print(f"redis={REDIS_URL}")
         print(f"pattern={ARCHIVE_PATTERN}")
+        print(f"version={EXPORT_VERSION}")
         print(f"keys_found={len(keys)}")
         print(f"output_dir={EXPORT_DIR.resolve()}")
         print(f"manifest={MANIFEST_FILE.resolve()}")
@@ -523,7 +742,9 @@ class RedisArchiveExporter:
         print(f"batch_size={BATCH_SIZE}")
         print(f"delete_after_export={DELETE_AFTER_EXPORT}")
         print(f"trim_after_export={TRIM_AFTER_EXPORT}")
+        print(f"min_free_disk_gb={MIN_FREE_DISK_GB}")
         print(f"dry_run={DRY_RUN}")
+        print(f"dry_run_max_batches_per_key={DRY_RUN_MAX_BATCHES_PER_KEY}")
         print("============================================================")
         print("")
 
@@ -534,22 +755,37 @@ class RedisArchiveExporter:
         for idx, key in enumerate(keys, 1):
             await self.export_key(key, cutoff_id, cutoff_ms, idx, len(keys))
 
-        runtime_sec = (now_ms() - self.stats["started_at_ms"]) / 1000
+        completed_at_ms = now_ms()
+        self.stats["completed_at_ms"] = completed_at_ms
+        self.stats["completed_at_iso"] = utc_parts(completed_at_ms)["iso"]
+
+        runtime_sec = (completed_at_ms - self.stats["started_at_ms"]) / 1000
 
         print("")
         print("============================================================")
-        print("✅ REDIS MULTI-KEY ARCHIVE EXPORT DONE")
+        print("✅ REDIS MULTI-KEY ARCHIVE EXPORT DONE V2.1.1")
         print("============================================================")
+        print(f"version={EXPORT_VERSION}")
         print(f"keys_found={self.stats['keys_found']}")
         print(f"keys_stream={self.stats['keys_stream']}")
         print(f"keys_skipped={self.stats['keys_skipped']}")
         print(f"keys_completed={self.stats['keys_completed']}")
         print(f"batches={self.stats['batches']}")
         print(f"files={self.stats['files']}")
+        print(f"files_written={self.stats['files_written']}")
+        print(f"files_existing_valid={self.stats['files_existing_valid']}")
+        print(f"files_corrupt_rewritten={self.stats['files_corrupt_rewritten']}")
         print(f"read={self.stats['read']}")
         print(f"exported={self.stats['exported']}")
         print(f"deleted={self.stats['deleted']}")
+        print(f"bytes_written={self.stats['bytes_written']}")
+        print(f"manifest_written={self.stats['manifest_written']}")
+        print(f"dry_run_batches={self.stats['dry_run_batches']}")
+        print(f"symbol_mismatch={self.stats['symbol_mismatch']}")
+        print(f"validate_errors={self.stats['validate_errors']}")
         print(f"errors={self.stats['errors']}")
+        print(f"started_at_iso={self.stats['started_at_iso']}")
+        print(f"completed_at_iso={self.stats['completed_at_iso']}")
         print(f"runtime={runtime_sec:.1f}s")
         print(f"manifest={MANIFEST_FILE}")
         print("============================================================")
@@ -557,7 +793,7 @@ class RedisArchiveExporter:
 
 
 # ============================================================
-# 4. MAIN
+# 5. MAIN
 # ============================================================
 async def main():
     exporter = RedisArchiveExporter()
