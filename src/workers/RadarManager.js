@@ -1,45 +1,181 @@
 const axios = require('axios');
 const Redis = require('ioredis');
-const fs = require('fs');
 
 // ============================================================
-// RADAR MANAGER V20 - OPPORTUNITY RADAR FUTURES 15M-
+// RADAR MANAGER V24 - PRODUCTION-STABLE PROFIT OPPORTUNITY RADAR 3M
 // ------------------------------------------------------------
-// Mục tiêu chính:
-// 1. Quét toàn bộ Binance Futures USDT-M Perpetual đang trading.
-// 2. Không trực tiếp vào lệnh, không quyết định trade cuối.
-// 3. Chỉ lọc danh sách coin có dấu hiệu bất thường / tiềm năng.
-// 4. Bắt rộng cơ hội hơn bản Impulse Radar cũ.
-// 5. Hỗ trợ direction: LONG / SHORT / WATCH.
-// 6. Không ép direction quá sớm, tránh bỏ sót coin tốt.
-// 7. Dùng trigger-count + opportunity-score thay vì hard filter quá cứng.
-// 8. Có tag tín hiệu để các tầng sau phân tích sâu hơn.
-// 9. Giữ nguyên luồng Redis cũ:
-//    - radar:candidates
-//    - system:subscriptions
-//    - macro:scores
-// 10. Có thêm channel mới không bắt buộc:
-//    - radar:watchlist
-//    - radar:hotlist
-//    - radar:signals
+// Vai trò:
+// 1. Quét Binance Futures USDT-M Perpetual.
+// 2. Không vào lệnh.
+// 3. Không quyết định trade.
+// 4. Chỉ lọc altcoin có cơ hội biến động tốt để Feed theo dõi.
+// 5. Publish SUBSCRIBE / UNSUBSCRIBE cho FeedHandler.
+// 6. Ghi macro:scores, radar:hotlist, radar:watchlist.
+//
+// Triết lý V24:
+// - Giữ Radar đơn giản, ổn định, không overfit bằng quá nhiều indicator.
+// - Ưu tiên tính vận hành thật: Binance time sync, Redis publish chắc hơn,
+//   slot lifecycle rõ ràng, stale slot pruning, filterStats đầy đủ.
+// - Không chọn coin khi thiếu dữ liệu cần thiết như ticker/bookTicker.
+// - Không publish spam khi update nhỏ.
+// - Output đủ giàu để Feed/Order tiếp tục xử lý realtime.
 // ============================================================
 
 
 // ============================================================
-// 1. HÀM TIỆN ÍCH CƠ BẢN
+// 1. HARD-CODED RUNTIME CONFIG
 // ============================================================
-function intervalToMs(interval) {
-    const text = String(interval || '3m');
-    const unit = text.slice(-1);
-    const value = Number(text.slice(0, -1));
 
-    if (!Number.isFinite(value) || value <= 0) return 3 * 60 * 1000;
-    if (unit === 'm') return value * 60 * 1000;
-    if (unit === 'h') return value * 60 * 60 * 1000;
-    if (unit === 'd') return value * 24 * 60 * 60 * 1000;
+const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
 
-    return 3 * 60 * 1000;
-}
+const CHANNELS = {
+    CANDIDATES: 'radar:candidates',
+    SUBSCRIPTIONS: 'system:subscriptions',
+    MACRO_SCORES: 'macro:scores',
+    HOTLIST: 'radar:hotlist',
+    WATCHLIST: 'radar:watchlist'
+};
+
+const BINANCE_FAPI_BASE = 'https://fapi.binance.com';
+
+const RADAR_INTERVAL = '3m';
+const RADAR_INTERVAL_MS = 3 * 60 * 1000;
+
+// Chờ nến chạy 45s để giảm spike ảo đầu nến.
+const SCAN_OFFSET_MS = 45 * 1000;
+const MIN_CANDLE_ELAPSED_MS = 45 * 1000;
+
+// Top symbol mới mỗi scan.
+const MAX_RADAR_SLOTS = 30;
+
+// Tổng slot active tối đa, bao gồm sticky slot.
+const MAX_ACTIVE_SLOTS = 40;
+const MIN_FORCE_KEEP_MS = 2 * 60 * 1000;
+
+// Cooldown sau khi remove để tránh subscribe/unsubscribe lặp lại.
+const RESUBSCRIBE_COOLDOWN_MS = 6 * 60 * 1000;
+const REMOVED_CACHE_TTL_MS = 30 * 60 * 1000;
+
+// Slot cũ quá lâu không được cập nhật sẽ bị dọn để tránh giữ rác khi thị trường đổi pha.
+const MAX_SLOT_STALE_MS = 15 * 60 * 1000;
+
+// Chặn republish spam cùng một symbol.
+const MIN_REPUBLISH_INTERVAL_MS = 60 * 1000;
+
+const OPPORTUNITY_THRESHOLD = 0.58;
+const HOT_THRESHOLD = 0.74;
+
+const MIN_24H_QUOTE_VOLUME = 5_000_000;
+
+const EXCLUDED_SYMBOLS = new Set([
+    'BTCUSDT',
+    'ETHUSDT',
+    'BNBUSDT',
+    'SOLUSDT',
+    'XRPUSDT',
+    'ADAUSDT',
+    'DOGEUSDT',
+    'TRXUSDT',
+    'LTCUSDT',
+    'BCHUSDT',
+    'LINKUSDT',
+    'AVAXUSDT',
+    'DOTUSDT',
+    'UNIUSDT',
+    'ATOMUSDT',
+    'ETCUSDT',
+    'AAVEUSDT',
+    'NEARUSDT',
+    'FILUSDT'
+]);
+
+const SAFE_SYMBOL_REGEX = /^[A-Z0-9]+USDT$/;
+
+const KLINE_LIMIT = 48;
+
+const MIN_ABS_MOVE = 0.003;
+const MIN_RANGE = 0.005;
+const MIN_BODY_STRENGTH = 0.30;
+
+const MIN_VOLUME_RATIO = 1.8;
+const MIN_QUOTE_VOLUME_RATIO = 1.8;
+const MIN_TRADES_RATIO = 1.5;
+
+const MIN_TRIGGER_COUNT = 3;
+
+// Spread cao dễ chết vì slippage/fee khi scalping.
+const MAX_SPREAD_BPS = 15;
+
+const MAX_PROJECTION_FACTOR = 4;
+
+const MIN_HOLD_MS = 6 * 60 * 1000;
+const RADAR_LIST_TTL_SEC = 10 * 60;
+
+const REQUEST_TIMEOUT_MS = 10_000;
+const MAX_RETRIES = 2;
+const RETRY_BASE_DELAY_MS = 500;
+const RETRY_RATE_LIMIT_DELAY_MS = 5000;
+
+const BATCH_SIZE = 5;
+const BATCH_DELAY_MS = 250;
+
+const SYMBOLS_CACHE_MS = 15 * 60 * 1000;
+const TICKER_CACHE_MS = 10 * 1000;
+const BOOK_TICKER_CACHE_MS = 3 * 1000;
+const BINANCE_TIME_SYNC_MS = 5 * 60 * 1000;
+
+// Nếu scan kéo dài quá lâu so với interval thì cảnh báo để giảm batch/slot sau này.
+const SCAN_WARN_DURATION_MS = 120 * 1000;
+
+
+// ============================================================
+// 2. REDIS CLIENTS
+// ============================================================
+
+const pubClient = new Redis(REDIS_URL);
+const dataClient = new Redis(REDIS_URL);
+
+pubClient.on('error', err => console.error('❌ Redis pubClient error:', err.message));
+dataClient.on('error', err => console.error('❌ Redis dataClient error:', err.message));
+
+
+// ============================================================
+// 3. STATE
+// ============================================================
+
+let currentSlots = new Map(); // symbol -> candidate
+let activeSubscribedSymbols = new Set();
+let recentlyRemovedSymbols = new Map(); // symbol -> removedAt
+
+let tradableSymbolsCache = {
+    updatedAt: 0,
+    symbols: []
+};
+
+let tickerCache = {
+    updatedAt: 0,
+    map: new Map()
+};
+
+let bookTickerCache = {
+    updatedAt: 0,
+    map: new Map()
+};
+
+let binanceTimeState = {
+    updatedAt: 0,
+    offsetMs: 0,
+    lastServerTime: 0
+};
+
+let isScanning = false;
+let nextScanTimer = null;
+let scanSeq = 0;
+
+
+// ============================================================
+// 4. UTILS
+// ============================================================
 
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -59,236 +195,42 @@ function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
 }
 
-function average(values) {
-    const arr = values.filter(v => Number.isFinite(v));
-    if (arr.length === 0) return 0;
-    return arr.reduce((sum, v) => sum + v, 0) / arr.length;
-}
-
-function std(values) {
-    const arr = values.filter(v => Number.isFinite(v));
-    if (arr.length < 2) return 0;
-
-    const avg = average(arr);
-    const variance = average(arr.map(v => (v - avg) ** 2));
-    return Math.sqrt(variance);
-}
-
-function pctChange(from, to) {
-    if (!Number.isFinite(from) || !Number.isFinite(to) || from <= 0) return 0;
-    return (to - from) / from;
-}
-
-// Với radar tầng đầu, nên quản lý slot theo SYMBOL, không theo SYMBOL:DIRECTION.
-// Lý do: radar chỉ cần biết coin nào đáng theo dõi, direction sau có thể đổi từ WATCH -> LONG/SHORT.
-function buildSlotKey(symbol) {
-    return symbol;
-}
-
-// Jitter chỉ dùng cho retry/backoff network, không dùng để chấm điểm trading.
 function jitter(ms, ratio = 0.2) {
     const spread = ms * ratio;
     return Math.round(ms - spread + Math.random() * spread * 2);
 }
 
-
-// ============================================================
-// 2. ĐỌC CẤU HÌNH
-// ============================================================
-let config;
-
-try {
-    config = JSON.parse(fs.readFileSync('./system_config.json', 'utf8'));
-} catch (e) {
-    config = {
-        REDIS_URL: process.env.REDIS_URL || 'redis://localhost:6379',
-        CHANNELS: {
-            CANDIDATES: 'radar:candidates',
-            WATCHLIST: 'radar:watchlist',
-            HOTLIST: 'radar:hotlist',
-            SIGNALS: 'radar:signals',
-            MACRO_SCORES: 'macro:scores',
-            SUBSCRIPTIONS: 'system:subscriptions'
-        },
-
-        // Số coin tối đa ưu tiên cao trong mỗi vòng quét.
-        MAX_RADAR_SLOTS: 40,
-
-        // Hard cap tổng slot đang giữ, bao gồm cả sticky slot.
-        MAX_TOTAL_RADAR_SLOTS: 60,
-
-        // Radar này là opportunity scanner, nên threshold rộng hơn bản cũ.
-        OPPORTUNITY_THRESHOLD: 0.50,
-        HOT_THRESHOLD: 0.68,
-
-        // Giữ tương thích macro threshold cũ.
-        MACRO_THRESHOLD: 0.50,
-
-        // Khung scan chính.
-        IMPULSE_INTERVAL: '3m',
-        IMPULSE_KLINE_LIMIT: 31,
-
-        // Lọc thanh khoản 24h.
-        MIN_24H_QUOTE_VOLUME: 1000000,
-
-        // Bộ lọc opportunity mềm.
-        MIN_TRIGGER_COUNT: 2,
-        MIN_VOLUME_Z: 1.5,
-        MIN_QUOTE_VOLUME_Z: 1.4,
-        MIN_TRADES_Z: 1.4,
-        MIN_PRICE_MOVE_3M: 0.0035,
-        MIN_RANGE_3M: 0.005,
-        MIN_BODY_STRENGTH: 0.25,
-
-        // Direction chỉ là gợi ý cho tầng sau.
-        LONG_TAKER_BUY_RATIO: 0.53,
-        SHORT_TAKER_BUY_RATIO: 0.47,
-
-        // Projected volume cho nến chưa đóng.
-        MIN_CANDLE_ELAPSED_MS: 15000,
-        MAX_CANDLE_ELAPSED_RATIO: 1,
-        MAX_PROJECTION_FACTOR: 6,
-
-        // Chống spread xấu.
-        MAX_SPREAD_BPS: 12,
-
-        // API safety.
-        BATCH_SIZE: 5,
-        BATCH_DELAY_MS: 250,
-        REQUEST_TIMEOUT_MS: 10000,
-        MAX_RETRIES: 2,
-        RETRY_BASE_DELAY_MS: 500,
-        RETRY_RATE_LIMIT_DELAY_MS: 5000,
-
-        // Cache.
-        SYMBOLS_CACHE_MS: 15 * 60 * 1000,
-        TICKER_CACHE_MS: 10 * 1000,
-        BOOK_TICKER_CACHE_MS: 3000,
-        MARKET_CONTEXT_CACHE_MS: 15000,
-
-        // Scheduler.
-        SCAN_OFFSET_MS: 8000,
-
-        // Sticky slot: giữ symbol một thời gian để tầng sau kịp phân tích.
-        MIN_HOLD_MS: 8 * 60 * 1000,
-
-        // Publish update khi score thay đổi đáng kể.
-        REPUBLISH_SCORE_DELTA: 0.04,
-        REPUBLISH_MIN_INTERVAL_MS: 60 * 1000
-    };
+function mean(values) {
+    if (!values.length) return 0;
+    return values.reduce((sum, v) => sum + v, 0) / values.length;
 }
 
+function logScaleScore(value, target) {
+    if (value <= 1) return 0;
+    return clamp(Math.log(value) / Math.log(target), 0, 1);
+}
 
-// ============================================================
-// 3. DEFAULT CONFIG ĐỂ TƯƠNG THÍCH FILE system_config.json CŨ
-// ============================================================
-config.REDIS_URL = config.REDIS_URL || process.env.REDIS_URL || 'redis://localhost:6379';
+function pctChange(from, to) {
+    if (from <= 0 || to <= 0) return 0;
+    return (to - from) / from;
+}
 
-config.CHANNELS = config.CHANNELS || {};
-config.CHANNELS.CANDIDATES = config.CHANNELS.CANDIDATES || 'radar:candidates';
-config.CHANNELS.WATCHLIST = config.CHANNELS.WATCHLIST || 'radar:watchlist';
-config.CHANNELS.HOTLIST = config.CHANNELS.HOTLIST || 'radar:hotlist';
-config.CHANNELS.SIGNALS = config.CHANNELS.SIGNALS || 'radar:signals';
-config.CHANNELS.MACRO_SCORES = config.CHANNELS.MACRO_SCORES || 'macro:scores';
-config.CHANNELS.SUBSCRIPTIONS = config.CHANNELS.SUBSCRIPTIONS || 'system:subscriptions';
+function klineHigh(k) {
+    return safeNumber(k[2]);
+}
 
-config.MAX_RADAR_SLOTS = config.MAX_RADAR_SLOTS ?? 40;
-config.MAX_TOTAL_RADAR_SLOTS = config.MAX_TOTAL_RADAR_SLOTS ?? Math.floor(config.MAX_RADAR_SLOTS * 1.5);
+function klineLow(k) {
+    return safeNumber(k[3]);
+}
 
-config.OPPORTUNITY_THRESHOLD = config.OPPORTUNITY_THRESHOLD ?? 0.50;
-config.HOT_THRESHOLD = config.HOT_THRESHOLD ?? 0.68;
-config.MACRO_THRESHOLD = config.MACRO_THRESHOLD ?? config.OPPORTUNITY_THRESHOLD;
+function klineClose(k) {
+    return safeNumber(k[4]);
+}
 
-config.IMPULSE_INTERVAL = config.IMPULSE_INTERVAL || '3m';
-config.IMPULSE_INTERVAL_MS = config.IMPULSE_INTERVAL_MS ?? intervalToMs(config.IMPULSE_INTERVAL);
-config.IMPULSE_KLINE_LIMIT = config.IMPULSE_KLINE_LIMIT ?? 31;
+function binanceNow() {
+    return Date.now() + binanceTimeState.offsetMs;
+}
 
-config.MIN_24H_QUOTE_VOLUME = config.MIN_24H_QUOTE_VOLUME ?? 1000000;
-
-config.MIN_TRIGGER_COUNT = config.MIN_TRIGGER_COUNT ?? 2;
-config.MIN_VOLUME_Z = config.MIN_VOLUME_Z ?? 1.5;
-config.MIN_QUOTE_VOLUME_Z = config.MIN_QUOTE_VOLUME_Z ?? 1.4;
-config.MIN_TRADES_Z = config.MIN_TRADES_Z ?? 1.4;
-config.MIN_PRICE_MOVE_3M = config.MIN_PRICE_MOVE_3M ?? 0.0035;
-config.MIN_RANGE_3M = config.MIN_RANGE_3M ?? 0.005;
-config.MIN_BODY_STRENGTH = config.MIN_BODY_STRENGTH ?? 0.25;
-
-config.LONG_TAKER_BUY_RATIO = config.LONG_TAKER_BUY_RATIO ?? 0.53;
-config.SHORT_TAKER_BUY_RATIO = config.SHORT_TAKER_BUY_RATIO ?? 0.47;
-
-config.MIN_CANDLE_ELAPSED_MS = config.MIN_CANDLE_ELAPSED_MS ?? 15000;
-config.MAX_CANDLE_ELAPSED_RATIO = config.MAX_CANDLE_ELAPSED_RATIO ?? 1;
-config.MAX_PROJECTION_FACTOR = config.MAX_PROJECTION_FACTOR ?? 6;
-
-config.MAX_SPREAD_BPS = config.MAX_SPREAD_BPS ?? 12;
-
-config.BATCH_SIZE = config.BATCH_SIZE ?? 5;
-config.BATCH_DELAY_MS = config.BATCH_DELAY_MS ?? 250;
-config.REQUEST_TIMEOUT_MS = config.REQUEST_TIMEOUT_MS ?? 10000;
-config.MAX_RETRIES = config.MAX_RETRIES ?? 2;
-config.RETRY_BASE_DELAY_MS = config.RETRY_BASE_DELAY_MS ?? 500;
-config.RETRY_RATE_LIMIT_DELAY_MS = config.RETRY_RATE_LIMIT_DELAY_MS ?? 5000;
-
-config.SYMBOLS_CACHE_MS = config.SYMBOLS_CACHE_MS ?? 15 * 60 * 1000;
-config.TICKER_CACHE_MS = config.TICKER_CACHE_MS ?? 10 * 1000;
-config.BOOK_TICKER_CACHE_MS = config.BOOK_TICKER_CACHE_MS ?? 3000;
-config.MARKET_CONTEXT_CACHE_MS = config.MARKET_CONTEXT_CACHE_MS ?? 15000;
-
-config.SCAN_OFFSET_MS = config.SCAN_OFFSET_MS ?? 8000;
-config.MIN_HOLD_MS = config.MIN_HOLD_MS ?? 8 * 60 * 1000;
-
-config.REPUBLISH_SCORE_DELTA = config.REPUBLISH_SCORE_DELTA ?? 0.04;
-config.REPUBLISH_MIN_INTERVAL_MS = config.REPUBLISH_MIN_INTERVAL_MS ?? 60 * 1000;
-
-const BINANCE_FAPI_BASE = 'https://fapi.binance.com';
-
-const pubClient = new Redis(config.REDIS_URL);
-const dataClient = new Redis(config.REDIS_URL);
-
-
-// ============================================================
-// 4. BỘ NHỚ TRẠNG THÁI
-// ============================================================
-let currentRadarSlots = new Map();
-
-// Giữ danh sách symbol đã gửi SUBSCRIBE để không subscribe trùng.
-let activeSubscribedSymbols = new Set();
-
-// Cache score mạnh nhất theo symbol để ghi macro:scores.
-const macroScoreCache = new Map();
-
-let tradableSymbolsCache = {
-    updatedAt: 0,
-    symbols: []
-};
-
-let tickerCache = {
-    updatedAt: 0,
-    map: new Map()
-};
-
-let bookTickerCache = {
-    updatedAt: 0,
-    map: new Map()
-};
-
-let marketContextCache = {
-    updatedAt: 0,
-    context: {
-        btcReturn5m: 0,
-        ethReturn5m: 0,
-        marketBias: 'NEUTRAL',
-        volatilityMode: 'NORMAL'
-    }
-};
-
-let isScanning = false;
-let nextScanTimer = null;
-
-
-// ============================================================
-// 5. HTTP CLIENT CÓ RETRY VÀ BACKOFF
-// ============================================================
 function getBinanceUsedWeight(headers) {
     if (!headers) return null;
     const value = headers['x-mbx-used-weight-1m'] || headers['X-MBX-USED-WEIGHT-1M'];
@@ -302,20 +244,116 @@ function isRateLimitError(error) {
 
 function isRetryableNetworkError(error) {
     if (isRateLimitError(error)) return true;
-
     const code = error ? error.code : null;
-    return [
-        'ECONNRESET',
-        'ETIMEDOUT',
-        'ECONNABORTED',
-        'EAI_AGAIN',
-        'ENOTFOUND'
-    ].includes(code);
+    return ['ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'EAI_AGAIN', 'ENOTFOUND'].includes(code);
 }
 
+function createFilterStats() {
+    return {
+        missingTicker: 0,
+        missingBookTicker: 0,
+        lowLiquidity: 0,
+        highSpread: 0,
+        klineInvalid: 0,
+        candleTooEarly: 0,
+        invalidPrice: 0,
+        lowBaseline: 0,
+        weakPriceAction: 0,
+        lowVolume: 0,
+        lowTrades: 0,
+        lowRange: 0,
+        weakBody: 0,
+        highWick: 0,
+        choppy: 0,
+        lateWatch: 0,
+        lowScore: 0,
+        cooldownSkip: 0,
+        staleRemoved: 0,
+        forceRemoved: 0,
+        errors: 0
+    };
+}
+
+function isInResubscribeCooldown(symbol) {
+    const removedAt = recentlyRemovedSymbols.get(symbol);
+    if (!removedAt) return false;
+    return Date.now() - removedAt < RESUBSCRIBE_COOLDOWN_MS;
+}
+
+function cleanupRemovedCache() {
+    const now = Date.now();
+
+    for (const [symbol, removedAt] of recentlyRemovedSymbols.entries()) {
+        if (now - removedAt > REMOVED_CACHE_TTL_MS) {
+            recentlyRemovedSymbols.delete(symbol);
+        }
+    }
+}
+
+function hasImportantTagChange(oldTags = [], newTags = []) {
+    const importantTags = [
+        'STRONG_MOMENTUM',
+        'BREAKOUT_UP',
+        'BREAKOUT_DOWN',
+        'PRICE_IMPULSE_STRONG',
+        'RANGE_EXPANSION_STRONG',
+        'BUY_FLOW_STRONG',
+        'SELL_FLOW_STRONG',
+        'LATE_MOVE_RISK',
+        'LONG_WICK_RISK',
+        'CHOPPY_STRUCTURE'
+    ];
+
+    return importantTags.some(tag =>
+        oldTags.includes(tag) !== newTags.includes(tag)
+    );
+}
+
+function shouldRepublishCandidate(oldCandidate, newCandidate) {
+    if (!oldCandidate || !newCandidate) return true;
+
+    const lastPublishedAt = safeNumber(oldCandidate.lastPublishedAt, 0);
+    const recentlyPublished = Date.now() - lastPublishedAt < MIN_REPUBLISH_INTERVAL_MS;
+
+    const criticalChange =
+        oldCandidate.tier !== newCandidate.tier ||
+        oldCandidate.direction !== newCandidate.direction;
+
+    if (criticalChange) return true;
+
+    if (recentlyPublished) return false;
+
+    return (
+        Math.abs(newCandidate.score - oldCandidate.score) >= 0.08 ||
+        hasImportantTagChange(oldCandidate.tags, newCandidate.tags)
+    );
+}
+
+function validateConfig() {
+    const errors = [];
+
+    if (MAX_RADAR_SLOTS <= 0) errors.push('MAX_RADAR_SLOTS must be > 0');
+    if (MAX_ACTIVE_SLOTS < MAX_RADAR_SLOTS) errors.push('MAX_ACTIVE_SLOTS must be >= MAX_RADAR_SLOTS');
+    if (MIN_CANDLE_ELAPSED_MS < 15_000) errors.push('MIN_CANDLE_ELAPSED_MS too low');
+    if (SCAN_OFFSET_MS < MIN_CANDLE_ELAPSED_MS) errors.push('SCAN_OFFSET_MS should be >= MIN_CANDLE_ELAPSED_MS');
+    if (OPPORTUNITY_THRESHOLD >= HOT_THRESHOLD) errors.push('OPPORTUNITY_THRESHOLD must be < HOT_THRESHOLD');
+    if (MAX_PROJECTION_FACTOR > 6) errors.push('MAX_PROJECTION_FACTOR too high for scalping radar');
+    if (BATCH_SIZE <= 0) errors.push('BATCH_SIZE must be > 0');
+
+    if (errors.length) {
+        throw new Error(`[CONFIG] Invalid config: ${errors.join('; ')}`);
+    }
+}
+
+
+// ============================================================
+// 5. HTTP CLIENT CÓ RETRY/BACKOFF
+// ============================================================
+
 async function binanceGet(path, params = {}, options = {}) {
-    const maxRetries = options.maxRetries ?? config.MAX_RETRIES;
-    const timeout = options.timeout ?? config.REQUEST_TIMEOUT_MS;
+    const maxRetries = options.maxRetries ?? MAX_RETRIES;
+    const timeout = options.timeout ?? REQUEST_TIMEOUT_MS;
+
     let lastError = null;
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -339,16 +377,13 @@ async function binanceGet(path, params = {}, options = {}) {
             }
 
             const delay = isRateLimitError(error)
-                ? config.RETRY_RATE_LIMIT_DELAY_MS
-                : config.RETRY_BASE_DELAY_MS * (attempt + 1);
+                ? RETRY_RATE_LIMIT_DELAY_MS
+                : RETRY_BASE_DELAY_MS * (attempt + 1);
 
             const status = error && error.response ? error.response.status : 'NA';
             const code = error && error.code ? error.code : 'NA';
 
-            console.warn(
-                `⚠️ [BINANCE] Retry ${attempt + 1}/${maxRetries} path=${path} status=${status} code=${code} delay=${delay}ms`
-            );
-
+            console.warn(`⚠️ [BINANCE] Retry ${attempt + 1}/${maxRetries} path=${path} status=${status} code=${code} delay=${delay}ms`);
             await sleep(jitter(delay));
         }
     }
@@ -356,16 +391,52 @@ async function binanceGet(path, params = {}, options = {}) {
     throw lastError;
 }
 
+async function syncBinanceTime(force = false) {
+    const now = Date.now();
+
+    if (!force && binanceTimeState.updatedAt > 0 && now - binanceTimeState.updatedAt < BINANCE_TIME_SYNC_MS) {
+        return binanceTimeState.offsetMs;
+    }
+
+    try {
+        const localBefore = Date.now();
+        const response = await binanceGet('/fapi/v1/time', {}, { maxRetries: 1, timeout: 5000 });
+        const localAfter = Date.now();
+
+        const serverTime = safeNumber(response.data.serverTime);
+        if (serverTime <= 0) return binanceTimeState.offsetMs;
+
+        const localMidpoint = Math.round((localBefore + localAfter) / 2);
+        const offsetMs = serverTime - localMidpoint;
+
+        binanceTimeState = {
+            updatedAt: now,
+            offsetMs,
+            lastServerTime: serverTime
+        };
+
+        if (Math.abs(offsetMs) > 1500) {
+            console.warn(`⚠️ [TIME] Local clock lệch Binance khoảng ${offsetMs}ms`);
+        }
+
+        return offsetMs;
+    } catch (error) {
+        console.warn(`⚠️ [TIME] Không sync được Binance time, dùng offset cũ=${binanceTimeState.offsetMs}ms | ${error.message}`);
+        return binanceTimeState.offsetMs;
+    }
+}
+
 
 // ============================================================
-// 6. LẤY 100% SYMBOL USDT-M PERPETUAL ĐANG TRADING
+// 6. FETCH SYMBOLS / TICKERS
 // ============================================================
-async function fetchTradableUSDTPerpetualSymbols() {
+
+async function fetchTradableSymbols() {
     const now = Date.now();
 
     if (
         tradableSymbolsCache.symbols.length > 0 &&
-        now - tradableSymbolsCache.updatedAt < config.SYMBOLS_CACHE_MS
+        now - tradableSymbolsCache.updatedAt < SYMBOLS_CACHE_MS
     ) {
         return tradableSymbolsCache.symbols;
     }
@@ -377,20 +448,22 @@ async function fetchTradableUSDTPerpetualSymbols() {
             .filter(item => item.status === 'TRADING')
             .filter(item => item.contractType === 'PERPETUAL')
             .filter(item => item.quoteAsset === 'USDT')
-            .map(item => item.symbol);
+            .map(item => item.symbol)
+            .filter(symbol => SAFE_SYMBOL_REGEX.test(symbol))
+            .filter(symbol => !EXCLUDED_SYMBOLS.has(symbol));
 
         tradableSymbolsCache = {
             updatedAt: now,
             symbols
         };
 
-        console.log(`🌐 [RADAR] USDT-M Perpetual đang trading: ${symbols.length} symbols`);
+        console.log(`🌐 [RADAR] Tradable filtered symbols: ${symbols.length}`);
         return symbols;
     } catch (error) {
-        console.error('❌ Lỗi lấy exchangeInfo:', error.message);
+        console.error('❌ [RADAR] Lỗi exchangeInfo:', error.message);
 
         if (tradableSymbolsCache.symbols.length > 0) {
-            console.warn('⚠️ [RADAR] Dùng lại cache symbol cũ do exchangeInfo lỗi');
+            console.warn('⚠️ [RADAR] Dùng cache symbols cũ');
             return tradableSymbolsCache.symbols;
         }
 
@@ -398,39 +471,32 @@ async function fetchTradableUSDTPerpetualSymbols() {
     }
 }
 
-
-// ============================================================
-// 7. LẤY 24H TICKER TOÀN THỊ TRƯỜNG
-// ============================================================
 async function fetch24hTickerMap() {
     const now = Date.now();
 
-    if (
-        tickerCache.map.size > 0 &&
-        now - tickerCache.updatedAt < config.TICKER_CACHE_MS
-    ) {
+    if (tickerCache.map.size > 0 && now - tickerCache.updatedAt < TICKER_CACHE_MS) {
         return tickerCache.map;
     }
 
     try {
         const response = await binanceGet('/fapi/v1/ticker/24hr');
-        const tickerMap = new Map();
+        const map = new Map();
 
-        for (const ticker of response.data) {
-            tickerMap.set(ticker.symbol, ticker);
+        for (const item of response.data) {
+            map.set(item.symbol, item);
         }
 
         tickerCache = {
             updatedAt: now,
-            map: tickerMap
+            map
         };
 
-        return tickerMap;
+        return map;
     } catch (error) {
-        console.error('❌ Lỗi lấy ticker 24h:', error.message);
+        console.error('❌ [RADAR] Lỗi ticker 24h:', error.message);
 
         if (tickerCache.map.size > 0) {
-            console.warn('⚠️ [RADAR] Dùng lại cache ticker cũ do ticker API lỗi');
+            console.warn('⚠️ [RADAR] Dùng cache ticker cũ');
             return tickerCache.map;
         }
 
@@ -438,42 +504,32 @@ async function fetch24hTickerMap() {
     }
 }
 
-
-// ============================================================
-// 8. LẤY BOOK TICKER TOÀN THỊ TRƯỜNG ĐỂ ĐO SPREAD
-// ------------------------------------------------------------
-// Spread quá rộng sẽ làm bot scalping dễ bị ăn phí + trượt giá.
-// Radar không vào lệnh nhưng vẫn nên loại bớt coin spread xấu.
-// ============================================================
 async function fetchBookTickerMap() {
     const now = Date.now();
 
-    if (
-        bookTickerCache.map.size > 0 &&
-        now - bookTickerCache.updatedAt < config.BOOK_TICKER_CACHE_MS
-    ) {
+    if (bookTickerCache.map.size > 0 && now - bookTickerCache.updatedAt < BOOK_TICKER_CACHE_MS) {
         return bookTickerCache.map;
     }
 
     try {
         const response = await binanceGet('/fapi/v1/ticker/bookTicker');
-        const bookMap = new Map();
+        const map = new Map();
 
         for (const item of response.data) {
-            bookMap.set(item.symbol, item);
+            map.set(item.symbol, item);
         }
 
         bookTickerCache = {
             updatedAt: now,
-            map: bookMap
+            map
         };
 
-        return bookMap;
+        return map;
     } catch (error) {
-        console.error('❌ Lỗi lấy bookTicker:', error.message);
+        console.error('❌ [RADAR] Lỗi bookTicker:', error.message);
 
         if (bookTickerCache.map.size > 0) {
-            console.warn('⚠️ [RADAR] Dùng lại cache bookTicker cũ do API lỗi');
+            console.warn('⚠️ [RADAR] Dùng cache bookTicker cũ');
             return bookTickerCache.map;
         }
 
@@ -483,289 +539,311 @@ async function fetchBookTickerMap() {
 
 
 // ============================================================
-// 9. MARKET CONTEXT BTC / ETH
-// ------------------------------------------------------------
-// Radar không trade theo BTC, nhưng context giúp score tốt hơn.
-// Nếu toàn market đang biến động mạnh, coin alt dễ có cơ hội hơn.
-// Nếu BTC/ETH cực xấu, vẫn publish nhưng gắn context cho tầng sau.
+// 7. CHART CONTEXT FILTER
 // ============================================================
-async function fetchMarketContext() {
-    const now = Date.now();
 
-    if (now - marketContextCache.updatedAt < config.MARKET_CONTEXT_CACHE_MS) {
-        return marketContextCache.context;
+function analyzeChartContext(closedHistory, current, previousClose, directionHint = 'WATCH') {
+    const contextTags = [];
+
+    const closeNow = safeNumber(current[4]);
+    const openNow = safeNumber(current[1]);
+    const highNow = safeNumber(current[2]);
+    const lowNow = safeNumber(current[3]);
+
+    const closes = closedHistory.map(klineClose).filter(v => v > 0);
+    const highs = closedHistory.map(klineHigh).filter(v => v > 0);
+    const lows = closedHistory.map(klineLow).filter(v => v > 0);
+
+    if (
+        closeNow <= 0 ||
+        openNow <= 0 ||
+        highNow <= 0 ||
+        lowNow <= 0 ||
+        previousClose <= 0 ||
+        closes.length < 12 ||
+        highs.length < 12 ||
+        lows.length < 12
+    ) {
+        return {
+            trendScore: 0,
+            breakoutScore: 0,
+            chopPenalty: 0.3,
+            wickPenalty: 0.3,
+            lateMovePenalty: 0,
+            volatilityScore: 0,
+            recentMove6: 0,
+            recentMove12: 0,
+            contextTags: ['CONTEXT_INSUFFICIENT']
+        };
     }
 
-    try {
-        const [btcResponse, ethResponse] = await Promise.all([
-            binanceGet('/fapi/v1/klines', {
-                symbol: 'BTCUSDT',
-                interval: '1m',
-                limit: 6
-            }, { maxRetries: 1 }),
-            binanceGet('/fapi/v1/klines', {
-                symbol: 'ETHUSDT',
-                interval: '1m',
-                limit: 6
-            }, { maxRetries: 1 })
-        ]);
+    const close6Ago = closes[Math.max(0, closes.length - 6)];
+    const close12Ago = closes[Math.max(0, closes.length - 12)];
 
-        const btcKlines = btcResponse.data || [];
-        const ethKlines = ethResponse.data || [];
+    const recentMove6 = pctChange(close6Ago, closeNow);
+    const recentMove12 = pctChange(close12Ago, closeNow);
 
-        const btcFirstClose = safeNumber(btcKlines[0]?.[4]);
-        const btcLastClose = safeNumber(btcKlines[btcKlines.length - 1]?.[4]);
+    const directionForContext = directionHint === 'LONG' || directionHint === 'SHORT'
+        ? directionHint
+        : closeNow >= previousClose ? 'LONG' : 'SHORT';
 
-        const ethFirstClose = safeNumber(ethKlines[0]?.[4]);
-        const ethLastClose = safeNumber(ethKlines[ethKlines.length - 1]?.[4]);
+    let trend6Aligned = 0;
+    let trend12Aligned = 0;
 
-        const btcReturn5m = pctChange(btcFirstClose, btcLastClose);
-        const ethReturn5m = pctChange(ethFirstClose, ethLastClose);
+    if (directionForContext === 'LONG') {
+        trend6Aligned = recentMove6 > 0 ? clamp(recentMove6 / 0.018, 0, 1) : 0;
+        trend12Aligned = recentMove12 > 0 ? clamp(recentMove12 / 0.035, 0, 1) : 0;
+    } else {
+        trend6Aligned = recentMove6 < 0 ? clamp(Math.abs(recentMove6) / 0.018, 0, 1) : 0;
+        trend12Aligned = recentMove12 < 0 ? clamp(Math.abs(recentMove12) / 0.035, 0, 1) : 0;
+    }
 
-        const absBtc = Math.abs(btcReturn5m);
-        const absEth = Math.abs(ethReturn5m);
+    let trendScore = trend6Aligned * 0.6 + trend12Aligned * 0.4;
 
-        let marketBias = 'NEUTRAL';
+    const recentHigh12 = Math.max(...highs.slice(-12));
+    const recentLow12 = Math.min(...lows.slice(-12));
+    const range12 = recentHigh12 - recentLow12;
 
-        if (btcReturn5m > 0.0025 && ethReturn5m > 0.0025) {
-            marketBias = 'RISK_ON';
-        } else if (btcReturn5m < -0.0025 && ethReturn5m < -0.0025) {
-            marketBias = 'RISK_OFF';
+    let positionScore = 0;
+
+    if (range12 > 0) {
+        const posInRange = (closeNow - recentLow12) / range12;
+
+        if (directionForContext === 'LONG') {
+            positionScore = clamp((posInRange - 0.5) / 0.5, 0, 1);
+        } else {
+            positionScore = clamp((0.5 - posInRange) / 0.5, 0, 1);
+        }
+    }
+
+    trendScore = clamp(trendScore * 0.7 + positionScore * 0.3, 0, 1);
+
+    if (trendScore >= 0.45) {
+        contextTags.push('TREND_CONTEXT_OK');
+    }
+
+    const recentHigh6 = Math.max(...highs.slice(-6));
+    const recentLow6 = Math.min(...lows.slice(-6));
+    const recentHigh12Closed = Math.max(...highs.slice(-12));
+    const recentLow12Closed = Math.min(...lows.slice(-12));
+
+    let breakoutScore = 0;
+
+    if (directionForContext === 'LONG') {
+        const breakout6 = closeNow > recentHigh6
+            ? clamp((closeNow - recentHigh6) / previousClose / 0.006, 0, 1)
+            : 0;
+
+        const breakout12 = closeNow > recentHigh12Closed
+            ? clamp((closeNow - recentHigh12Closed) / previousClose / 0.01, 0, 1)
+            : 0;
+
+        breakoutScore = clamp(breakout6 * 0.55 + breakout12 * 0.45, 0, 1);
+
+        if (breakoutScore >= 0.25) {
+            contextTags.push('BREAKOUT_UP');
+        }
+    } else {
+        const breakout6 = closeNow < recentLow6
+            ? clamp((recentLow6 - closeNow) / previousClose / 0.006, 0, 1)
+            : 0;
+
+        const breakout12 = closeNow < recentLow12Closed
+            ? clamp((recentLow12Closed - closeNow) / previousClose / 0.01, 0, 1)
+            : 0;
+
+        breakoutScore = clamp(breakout6 * 0.55 + breakout12 * 0.45, 0, 1);
+
+        if (breakoutScore >= 0.25) {
+            contextTags.push('BREAKOUT_DOWN');
+        }
+    }
+
+    const last12Closes = closes.slice(-12);
+    const returns = [];
+
+    for (let i = 1; i < last12Closes.length; i++) {
+        returns.push(pctChange(last12Closes[i - 1], last12Closes[i]));
+    }
+
+    const sumAbsReturn = returns.reduce((sum, r) => sum + Math.abs(r), 0);
+    const netMove = Math.abs(pctChange(last12Closes[0], last12Closes[last12Closes.length - 1]));
+
+    let choppiness = 0;
+
+    if (netMove > 0.0001) {
+        choppiness = sumAbsReturn / netMove;
+    } else {
+        choppiness = sumAbsReturn > 0.006 ? 10 : 1;
+    }
+
+    const directionChanges = returns.reduce((count, r, i) => {
+        if (i === 0) return count;
+        const prev = returns[i - 1];
+        if ((prev > 0 && r < 0) || (prev < 0 && r > 0)) return count + 1;
+        return count;
+    }, 0);
+
+    let chopPenalty = 0;
+
+    if (choppiness <= 2.2) {
+        chopPenalty = 0;
+    } else if (choppiness <= 4.5) {
+        chopPenalty = clamp((choppiness - 2.2) / 2.3 * 0.5, 0, 0.5);
+    } else {
+        chopPenalty = clamp(0.5 + (choppiness - 4.5) / 5.5 * 0.5, 0.5, 1);
+    }
+
+    chopPenalty = clamp(chopPenalty + clamp(directionChanges / 10, 0, 0.35), 0, 1);
+
+    if (chopPenalty >= 0.45) {
+        contextTags.push('CHOPPY_STRUCTURE');
+    } else {
+        contextTags.push('CLEAN_STRUCTURE');
+    }
+
+    const candleRange = highNow - lowNow;
+    const body = Math.abs(closeNow - openNow);
+
+    let wickPenalty = 0;
+
+    if (candleRange > 0) {
+        const upperWick = highNow - Math.max(openNow, closeNow);
+        const lowerWick = Math.min(openNow, closeNow) - lowNow;
+        const upperWickRatio = clamp(upperWick / candleRange, 0, 1);
+        const lowerWickRatio = clamp(lowerWick / candleRange, 0, 1);
+        const bodyRatio = clamp(body / candleRange, 0, 1);
+        const totalWickRatio = clamp(1 - bodyRatio, 0, 1);
+
+        if (directionForContext === 'LONG') {
+            wickPenalty = upperWickRatio >= 0.45
+                ? clamp((upperWickRatio - 0.35) / 0.55, 0, 1)
+                : clamp(totalWickRatio * 0.25, 0, 0.25);
+        } else {
+            wickPenalty = lowerWickRatio >= 0.45
+                ? clamp((lowerWickRatio - 0.35) / 0.55, 0, 1)
+                : clamp(totalWickRatio * 0.25, 0, 0.25);
         }
 
-        let volatilityMode = 'NORMAL';
-
-        if (absBtc >= 0.006 || absEth >= 0.008) {
-            volatilityMode = 'HIGH';
-        } else if (absBtc <= 0.001 && absEth <= 0.0015) {
-            volatilityMode = 'LOW';
+        if (bodyRatio < 0.25 && totalWickRatio > 0.65) {
+            wickPenalty = clamp(wickPenalty + 0.35, 0, 1);
         }
-
-        const context = {
-            btcReturn5m: round(btcReturn5m, 6),
-            ethReturn5m: round(ethReturn5m, 6),
-            marketBias,
-            volatilityMode
-        };
-
-        marketContextCache = {
-            updatedAt: now,
-            context
-        };
-
-        return context;
-    } catch (error) {
-        console.warn('⚠️ [RADAR] Không lấy được market context:', error.message);
-        return marketContextCache.context;
-    }
-}
-
-
-// ============================================================
-// 10. TÍNH SPREAD BPS
-// ============================================================
-function calculateSpreadBps(bookTicker) {
-    if (!bookTicker) return null;
-
-    const bid = safeNumber(bookTicker.bidPrice);
-    const ask = safeNumber(bookTicker.askPrice);
-
-    if (bid <= 0 || ask <= 0 || ask < bid) return null;
-
-    const mid = (bid + ask) / 2;
-    if (mid <= 0) return null;
-
-    return ((ask - bid) / mid) * 10000;
-}
-
-
-// ============================================================
-// 11. BUILD TAG TÍN HIỆU
-// ------------------------------------------------------------
-// Tags giúp tầng sau biết coin đang bất thường kiểu gì.
-// Đây là điểm quan trọng hơn direction trong radar tầng đầu.
-// ============================================================
-function buildSignalTags(metrics) {
-    const tags = [];
-
-    if (metrics.volumeZ >= 3) tags.push('VOLUME_SPIKE');
-    else if (metrics.volumeZ >= config.MIN_VOLUME_Z) tags.push('VOLUME_WAKEUP');
-
-    if (metrics.quoteVolumeZ >= 3) tags.push('QUOTE_VOLUME_SPIKE');
-    else if (metrics.quoteVolumeZ >= config.MIN_QUOTE_VOLUME_Z) tags.push('QUOTE_VOLUME_WAKEUP');
-
-    if (metrics.tradeCountZ >= 2.5) tags.push('TRADE_COUNT_SPIKE');
-    else if (metrics.tradeCountZ >= config.MIN_TRADES_Z) tags.push('TRADE_COUNT_WAKEUP');
-
-    if (metrics.absPriceChange3m >= 0.01) tags.push('PRICE_IMPULSE_STRONG');
-    else if (metrics.absPriceChange3m >= config.MIN_PRICE_MOVE_3M) tags.push('PRICE_WAKEUP');
-
-    if (metrics.range3m >= 0.012) tags.push('RANGE_EXPANSION_STRONG');
-    else if (metrics.range3m >= config.MIN_RANGE_3M) tags.push('RANGE_EXPANSION');
-
-    if (metrics.bodyStrength >= 0.6) tags.push('STRONG_BODY');
-    else if (metrics.bodyStrength >= config.MIN_BODY_STRENGTH) tags.push('BODY_CONFIRMED');
-
-    if (metrics.upperWickRatio >= 0.45 && metrics.range3m >= config.MIN_RANGE_3M) {
-        tags.push('UPPER_WICK_ACTIVITY');
     }
 
-    if (metrics.lowerWickRatio >= 0.45 && metrics.range3m >= config.MIN_RANGE_3M) {
-        tags.push('LOWER_WICK_ACTIVITY');
+    if (wickPenalty >= 0.45) {
+        contextTags.push('LONG_WICK_RISK');
     }
 
-    if (metrics.takerBuyRatio >= 0.58) tags.push('BUY_FLOW_STRONG');
-    else if (metrics.takerBuyRatio >= config.LONG_TAKER_BUY_RATIO) tags.push('BUY_FLOW');
+    let lateMovePenalty = 0;
 
-    if (metrics.takerBuyRatio <= 0.42) tags.push('SELL_FLOW_STRONG');
-    else if (metrics.takerBuyRatio <= config.SHORT_TAKER_BUY_RATIO) tags.push('SELL_FLOW');
-
-    if (metrics.projectionFactor > 1.5) tags.push('PROJECTED_VOLUME');
-
-    if (metrics.spreadBps !== null && metrics.spreadBps <= 4) tags.push('TIGHT_SPREAD');
-    if (metrics.spreadBps !== null && metrics.spreadBps > config.MAX_SPREAD_BPS) tags.push('WIDE_SPREAD');
-
-    if (metrics.marketContext.marketBias === 'RISK_ON') tags.push('MARKET_RISK_ON');
-    if (metrics.marketContext.marketBias === 'RISK_OFF') tags.push('MARKET_RISK_OFF');
-    if (metrics.marketContext.volatilityMode === 'HIGH') tags.push('MARKET_VOLATILE');
-
-    return tags;
-}
-
-
-// ============================================================
-// 12. GỢI Ý DIRECTION NHẸ, KHÔNG ÉP QUÁ SỚM
-// ------------------------------------------------------------
-// Radar chỉ đưa suggestedDirection.
-// Tầng sau mới quyết định hướng thật.
-// ============================================================
-function inferSuggestedDirection(metrics) {
-    let suggestedDirection = 'WATCH';
-
-    const buyBias = metrics.takerBuyRatio - 0.5;
-    const flowStrength = Math.abs(buyBias) * 2;
-    const moveStrength = Math.min(metrics.absPriceChange3m / 0.01, 1);
-    const bodyStrength = clamp(metrics.bodyStrength, 0, 1);
-
-    let directionConfidence = clamp(
-        flowStrength * 0.45 +
-        moveStrength * 0.35 +
-        bodyStrength * 0.20,
-        0,
-        1
-    );
-
-    if (
-        metrics.priceChange3m > 0 &&
-        metrics.takerBuyRatio >= config.LONG_TAKER_BUY_RATIO
-    ) {
-        suggestedDirection = 'LONG';
+    if (Math.abs(recentMove6) > 0.035) {
+        lateMovePenalty += clamp((Math.abs(recentMove6) - 0.035) / 0.035 * 0.65, 0, 0.65);
     }
 
-    if (
-        metrics.priceChange3m < 0 &&
-        metrics.takerBuyRatio <= config.SHORT_TAKER_BUY_RATIO
-    ) {
-        suggestedDirection = 'SHORT';
+    if (Math.abs(recentMove12) > 0.055) {
+        lateMovePenalty += clamp((Math.abs(recentMove12) - 0.055) / 0.055 * 0.65, 0, 0.65);
     }
 
-    // Nếu giá chạy lên nhưng taker sell áp đảo, hướng chưa sạch.
-    if (
-        metrics.priceChange3m > 0 &&
-        metrics.takerBuyRatio < 0.48
-    ) {
-        suggestedDirection = 'WATCH';
-        directionConfidence *= 0.65;
+    lateMovePenalty = clamp(lateMovePenalty, 0, 1);
+
+    if (lateMovePenalty >= 0.35) {
+        contextTags.push('LATE_MOVE_RISK');
     }
 
-    // Nếu giá giảm nhưng taker buy hấp thụ mạnh, hướng chưa sạch.
-    if (
-        metrics.priceChange3m < 0 &&
-        metrics.takerBuyRatio > 0.52
-    ) {
-        suggestedDirection = 'WATCH';
-        directionConfidence *= 0.65;
+    const last12Klines = closedHistory.slice(-12);
+    const ranges = last12Klines.map(k => {
+        const h = klineHigh(k);
+        const l = klineLow(k);
+        const c = klineClose(k);
+        if (h <= 0 || l <= 0 || c <= 0) return 0;
+        return (h - l) / c;
+    }).filter(v => v > 0);
+
+    const avgRange = mean(ranges);
+
+    let volatilityScore = 0;
+
+    if (avgRange < 0.0025) {
+        volatilityScore = clamp(avgRange / 0.0025 * 0.35, 0, 0.35);
+    } else if (avgRange <= 0.018) {
+        volatilityScore = clamp(0.35 + (avgRange - 0.0025) / 0.0155 * 0.65, 0.35, 1);
+    } else {
+        volatilityScore = clamp(1 - (avgRange - 0.018) / 0.035, 0.25, 1);
+    }
+
+    if (volatilityScore >= 0.45) {
+        contextTags.push('VOLATILITY_OK');
     }
 
     return {
-        suggestedDirection,
-        directionConfidence: round(directionConfidence, 4)
+        trendScore: round(trendScore, 4),
+        breakoutScore: round(breakoutScore, 4),
+        chopPenalty: round(chopPenalty, 4),
+        wickPenalty: round(wickPenalty, 4),
+        lateMovePenalty: round(lateMovePenalty, 4),
+        volatilityScore: round(volatilityScore, 4),
+        recentMove6: round(recentMove6, 6),
+        recentMove12: round(recentMove12, 6),
+        contextTags
     };
 }
 
 
 // ============================================================
-// 13. CHẤM ĐIỂM OPPORTUNITY
-// ------------------------------------------------------------
-// Đây là score để quyết định coin có đáng đưa vào radar không.
-// Không phải score để vào lệnh.
+// 8. ANALYZE SYMBOL
 // ============================================================
-function inferOpportunityScore(metrics) {
-    const moveScore = Math.min(metrics.absPriceChange3m / 0.012, 1);
-    const volumeScore = Math.min(metrics.volumeZ / 4, 1);
-    const quoteVolumeScore = Math.min(metrics.quoteVolumeZ / 4, 1);
-    const tradeCountScore = Math.min(metrics.tradeCountZ / 3.5, 1);
-    const rangeScore = Math.min(metrics.range3m / 0.015, 1);
-    const bodyScore = Math.min(metrics.bodyStrength, 1);
 
-    const flowImbalance = Math.abs(metrics.takerBuyRatio - 0.5) * 2;
-    const flowScore = clamp(flowImbalance, 0, 1);
+function getSpreadBps(symbol, bookTickerMap, filterStats) {
+    const item = bookTickerMap.get(symbol);
 
-    let spreadScore = 0.7;
-    if (metrics.spreadBps !== null) {
-        spreadScore = clamp(1 - metrics.spreadBps / config.MAX_SPREAD_BPS, 0, 1);
+    if (!item) {
+        filterStats.missingBookTicker += 1;
+        return null;
     }
 
-    let marketScore = 0.5;
+    const bid = safeNumber(item.bidPrice);
+    const ask = safeNumber(item.askPrice);
 
-    if (metrics.marketContext.volatilityMode === 'HIGH') {
-        marketScore = 0.75;
+    if (bid <= 0 || ask <= 0 || ask <= bid) {
+        filterStats.missingBookTicker += 1;
+        return null;
     }
 
-    if (metrics.marketContext.marketBias === 'RISK_ON' && metrics.priceChange3m > 0) {
-        marketScore = 0.8;
-    }
-
-    if (metrics.marketContext.marketBias === 'RISK_OFF' && metrics.priceChange3m < 0) {
-        marketScore = 0.8;
-    }
-
-    // Trọng số được thiết kế cho radar tầng đầu:
-    // volume/range/trades quan trọng vì nhiệm vụ là bắt bất thường,
-    // không phải đo xác suất thắng cuối.
-    const score =
-        volumeScore * 0.22 +
-        quoteVolumeScore * 0.13 +
-        tradeCountScore * 0.14 +
-        moveScore * 0.17 +
-        rangeScore * 0.14 +
-        bodyScore * 0.07 +
-        flowScore * 0.06 +
-        spreadScore * 0.04 +
-        marketScore * 0.03;
-
-    return round(clamp(score, 0, 1), 4);
+    const mid = (bid + ask) / 2;
+    return ((ask - bid) / mid) * 10000;
 }
 
-
-// ============================================================
-// 14. PHÂN TÍCH OPPORTUNITY CHO 1 SYMBOL
-// ------------------------------------------------------------
-// Đây là lõi radar mới.
-// Thay vì bắt buộc đủ tất cả điều kiện,
-// dùng trigger-count để bắt rộng hơn nhưng vẫn tránh coin rác.
-// ============================================================
-async function analyzeOpportunity(symbol, bookTicker, marketContext) {
+async function analyzeSymbol(symbol, ticker24h, bookTickerMap, filterStats, scanId) {
     try {
+        if (!ticker24h) {
+            filterStats.missingTicker += 1;
+            return null;
+        }
+
+        const bookSpreadBps = getSpreadBps(symbol, bookTickerMap, filterStats);
+
+        // Production-stable: thiếu bookTicker thì không chọn coin, vì scalping rất sợ spread/slippage mù.
+        if (bookSpreadBps === null) {
+            return null;
+        }
+
+        if (bookSpreadBps > MAX_SPREAD_BPS) {
+            filterStats.highSpread += 1;
+            return null;
+        }
+
         const response = await binanceGet('/fapi/v1/klines', {
             symbol,
-            interval: config.IMPULSE_INTERVAL,
-            limit: config.IMPULSE_KLINE_LIMIT
-        }, { maxRetries: 1 });
+            interval: RADAR_INTERVAL,
+            limit: KLINE_LIMIT
+        }, {
+            maxRetries: 1
+        });
 
         const klines = response.data;
 
-        if (!Array.isArray(klines) || klines.length < config.IMPULSE_KLINE_LIMIT) {
+        if (!Array.isArray(klines) || klines.length < KLINE_LIMIT) {
+            filterStats.klineInvalid += 1;
             return null;
         }
 
@@ -780,9 +858,9 @@ async function analyzeOpportunity(symbol, bookTicker, marketContext) {
         const closeNow = safeNumber(current[4]);
         const volumeNow = safeNumber(current[5]);
         const quoteVolumeNow = safeNumber(current[7]);
-        const numberOfTrades = safeNumber(current[8]);
-        const takerBuyBaseVolume = safeNumber(current[9]);
-        const takerBuyQuoteVolume = safeNumber(current[10]);
+        const tradesNow = safeNumber(current[8]);
+        const takerBuyBaseNow = safeNumber(current[9]);
+        const takerBuyQuoteNow = safeNumber(current[10]);
         const previousClose = safeNumber(previous[4]);
 
         if (
@@ -792,464 +870,441 @@ async function analyzeOpportunity(symbol, bookTicker, marketContext) {
             lowNow <= 0 ||
             closeNow <= 0 ||
             previousClose <= 0 ||
-            volumeNow <= 0
+            volumeNow <= 0 ||
+            quoteVolumeNow <= 0
         ) {
+            filterStats.invalidPrice += 1;
             return null;
         }
 
-        // ----------------------------------------------------
-        // 14.1 PROJECTED VOLUME CHO NẾN CHƯA ĐÓNG
-        // ----------------------------------------------------
-        const elapsedRawMs = Date.now() - openTime;
-        const intervalMs = config.IMPULSE_INTERVAL_MS;
-        const maxElapsedMs = intervalMs * config.MAX_CANDLE_ELAPSED_RATIO;
-        const elapsedMs = clamp(elapsedRawMs, 0, maxElapsedMs);
+        const elapsedRawMs = binanceNow() - openTime;
+        const elapsedMs = clamp(elapsedRawMs, 0, RADAR_INTERVAL_MS);
 
-        // Không phân tích quá sớm đầu nến để tránh projection bị ảo.
-        if (elapsedMs < config.MIN_CANDLE_ELAPSED_MS) {
+        if (elapsedMs < MIN_CANDLE_ELAPSED_MS) {
+            filterStats.candleTooEarly += 1;
             return null;
         }
 
         let projectionFactor = 1;
 
-        if (elapsedMs > 0 && elapsedMs < intervalMs) {
-            projectionFactor = Math.min(
-                intervalMs / elapsedMs,
-                config.MAX_PROJECTION_FACTOR
-            );
+        if (elapsedMs > 0 && elapsedMs < RADAR_INTERVAL_MS) {
+            projectionFactor = RADAR_INTERVAL_MS / elapsedMs;
         }
+
+        projectionFactor = clamp(projectionFactor, 1, MAX_PROJECTION_FACTOR);
 
         const projectedVolume = volumeNow * projectionFactor;
         const projectedQuoteVolume = quoteVolumeNow * projectionFactor;
-        const projectedTrades = numberOfTrades * projectionFactor;
-        const projectedTakerBuyBaseVolume = takerBuyBaseVolume * projectionFactor;
-        const projectedTakerBuyQuoteVolume = takerBuyQuoteVolume * projectionFactor;
+        const projectedTrades = tradesNow * projectionFactor;
 
-        // ----------------------------------------------------
-        // 14.2 BASELINE CHỈ LẤY NẾN ĐÃ ĐÓNG
-        // ----------------------------------------------------
         const historyVolumes = closedHistory.map(k => safeNumber(k[5])).filter(v => v > 0);
         const historyQuoteVolumes = closedHistory.map(k => safeNumber(k[7])).filter(v => v > 0);
         const historyTrades = closedHistory.map(k => safeNumber(k[8])).filter(v => v > 0);
 
-        if (historyVolumes.length === 0) return null;
+        const avgVolume = mean(historyVolumes);
+        const avgQuoteVolume = mean(historyQuoteVolumes);
+        const avgTrades = mean(historyTrades);
 
-        const avgVolume = average(historyVolumes);
-        const avgQuoteVolume = average(historyQuoteVolumes);
-        const avgTrades = average(historyTrades);
+        if (avgVolume <= 0 || avgQuoteVolume <= 0 || avgTrades <= 0) {
+            filterStats.lowBaseline += 1;
+            return null;
+        }
 
-        if (avgVolume <= 0) return null;
+        const volumeRatio = projectedVolume / avgVolume;
+        const quoteVolumeRatio = projectedQuoteVolume / avgQuoteVolume;
+        const tradesRatio = projectedTrades / avgTrades;
 
-        // ----------------------------------------------------
-        // 14.3 METRICS BIẾN ĐỘNG
-        // ----------------------------------------------------
-        const priceChange3m = pctChange(previousClose, closeNow);
-        const absPriceChange3m = Math.abs(priceChange3m);
-
-        const volumeZ = projectedVolume / avgVolume;
-        const quoteVolumeZ = avgQuoteVolume > 0
-            ? projectedQuoteVolume / avgQuoteVolume
-            : volumeZ;
-
-        const tradeCountZ = avgTrades > 0
-            ? projectedTrades / avgTrades
-            : 1;
+        const priceChange3m = (closeNow - previousClose) / previousClose;
+        const absMove = Math.abs(priceChange3m);
 
         const range3m = (highNow - lowNow) / previousClose;
         const candleRange = highNow - lowNow;
-
         const bodyStrength = candleRange > 0
             ? Math.abs(closeNow - openNow) / candleRange
             : 0;
 
-        const upperWick = candleRange > 0
-            ? highNow - Math.max(openNow, closeNow)
-            : 0;
-
-        const lowerWick = candleRange > 0
-            ? Math.min(openNow, closeNow) - lowNow
-            : 0;
-
-        const upperWickRatio = candleRange > 0
-            ? upperWick / candleRange
-            : 0;
-
-        const lowerWickRatio = candleRange > 0
-            ? lowerWick / candleRange
-            : 0;
-
-        // Taker buy ratio dùng volume thật, không cần projected,
-        // vì tỷ lệ mua/bán trong phần nến đã chạy vẫn có ý nghĩa.
         const takerBuyRatio = volumeNow > 0
-            ? takerBuyBaseVolume / volumeNow
+            ? takerBuyBaseNow / volumeNow
             : 0.5;
 
-        const spreadBps = calculateSpreadBps(bookTicker);
+        const takerBuyQuoteRatio = quoteVolumeNow > 0
+            ? takerBuyQuoteNow / quoteVolumeNow
+            : takerBuyRatio;
 
-        // ----------------------------------------------------
-        // 14.4 LOẠI COIN SPREAD QUÁ XẤU
-        // ----------------------------------------------------
-        // Với scalping, spread quá rộng làm tầng sau tốn tài nguyên vô ích.
-        // Nhưng nếu không lấy được spread thì không loại, tránh miss do API lỗi.
-        if (spreadBps !== null && spreadBps > config.MAX_SPREAD_BPS) {
+        const quoteVolume24h = safeNumber(ticker24h.quoteVolume);
+        const priceChange24h = safeNumber(ticker24h.priceChangePercent) / 100;
+
+        const hasPriceAction =
+            absMove >= MIN_ABS_MOVE ||
+            (range3m >= MIN_RANGE && bodyStrength >= MIN_BODY_STRENGTH);
+
+        if (!hasPriceAction) {
+            filterStats.weakPriceAction += 1;
             return null;
         }
 
-        const metrics = {
-            symbol,
-            openTime,
-            elapsedMs,
-            intervalMs,
-            projectionFactor,
+        if (volumeRatio < MIN_VOLUME_RATIO && quoteVolumeRatio < MIN_QUOTE_VOLUME_RATIO) {
+            filterStats.lowVolume += 1;
+            return null;
+        }
 
-            openNow,
-            highNow,
-            lowNow,
-            closeNow,
+        if (tradesRatio < MIN_TRADES_RATIO) {
+            filterStats.lowTrades += 1;
+            return null;
+        }
+
+        if (range3m < MIN_RANGE) {
+            filterStats.lowRange += 1;
+            return null;
+        }
+
+        if (bodyStrength < MIN_BODY_STRENGTH) {
+            filterStats.weakBody += 1;
+            return null;
+        }
+
+        const strongMomentum =
+            absMove >= 0.006 &&
+            range3m >= 0.009 &&
+            bodyStrength >= 0.5 &&
+            tradesRatio >= 1.8 &&
+            (volumeRatio >= 2.5 || quoteVolumeRatio >= 2.5);
+
+        let direction = 'WATCH';
+
+        if (priceChange3m > 0 && takerBuyRatio >= 0.52) {
+            direction = 'LONG';
+        } else if (priceChange3m < 0 && takerBuyRatio <= 0.48) {
+            direction = 'SHORT';
+        }
+
+        const flowBias = (takerBuyRatio - 0.5) * 2;
+        const quoteFlowBias = (takerBuyQuoteRatio - 0.5) * 2;
+
+        const signedMoveScore = clamp(Math.abs(priceChange3m) / 0.015, 0, 1);
+        const flowScore = clamp(Math.abs(flowBias), 0, 1);
+        const quoteFlowScore = clamp(Math.abs(quoteFlowBias), 0, 1);
+
+        let dirConf =
+            signedMoveScore * 0.55 +
+            flowScore * 0.25 +
+            quoteFlowScore * 0.20;
+
+        dirConf = round(dirConf, 4);
+
+        const chartContext = analyzeChartContext(
+            closedHistory,
+            current,
             previousClose,
-
-            priceChange3m,
-            absPriceChange3m,
-            range3m,
-            bodyStrength,
-            upperWickRatio,
-            lowerWickRatio,
-
-            volumeNow,
-            projectedVolume,
-            quoteVolumeNow,
-            projectedQuoteVolume,
-            avgVolume,
-            avgQuoteVolume,
-            volumeZ,
-            quoteVolumeZ,
-
-            numberOfTrades,
-            projectedTrades,
-            avgTrades,
-            tradeCountZ,
-
-            takerBuyRatio,
-            takerBuyBaseVolume,
-            projectedTakerBuyBaseVolume,
-            takerBuyQuoteVolume,
-            projectedTakerBuyQuoteVolume,
-
-            spreadBps,
-            marketContext
-        };
-
-        // ----------------------------------------------------
-        // 14.5 TRIGGER COUNT - LỌC MỀM
-        // ----------------------------------------------------
-        // Radar tầng đầu không nên bắt buộc đủ tất cả điều kiện.
-        // Chỉ cần có ít nhất N dấu hiệu bất thường.
-        let triggerCount = 0;
-        const triggerReasons = [];
-
-        if (absPriceChange3m >= config.MIN_PRICE_MOVE_3M) {
-            triggerCount++;
-            triggerReasons.push('PRICE_MOVE');
-        }
-
-        if (volumeZ >= config.MIN_VOLUME_Z) {
-            triggerCount++;
-            triggerReasons.push('VOLUME_Z');
-        }
-
-        if (quoteVolumeZ >= config.MIN_QUOTE_VOLUME_Z) {
-            triggerCount++;
-            triggerReasons.push('QUOTE_VOLUME_Z');
-        }
-
-        if (tradeCountZ >= config.MIN_TRADES_Z) {
-            triggerCount++;
-            triggerReasons.push('TRADE_COUNT_Z');
-        }
-
-        if (range3m >= config.MIN_RANGE_3M) {
-            triggerCount++;
-            triggerReasons.push('RANGE');
-        }
-
-        if (bodyStrength >= config.MIN_BODY_STRENGTH) {
-            triggerCount++;
-            triggerReasons.push('BODY');
-        }
-
-        // Trường hợp đặc biệt:
-        // Nếu volume/trade tăng cực mạnh nhưng giá chưa chạy,
-        // vẫn nên đưa vào WATCH vì có thể là giai đoạn gom/xả trước biến động.
-        const earlyActivity =
-            volumeZ >= 2.5 &&
-            tradeCountZ >= 2 &&
-            range3m >= config.MIN_RANGE_3M * 0.65;
-
-        if (triggerCount < config.MIN_TRIGGER_COUNT && !earlyActivity) {
-            return null;
-        }
-
-        const tags = buildSignalTags(metrics);
-        const opportunityScore = inferOpportunityScore(metrics);
-
-        if (opportunityScore < config.OPPORTUNITY_THRESHOLD && !earlyActivity) {
-            return null;
-        }
+            direction
+        );
 
         const {
-            suggestedDirection,
-            directionConfidence
-        } = inferSuggestedDirection(metrics);
+            trendScore,
+            breakoutScore,
+            chopPenalty,
+            wickPenalty,
+            lateMovePenalty,
+            volatilityScore,
+            recentMove6,
+            recentMove12,
+            contextTags
+        } = chartContext;
 
-        const priority = opportunityScore >= config.HOT_THRESHOLD
-            ? 'HOT'
-            : 'WATCH';
+        if (wickPenalty >= 0.75 && bodyStrength < 0.42) {
+            filterStats.highWick += 1;
+            return null;
+        }
 
-        const candidate = {
-            // Giữ field cũ cho tương thích downstream.
-            symbol,
-            direction: suggestedDirection,
-            score: opportunityScore,
+        if (!strongMomentum && chopPenalty >= 0.82 && breakoutScore < 0.2) {
+            filterStats.choppy += 1;
+            return null;
+        }
 
-            // Field mới rõ nghĩa hơn.
-            suggestedDirection,
-            opportunityScore,
-            directionConfidence,
-            priority,
+        if (!strongMomentum && lateMovePenalty >= 0.75 && direction === 'WATCH') {
+            filterStats.lateWatch += 1;
+            return null;
+        }
 
-            signalType: 'OPPORTUNITY',
-            timeframe: config.IMPULSE_INTERVAL,
-            reason: `${priority}_OPPORTUNITY_${config.IMPULSE_INTERVAL}`,
+        const tags = [];
 
-            tags,
-            triggerCount,
-            triggerReasons,
+        if (volumeRatio >= 3) tags.push('VOLUME_SPIKE');
+        else if (volumeRatio >= MIN_VOLUME_RATIO) tags.push('VOLUME_WAKEUP');
 
-            priceChange3m: round(priceChange3m, 6),
-            absPriceChange3m: round(absPriceChange3m, 6),
-            volumeZ: round(volumeZ, 4),
-            quoteVolumeZ: round(quoteVolumeZ, 4),
-            tradeCountZ: round(tradeCountZ, 4),
-            range3m: round(range3m, 6),
-            bodyStrength: round(bodyStrength, 4),
-            upperWickRatio: round(upperWickRatio, 4),
-            lowerWickRatio: round(lowerWickRatio, 4),
-            takerBuyRatio: round(takerBuyRatio, 4),
+        if (quoteVolumeRatio >= 3) tags.push('QUOTE_VOLUME_SPIKE');
+        else if (quoteVolumeRatio >= MIN_QUOTE_VOLUME_RATIO) tags.push('QUOTE_VOLUME_WAKEUP');
 
-            volumeNow: round(volumeNow, 4),
-            projectedVolume: round(projectedVolume, 4),
-            avgVolume: round(avgVolume, 4),
+        if (tradesRatio >= 2.5) tags.push('TRADE_COUNT_SPIKE');
+        else if (tradesRatio >= MIN_TRADES_RATIO) tags.push('TRADE_COUNT_WAKEUP');
 
-            quoteVolumeNow: round(quoteVolumeNow, 2),
-            projectedQuoteVolume: round(projectedQuoteVolume, 2),
-            avgQuoteVolume: round(avgQuoteVolume, 2),
+        if (absMove >= 0.008) tags.push('PRICE_IMPULSE_STRONG');
+        else if (absMove >= MIN_ABS_MOVE) tags.push('PRICE_WAKEUP');
 
-            numberOfTrades,
-            projectedTrades: round(projectedTrades, 2),
-            avgTrades: round(avgTrades, 2),
+        if (range3m >= 0.012) tags.push('RANGE_EXPANSION_STRONG');
+        else if (range3m >= MIN_RANGE) tags.push('RANGE_EXPANSION');
 
-            spreadBps: spreadBps === null ? null : round(spreadBps, 4),
+        if (bodyStrength >= 0.55) tags.push('STRONG_BODY');
+        else if (bodyStrength >= MIN_BODY_STRENGTH) tags.push('BODY_CONFIRMED');
 
-            openNow,
-            highNow,
-            lowNow,
-            closeNow,
-            previousClose,
+        if (takerBuyRatio >= 0.62 || takerBuyQuoteRatio >= 0.62) tags.push('BUY_FLOW_STRONG');
+        if (takerBuyRatio <= 0.38 || takerBuyQuoteRatio <= 0.38) tags.push('SELL_FLOW_STRONG');
 
-            elapsedMs: Math.round(elapsedMs),
-            projectionFactor: round(projectionFactor, 4),
+        if (strongMomentum) tags.push('STRONG_MOMENTUM');
 
-            marketContext,
+        for (const tag of contextTags) {
+            if (!tags.includes(tag)) tags.push(tag);
+        }
 
-            detectedAt: Date.now()
+        if (tags.length < MIN_TRIGGER_COUNT) {
+            filterStats.weakPriceAction += 1;
+            return null;
+        }
+
+        const moveScore = clamp(absMove / 0.025, 0, 1);
+        const rangeScore = clamp(range3m / 0.035, 0, 1);
+        const volumeScore = logScaleScore(volumeRatio, 15);
+        const quoteVolumeScore = logScaleScore(quoteVolumeRatio, 15);
+        const tradesScore = logScaleScore(tradesRatio, 10);
+        const bodyScore = clamp(bodyStrength, 0, 1);
+        const flowConfidence = clamp(Math.abs(takerBuyRatio - 0.5) * 2, 0, 1);
+        const liquidityScore = clamp(
+            Math.log10(Math.max(quoteVolume24h, MIN_24H_QUOTE_VOLUME) / MIN_24H_QUOTE_VOLUME + 1) / 2,
+            0,
+            1
+        );
+
+        const qualityBreakdown = {
+            moveScore: round(moveScore, 4),
+            rangeScore: round(rangeScore, 4),
+            volumeScore: round(volumeScore, 4),
+            quoteVolumeScore: round(quoteVolumeScore, 4),
+            tradesScore: round(tradesScore, 4),
+            bodyScore: round(bodyScore, 4),
+            flowConfidence: round(flowConfidence, 4),
+            liquidityScore: round(liquidityScore, 4),
+            trendScore,
+            breakoutScore,
+            wickPenalty,
+            chopPenalty,
+            lateMovePenalty,
+            volatilityScore
         };
 
-        return candidate;
+        let score =
+            moveScore * 0.22 +
+            rangeScore * 0.14 +
+            volumeScore * 0.14 +
+            quoteVolumeScore * 0.10 +
+            tradesScore * 0.10 +
+            bodyScore * 0.08 +
+            flowConfidence * 0.06 +
+            breakoutScore * 0.08 +
+            trendScore * 0.04 +
+            liquidityScore * 0.04;
+
+        score -= wickPenalty * 0.08;
+        score -= chopPenalty * 0.08;
+        score -= lateMovePenalty * 0.10;
+
+        if (direction !== 'WATCH') {
+            score += clamp(dirConf * 0.05, 0, 0.05);
+        }
+
+        score += clamp(volatilityScore * 0.03, 0, 0.03);
+
+        if (strongMomentum) {
+            score += 0.025;
+        }
+
+        score = clamp(score, 0, 1);
+
+        if (score < OPPORTUNITY_THRESHOLD) {
+            filterStats.lowScore += 1;
+            return null;
+        }
+
+        const tier = score >= HOT_THRESHOLD ? 'HOT' : 'WATCH';
+
+        return {
+            symbol,
+            direction,
+            tier,
+            score: round(score, 4),
+            dirConf,
+
+            priceChange3m: round(priceChange3m, 6),
+            movePct: round(priceChange3m * 100, 3),
+            range3m: round(range3m, 6),
+            rangePct: round(range3m * 100, 3),
+            bodyStrength: round(bodyStrength, 4),
+
+            volumeRatio: round(volumeRatio, 4),
+            quoteVolumeRatio: round(quoteVolumeRatio, 4),
+            tradesRatio: round(tradesRatio, 4),
+
+            // Backward-compatible fields.
+            volumeZ: round(volumeRatio, 4),
+            quoteVolumeZ: round(quoteVolumeRatio, 4),
+            tradesZ: round(tradesRatio, 4),
+
+            takerBuyRatio: round(takerBuyRatio, 4),
+            takerBuyQuoteRatio: round(takerBuyQuoteRatio, 4),
+            bookSpreadBps: round(bookSpreadBps, 3),
+            quoteVolume24h: round(quoteVolume24h, 2),
+            priceChange24h: round(priceChange24h, 6),
+            projectionFactor: round(projectionFactor, 4),
+            elapsedMs: Math.round(elapsedMs),
+
+            trendScore,
+            breakoutScore,
+            chopPenalty,
+            wickPenalty,
+            lateMovePenalty,
+            volatilityScore,
+            recentMove6,
+            recentMove12,
+            contextTags,
+            qualityBreakdown,
+
+            strongMomentum,
+
+            tags,
+            reason: `${tier}_${direction}_OPPORTUNITY_3M_V24`,
+            scanId,
+            detectedAt: binanceNow(),
+            localDetectedAt: Date.now()
+        };
     } catch (error) {
+        filterStats.errors += 1;
         return null;
     }
 }
 
 
 // ============================================================
-// 15. PLACEHOLDER KIỂM TRA MANIPULATION
-// ------------------------------------------------------------
-// Giữ lại hook này để sau có thể thêm:
-// - blacklist symbol
-// - funding quá dị
-// - spread bất thường
-// - coin bị pump dump quá bẩn
+// 9. REDIS PUBLISH / STATE
 // ============================================================
-async function checkOnChainManipulation(symbol) {
-    return false;
-}
 
+async function publishSubscribe(symbol) {
+    if (activeSubscribedSymbols.has(symbol)) return false;
 
-// ============================================================
-// 16. ĐỒNG BỘ SCORE VÀO REDIS HASH macro:scores
-// ------------------------------------------------------------
-// Giữ tương thích cũ: macro:scores vẫn là hash symbol -> score.
-// Score ở đây là opportunityScore, không phải xác suất thắng.
-// ============================================================
-async function syncMacroScores() {
-    if (currentRadarSlots.size === 0) return;
-
-    const pipeline = dataClient.pipeline();
-
-    for (const [, slot] of currentRadarSlots.entries()) {
-        macroScoreCache.set(slot.symbol, slot.opportunityScore);
-        pipeline.hset(
-            config.CHANNELS.MACRO_SCORES,
-            slot.symbol,
-            slot.opportunityScore
-        );
-    }
-
-    await pipeline.exec();
-}
-
-
-// ============================================================
-// 17. PUBLISH REDIS - GIỮ NGUYÊN LUỒNG CŨ + THÊM LUỒNG MỚI
-// ============================================================
-function publishSubscribe(symbol) {
-    if (activeSubscribedSymbols.has(symbol)) return;
-
-    pubClient.publish(config.CHANNELS.SUBSCRIPTIONS, JSON.stringify({
+    await pubClient.publish(CHANNELS.SUBSCRIPTIONS, JSON.stringify({
         action: 'SUBSCRIBE',
         symbol,
         client: 'radar'
     }));
 
     activeSubscribedSymbols.add(symbol);
+    return true;
 }
 
-function publishUnsubscribeIfNoActiveSlot(symbol) {
-    const stillHasSlot = [...currentRadarSlots.values()]
-        .some(slot => slot.symbol === symbol);
+async function publishUnsubscribe(symbol) {
+    if (!activeSubscribedSymbols.has(symbol)) return false;
 
-    if (stillHasSlot) return;
-    if (!activeSubscribedSymbols.has(symbol)) return;
-
-    pubClient.publish(config.CHANNELS.SUBSCRIPTIONS, JSON.stringify({
+    await pubClient.publish(CHANNELS.SUBSCRIPTIONS, JSON.stringify({
         action: 'UNSUBSCRIBE',
         symbol,
         client: 'radar'
     }));
 
     activeSubscribedSymbols.delete(symbol);
+    return true;
 }
 
-function publishCandidate(candidate, eventType = 'NEW') {
-    const payload = {
-        ...candidate,
-        eventType,
-        publishedAt: Date.now()
-    };
-
-    // Luồng cũ: downstream cũ vẫn nghe được.
-    pubClient.publish(config.CHANNELS.CANDIDATES, JSON.stringify(payload));
-
-    // Luồng mới: signal đầy đủ.
-    pubClient.publish(config.CHANNELS.SIGNALS, JSON.stringify(payload));
-
-    // Tách watchlist / hotlist để tầng sau dễ ưu tiên.
-    if (candidate.priority === 'HOT') {
-        pubClient.publish(config.CHANNELS.HOTLIST, JSON.stringify(payload));
-    } else {
-        pubClient.publish(config.CHANNELS.WATCHLIST, JSON.stringify(payload));
-    }
+async function publishCandidate(candidate) {
+    await pubClient.publish(CHANNELS.CANDIDATES, JSON.stringify(candidate));
 }
 
+async function removeSlot(symbol, reason = 'EXPIRED') {
+    const slot = currentSlots.get(symbol);
+    if (!slot) return false;
 
-// ============================================================
-// 18. XÓA SLOT RADAR
-// ============================================================
-async function removeRadarSlot(slotKey, reason = 'EXPIRED') {
-    const slot = currentRadarSlots.get(slotKey);
-    if (!slot) return;
+    currentSlots.delete(symbol);
+    recentlyRemovedSymbols.set(symbol, Date.now());
 
-    currentRadarSlots.delete(slotKey);
-
-    const stillHasSameSymbol = [...currentRadarSlots.values()]
-        .some(s => s.symbol === slot.symbol);
-
-    if (!stillHasSameSymbol) {
-        await dataClient.hdel(config.CHANNELS.MACRO_SCORES, slot.symbol);
-        macroScoreCache.delete(slot.symbol);
-        publishUnsubscribeIfNoActiveSlot(slot.symbol);
+    try {
+        await dataClient.hdel(CHANNELS.MACRO_SCORES, symbol);
+        await publishUnsubscribe(symbol);
+    } catch (error) {
+        console.error(`❌ [RADAR] removeSlot Redis/publish error ${symbol}:`, error.message);
     }
 
-    console.log(
-        `❌ [RADAR] Loại ${slot.symbol} ${slot.suggestedDirection} | score=${slot.opportunityScore} | reason=${reason}`
-    );
+    console.log(`❌ [RADAR] Loại ${symbol} ${slot.direction} | score=${slot.score} | reason=${reason}`);
+    return true;
 }
 
+async function syncRedisLists(activeCandidates) {
+    const hot = activeCandidates.filter(c => c.tier === 'HOT');
+    const watch = activeCandidates.filter(c => c.tier === 'WATCH');
 
-// ============================================================
-// 19. HARD CAP SLOT
-// ------------------------------------------------------------
-// Sticky giúp không miss cơ hội,
-// nhưng hard cap tránh giữ quá nhiều coin cũ làm nặng downstream.
-// ============================================================
-async function enforceHardCap() {
-    if (currentRadarSlots.size <= config.MAX_TOTAL_RADAR_SLOTS) return;
+    const pipeline = dataClient.pipeline();
 
-    const sortedSlots = [...currentRadarSlots.entries()]
-        .sort((a, b) => {
-            const scoreDiff = a[1].opportunityScore - b[1].opportunityScore;
-            if (scoreDiff !== 0) return scoreDiff;
+    pipeline.set(CHANNELS.HOTLIST, JSON.stringify(hot), 'EX', RADAR_LIST_TTL_SEC);
+    pipeline.set(CHANNELS.WATCHLIST, JSON.stringify(watch), 'EX', RADAR_LIST_TTL_SEC);
 
-            return a[1].updatedAt - b[1].updatedAt;
-        });
+    for (const [symbol, slot] of currentSlots.entries()) {
+        pipeline.hset(CHANNELS.MACRO_SCORES, symbol, slot.score);
+    }
 
-    while (
-        currentRadarSlots.size > config.MAX_TOTAL_RADAR_SLOTS &&
-        sortedSlots.length > 0
-    ) {
-        const [slotKey] = sortedSlots.shift();
-        await removeRadarSlot(slotKey, 'HARD_CAP_EXCEEDED');
+    await pipeline.exec();
+}
+
+async function pruneStaleSlots(filterStats) {
+    const now = Date.now();
+    const staleSymbols = [];
+
+    for (const [symbol, slot] of currentSlots.entries()) {
+        const updatedAt = safeNumber(slot.updatedAt, slot.addedAt || now);
+        if (now - updatedAt >= MAX_SLOT_STALE_MS) {
+            staleSymbols.push(symbol);
+        }
+    }
+
+    for (const symbol of staleSymbols) {
+        const removed = await removeSlot(symbol, 'STALE_SLOT');
+        if (removed) filterStats.staleRemoved += 1;
     }
 }
 
+async function enforceActiveSlotLimit(filterStats) {
+    if (currentSlots.size <= MAX_ACTIVE_SLOTS) return 0;
 
-// ============================================================
-// 20. CÓ NÊN REPUBLISH UPDATE KHÔNG?
-// ------------------------------------------------------------
-// Nếu score tăng/giảm mạnh hoặc đã lâu chưa publish,
-// gửi lại candidate để tầng sau cập nhật trạng thái.
-// ============================================================
-function shouldRepublishCandidate(oldSlot, candidate) {
-    if (!oldSlot) return true;
+    const now = Date.now();
 
-    const scoreDelta = Math.abs(
-        candidate.opportunityScore - oldSlot.opportunityScore
-    );
+    const removable = Array.from(currentSlots.values())
+        .map(slot => ({
+            symbol: slot.symbol,
+            score: safeNumber(slot.score),
+            ageMs: now - safeNumber(slot.addedAt, now)
+        }))
+        .filter(item => item.ageMs >= MIN_FORCE_KEEP_MS)
+        .sort((a, b) => a.score - b.score);
 
-    if (scoreDelta >= config.REPUBLISH_SCORE_DELTA) {
-        return true;
+    let removed = 0;
+
+    while (currentSlots.size > MAX_ACTIVE_SLOTS && removable.length > 0) {
+        const item = removable.shift();
+        const didRemove = await removeSlot(item.symbol, 'ACTIVE_SLOTS_LIMIT');
+        if (didRemove) removed += 1;
     }
 
-    if (candidate.priority !== oldSlot.priority) {
-        return true;
+    filterStats.forceRemoved += removed;
+
+    if (currentSlots.size > MAX_ACTIVE_SLOTS) {
+        console.warn(
+            `⚠️ [RADAR] currentSlots vẫn vượt giới hạn ${currentSlots.size}/${MAX_ACTIVE_SLOTS} ` +
+            `vì các slot còn lại mới dưới ${Math.round(MIN_FORCE_KEEP_MS / 1000)}s`
+        );
     }
 
-    if (candidate.suggestedDirection !== oldSlot.suggestedDirection) {
-        return true;
-    }
-
-    const lastPublishAt = oldSlot.lastPublishedAt || oldSlot.addedAt || 0;
-    if (Date.now() - lastPublishAt >= config.REPUBLISH_MIN_INTERVAL_MS) {
-        return true;
-    }
-
-    return false;
+    return removed;
 }
 
 
 // ============================================================
-// 21. VÒNG LẶP RADAR CHÍNH
+// 10. MAIN SCAN
 // ============================================================
+
 async function scanRadar() {
     if (isScanning) {
         console.warn('⚠️ [RADAR] Bỏ qua scan mới vì scan trước chưa xong');
@@ -1258,170 +1313,219 @@ async function scanRadar() {
 
     isScanning = true;
     const startedAt = Date.now();
+    const filterStats = createFilterStats();
+    const scanId = `radar-${++scanSeq}-${startedAt}`;
 
     try {
+        cleanupRemovedCache();
+        await syncBinanceTime(false);
+
         console.log('');
         console.log(
-            `📡 [RADAR] Opportunity scan ${config.IMPULSE_INTERVAL} | threshold=${config.OPPORTUNITY_THRESHOLD} | hot=${config.HOT_THRESHOLD}`
+            `📡 [RADAR] Profit Opportunity scan ${RADAR_INTERVAL} | ` +
+            `top=${MAX_RADAR_SLOTS} | maxActive=${MAX_ACTIVE_SLOTS} | ` +
+            `threshold=${OPPORTUNITY_THRESHOLD} | hot=${HOT_THRESHOLD} | scanId=${scanId}`
         );
 
-        const symbols = await fetchTradableUSDTPerpetualSymbols();
-
+        const symbols = await fetchTradableSymbols();
         if (symbols.length === 0) {
             console.warn('⚠️ [RADAR] Không có symbol để quét');
             return;
         }
 
-        const [tickerMap, bookTickerMap, marketContext] = await Promise.all([
-            fetch24hTickerMap(),
-            fetchBookTickerMap(),
-            fetchMarketContext()
-        ]);
+        const tickerMap = await fetch24hTickerMap();
+        const bookTickerMap = await fetchBookTickerMap();
 
         if (tickerMap.size === 0) {
-            console.warn('⚠️ [RADAR] Không có ticker 24h để lọc thanh khoản');
+            console.warn('⚠️ [RADAR] Không có ticker 24h');
             return;
         }
 
-        const liquidSymbols = symbols.filter(symbol => {
+        if (bookTickerMap.size === 0) {
+            console.warn('⚠️ [RADAR] Không có bookTicker, bỏ scan để tránh chọn coin mù spread');
+            return;
+        }
+
+        const liquidSymbols = [];
+
+        for (const symbol of symbols) {
             const ticker = tickerMap.get(symbol);
-            if (!ticker) return false;
+
+            if (!ticker) {
+                filterStats.missingTicker += 1;
+                continue;
+            }
 
             const quoteVolume = safeNumber(ticker.quoteVolume);
-            return quoteVolume >= config.MIN_24H_QUOTE_VOLUME;
-        });
 
-        console.log(
-            `🔎 [RADAR] Thanh khoản >= ${config.MIN_24H_QUOTE_VOLUME}: ${liquidSymbols.length}/${symbols.length} symbols | market=${marketContext.marketBias}/${marketContext.volatilityMode}`
-        );
+            if (quoteVolume < MIN_24H_QUOTE_VOLUME) {
+                filterStats.lowLiquidity += 1;
+                continue;
+            }
+
+            liquidSymbols.push(symbol);
+        }
+
+        console.log(`🔎 [RADAR] Sau lọc thanh khoản >= ${MIN_24H_QUOTE_VOLUME}: ${liquidSymbols.length}/${symbols.length} symbols`);
 
         const candidates = [];
 
-        for (let i = 0; i < liquidSymbols.length; i += config.BATCH_SIZE) {
-            const batch = liquidSymbols.slice(i, i + config.BATCH_SIZE);
+        for (let i = 0; i < liquidSymbols.length; i += BATCH_SIZE) {
+            const batch = liquidSymbols.slice(i, i + BATCH_SIZE);
 
-            const results = await Promise.all(batch.map(async symbol => {
-                const isManipulated = await checkOnChainManipulation(symbol);
-                if (isManipulated) return null;
-
-                const bookTicker = bookTickerMap.get(symbol);
-                return analyzeOpportunity(symbol, bookTicker, marketContext);
+            const results = await Promise.all(batch.map(symbol => {
+                const ticker24h = tickerMap.get(symbol);
+                return analyzeSymbol(symbol, ticker24h, bookTickerMap, filterStats, scanId);
             }));
 
             for (const result of results) {
                 if (result) candidates.push(result);
             }
 
-            if (i + config.BATCH_SIZE < liquidSymbols.length) {
-                await sleep(config.BATCH_DELAY_MS);
+            if (i + BATCH_SIZE < liquidSymbols.length) {
+                await sleep(BATCH_DELAY_MS);
             }
         }
 
-        candidates.sort((a, b) => b.opportunityScore - a.opportunityScore);
+        candidates.sort((a, b) => b.score - a.score);
 
-        const topCandidates = candidates.slice(0, config.MAX_RADAR_SLOTS);
-        const newSlotSet = new Set(topCandidates.map(c => buildSlotKey(c.symbol)));
+        const topCandidates = candidates.slice(0, MAX_RADAR_SLOTS);
+        const acceptedSymbols = new Set();
 
-        let addedCount = 0;
-        let updatedCount = 0;
-        let publishedCount = 0;
-        let hotCount = 0;
-        let watchCount = 0;
+        let added = 0;
+        let updated = 0;
+        let published = 0;
 
-        // ----------------------------------------------------
-        // 21.1 THÊM HOẶC CẬP NHẬT SLOT
-        // ----------------------------------------------------
         for (const candidate of topCandidates) {
-            const slotKey = buildSlotKey(candidate.symbol);
-            const oldSlot = currentRadarSlots.get(slotKey);
+            const old = currentSlots.get(candidate.symbol);
 
-            if (!oldSlot) {
-                const newSlot = {
+            if (!old && isInResubscribeCooldown(candidate.symbol)) {
+                filterStats.cooldownSkip += 1;
+                continue;
+            }
+
+            if (!old) {
+                const slot = {
                     ...candidate,
                     addedAt: Date.now(),
                     updatedAt: Date.now(),
-                    lastSeenAt: Date.now(),
                     lastPublishedAt: Date.now()
                 };
 
-                currentRadarSlots.set(slotKey, newSlot);
+                currentSlots.set(candidate.symbol, slot);
+                acceptedSymbols.add(candidate.symbol);
 
-                publishSubscribe(candidate.symbol);
-                publishCandidate(candidate, 'NEW');
+                try {
+                    await publishSubscribe(candidate.symbol);
+                    await publishCandidate(slot);
+                    published += 1;
+                } catch (error) {
+                    console.error(`❌ [RADAR] Publish new candidate lỗi ${candidate.symbol}:`, error.message);
+                }
 
-                addedCount++;
-                publishedCount++;
-
-                if (candidate.priority === 'HOT') hotCount++;
-                else watchCount++;
+                added += 1;
 
                 console.log(
-                    `➕ [RADAR] ${candidate.priority} ${candidate.symbol} ${candidate.suggestedDirection} | score=${candidate.opportunityScore} | dirConf=${candidate.directionConfidence} | move=${round(candidate.priceChange3m * 100, 2)}% | volZ=${candidate.volumeZ} | tradesZ=${candidate.tradeCountZ} | tags=${candidate.tags.slice(0, 4).join(',')}`
+                    `➕ [RADAR] ${candidate.tier} ${candidate.symbol} ${candidate.direction} | ` +
+                    `score=${candidate.score} | dir=${candidate.dirConf} | ` +
+                    `move=${candidate.movePct}% | range=${candidate.rangePct}% | ` +
+                    `vol=${candidate.volumeRatio} | trades=${candidate.tradesRatio} | ` +
+                    `trend=${candidate.trendScore} | brk=${candidate.breakoutScore} | ` +
+                    `chop=${candidate.chopPenalty} | wick=${candidate.wickPenalty} | ` +
+                    `late=${candidate.lateMovePenalty} | spread=${candidate.bookSpreadBps}bps | ` +
+                    `strong=${candidate.strongMomentum ? 'Y' : 'N'} | ` +
+                    `tags=${candidate.tags.slice(0, 6).join(',')}`
                 );
             } else {
-                const shouldPublish = shouldRepublishCandidate(oldSlot, candidate);
+                const shouldRepublish = shouldRepublishCandidate(old, candidate);
 
-                const updatedSlot = {
-                    ...oldSlot,
+                const slot = {
+                    ...old,
                     ...candidate,
-                    addedAt: oldSlot.addedAt,
+                    addedAt: old.addedAt,
                     updatedAt: Date.now(),
-                    lastSeenAt: Date.now(),
-                    lastPublishedAt: shouldPublish
-                        ? Date.now()
-                        : oldSlot.lastPublishedAt
+                    lastPublishedAt: shouldRepublish ? Date.now() : old.lastPublishedAt
                 };
 
-                currentRadarSlots.set(slotKey, updatedSlot);
-                updatedCount++;
+                currentSlots.set(candidate.symbol, slot);
+                acceptedSymbols.add(candidate.symbol);
 
-                if (shouldPublish) {
-                    publishCandidate(candidate, 'UPDATE');
-                    publishedCount++;
-                }
+                updated += 1;
 
-                if (candidate.priority === 'HOT') hotCount++;
-                else watchCount++;
-            }
-        }
-
-        // ----------------------------------------------------
-        // 21.2 LOẠI SLOT KHÔNG CÒN TOP SAU THỜI GIAN STICKY
-        // ----------------------------------------------------
-        const slotsToDrop = [];
-
-        for (const [slotKey, slot] of currentRadarSlots.entries()) {
-            if (!newSlotSet.has(slotKey)) {
-                const ageMs = Date.now() - slot.addedAt;
-
-                if (ageMs >= config.MIN_HOLD_MS) {
-                    slotsToDrop.push(slotKey);
-                } else {
-                    const remainMinutes = Math.ceil(
-                        (config.MIN_HOLD_MS - ageMs) / 60000
-                    );
+                if (shouldRepublish) {
+                    try {
+                        await publishCandidate(slot);
+                        published += 1;
+                    } catch (error) {
+                        console.error(`❌ [RADAR] Republish candidate lỗi ${candidate.symbol}:`, error.message);
+                    }
 
                     console.log(
-                        `🔒 [STICKY] Giữ ${slot.symbol} ${slot.suggestedDirection} dù không còn top | còn ${remainMinutes} phút`
+                        `🔁 [RADAR] UPDATE ${candidate.tier} ${candidate.symbol} ${candidate.direction} | ` +
+                        `score=${candidate.score} | old=${old.score} | ` +
+                        `move=${candidate.movePct}% | vol=${candidate.volumeRatio} | ` +
+                        `tags=${candidate.tags.slice(0, 6).join(',')}`
                     );
                 }
             }
         }
 
-        for (const slotKey of slotsToDrop) {
-            await removeRadarSlot(slotKey, 'MIN_HOLD_EXPIRED');
+        const toRemove = [];
+
+        for (const [symbol, slot] of currentSlots.entries()) {
+            if (!acceptedSymbols.has(symbol)) {
+                const ageMs = Date.now() - safeNumber(slot.addedAt, Date.now());
+
+                if (ageMs >= MIN_HOLD_MS) {
+                    toRemove.push(symbol);
+                } else {
+                    const remainMin = Math.ceil((MIN_HOLD_MS - ageMs) / 60000);
+                    console.log(`🔒 [STICKY] Giữ ${symbol} ${slot.direction} | còn ${remainMin} phút`);
+                }
+            }
         }
 
-        await enforceHardCap();
-        await syncMacroScores();
+        for (const symbol of toRemove) {
+            await removeSlot(symbol, 'NOT_IN_TOP_AND_HOLD_EXPIRED');
+        }
+
+        await pruneStaleSlots(filterStats);
+        const forcedRemoved = await enforceActiveSlotLimit(filterStats);
+
+        const activeCandidates = Array.from(currentSlots.values())
+            .sort((a, b) => b.score - a.score);
+
+        await syncRedisLists(activeCandidates);
+
+        const hotCount = activeCandidates.filter(c => c.tier === 'HOT').length;
+        const watchCount = activeCandidates.filter(c => c.tier === 'WATCH').length;
 
         const elapsedSec = round((Date.now() - startedAt) / 1000, 2);
 
         console.log(
-            `📊 [RADAR] Candidates=${candidates.length} | Top=${topCandidates.length} | Added=${addedCount} | Updated=${updatedCount} | Published=${publishedCount} | Hot=${hotCount} | Watch=${watchCount} | Slots=${currentRadarSlots.size} | Time=${elapsedSec}s`
+            `[FILTER] missingTicker=${filterStats.missingTicker} | missingBook=${filterStats.missingBookTicker} | ` +
+            `lowLiq=${filterStats.lowLiquidity} | highSpread=${filterStats.highSpread} | ` +
+            `early=${filterStats.candleTooEarly} | lowVol=${filterStats.lowVolume} | ` +
+            `lowTrades=${filterStats.lowTrades} | lowRange=${filterStats.lowRange} | ` +
+            `weakBody=${filterStats.weakBody} | highWick=${filterStats.highWick} | ` +
+            `choppy=${filterStats.choppy} | lateWatch=${filterStats.lateWatch} | ` +
+            `lowScore=${filterStats.lowScore} | cooldown=${filterStats.cooldownSkip} | ` +
+            `stale=${filterStats.staleRemoved} | force=${filterStats.forceRemoved} | errors=${filterStats.errors}`
         );
+
+        console.log(
+            `📊 [RADAR] Candidates=${candidates.length} | Top=${topCandidates.length} | ` +
+            `Added=${added} | Updated=${updated} | Published=${published} | ` +
+            `CooldownSkip=${filterStats.cooldownSkip} | ForceRemoved=${forcedRemoved} | ` +
+            `Hot=${hotCount} | Watch=${watchCount} | Slots=${currentSlots.size} | ` +
+            `Time=${elapsedSec}s | TimeOffset=${binanceTimeState.offsetMs}ms`
+        );
+
+        if (Date.now() - startedAt > SCAN_WARN_DURATION_MS) {
+            console.warn(`⚠️ [RADAR] Scan kéo dài ${elapsedSec}s, cần xem lại số symbol/batch/API latency`);
+        }
     } catch (error) {
-        console.error('❌ [RADAR] Lỗi scanRadar:', error.message);
+        console.error('❌ [RADAR] scanRadar error:', error.message);
     } finally {
         isScanning = false;
     }
@@ -1429,23 +1533,16 @@ async function scanRadar() {
 
 
 // ============================================================
-// 22. SCHEDULER CHỐNG TRÔI NHỊP
-// ------------------------------------------------------------
-// Canh đúng mốc nến 3m + offset.
-// Ví dụ offset 8s: scan sau khi nến mới chạy 8s.
-// Nhưng do MIN_CANDLE_ELAPSED_MS mặc định 15s,
-// bạn nên để SCAN_OFFSET_MS >= 15000 nếu muốn scan ngay vòng đầu có dữ liệu.
-// Nếu offset thấp hơn, analyzeOpportunity sẽ tự bỏ qua nến quá non.
+// 11. ALIGNED SCHEDULER
 // ============================================================
+
 function getNextAlignedScanDelay() {
-    const now = Date.now();
-    const intervalMs = config.IMPULSE_INTERVAL_MS;
-    const offsetMs = config.SCAN_OFFSET_MS;
+    const now = binanceNow();
 
-    let next = Math.floor(now / intervalMs) * intervalMs + offsetMs;
-    if (next <= now) next += intervalMs;
+    let next = Math.floor(now / RADAR_INTERVAL_MS) * RADAR_INTERVAL_MS + SCAN_OFFSET_MS;
+    if (next <= now) next += RADAR_INTERVAL_MS;
 
-    return next - now;
+    return Math.max(1000, next - now);
 }
 
 function scheduleNextScan() {
@@ -1454,9 +1551,7 @@ function scheduleNextScan() {
     const delay = getNextAlignedScanDelay();
     const nextAt = new Date(Date.now() + delay).toISOString();
 
-    console.log(
-        `⏱️ [RADAR] Scan kế tiếp tại ${nextAt} | sau ${round(delay / 1000, 2)}s`
-    );
+    console.log(`⏱️ [RADAR] Scan kế tiếp tại ${nextAt} | sau ${round(delay / 1000, 2)}s`);
 
     nextScanTimer = setTimeout(async () => {
         await scanRadar();
@@ -1466,39 +1561,27 @@ function scheduleNextScan() {
 
 
 // ============================================================
-// 23. KHỞI ĐỘNG
+// 12. STARTUP / SHUTDOWN
 // ============================================================
-console.log('👁️ RadarManager V20 - Opportunity Radar Futures 15M- khởi động!');
-console.log(
-    `⚙️ [CONFIG] batch=${config.BATCH_SIZE}, delay=${config.BATCH_DELAY_MS}ms, opportunity=${config.OPPORTUNITY_THRESHOLD}, hot=${config.HOT_THRESHOLD}, triggerCount=${config.MIN_TRIGGER_COUNT}, projectedVolume=ON, maxProjection=${config.MAX_PROJECTION_FACTOR}x, scheduler=ALIGNED`
-);
 
-scanRadar().finally(() => {
+async function startup() {
+    validateConfig();
+
+    console.log('👁️ RadarManager V24 - Production-Stable Profit Opportunity Radar 3M khởi động!');
+    console.log(
+        `⚙️ [CONFIG] interval=${RADAR_INTERVAL}, top=${MAX_RADAR_SLOTS}, maxActive=${MAX_ACTIVE_SLOTS}, ` +
+        `offset=${SCAN_OFFSET_MS / 1000}s, minElapsed=${MIN_CANDLE_ELAPSED_MS / 1000}s, ` +
+        `excludeMajors=ON, min24hVol=${MIN_24H_QUOTE_VOLUME}, ` +
+        `threshold=${OPPORTUNITY_THRESHOLD}, hot=${HOT_THRESHOLD}, ` +
+        `maxProjection=${MAX_PROJECTION_FACTOR}x, batch=${BATCH_SIZE}, delay=${BATCH_DELAY_MS}ms`
+    );
+
+    await syncBinanceTime(true);
+
+    await scanRadar();
     scheduleNextScan();
-});
+}
 
-setInterval(() => {
-    syncMacroScores().catch(error => {
-        console.error('❌ [RADAR] Lỗi syncMacroScores:', error.message);
-    });
-}, 15 * 60 * 1000);
-
-
-// ============================================================
-// 24. XỬ LÝ LỖI REDIS
-// ============================================================
-pubClient.on('error', err => {
-    console.error('❌ Redis pubClient error:', err.message);
-});
-
-dataClient.on('error', err => {
-    console.error('❌ Redis dataClient error:', err.message);
-});
-
-
-// ============================================================
-// 25. GRACEFUL SHUTDOWN
-// ============================================================
 async function shutdown() {
     console.log('');
     console.log('🛑 [RADAR] Đang tắt RadarManager...');
@@ -1506,10 +1589,16 @@ async function shutdown() {
     if (nextScanTimer) clearTimeout(nextScanTimer);
 
     try {
+        const symbols = Array.from(activeSubscribedSymbols);
+
+        for (const symbol of symbols) {
+            await publishUnsubscribe(symbol);
+        }
+
         await pubClient.quit();
         await dataClient.quit();
     } catch (error) {
-        console.error('❌ Lỗi khi đóng Redis:', error.message);
+        console.error('❌ [RADAR] Shutdown error:', error.message);
     }
 
     process.exit(0);
@@ -1517,3 +1606,8 @@ async function shutdown() {
 
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+
+startup().catch(error => {
+    console.error('❌ [RADAR] Startup error:', error.message);
+    process.exit(1);
+});
