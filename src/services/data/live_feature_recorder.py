@@ -20,64 +20,54 @@ load_dotenv()
 
 
 # ============================================================
-# REDIS ARCHIVE EXPORTER V1 - SAFE SSD EXPORT
+# REDIS MULTI-KEY ARCHIVE EXPORTER V2 - SAFE SSD EXPORT
 # ------------------------------------------------------------
-# Nhiệm vụ:
-# 1. Đọc dữ liệu từ Redis Stream features:archive.
-# 2. Không lấy dữ liệu 1 giờ gần nhất.
-# 3. Ghi ra SSD dạng .jsonl.gz:
-#    - ghi file .tmp trước
-#    - đóng gzip hoàn chỉnh
-#    - fsync
-#    - rename atomically thành .jsonl.gz
-#    - ghi manifest
-# 4. Sau khi file + manifest thành công mới XDEL dữ liệu Redis.
-# 5. Sau khi export xong, XTRIM MINID để Redis dọn RAM.
-# 6. Log rõ tiến độ.
+# Dành cho key dạng:
+# features:archive:BTCUSDT
+# features:archive:ETHUSDT
+# features:archive:1000PEPEUSDT
 #
-# Lưu ý:
-# - File này dành cho Redis Stream.
-# - Key mặc định: features:archive.
-# - Không dùng Pub/Sub.
+# Nhiệm vụ:
+# 1. Scan toàn bộ Redis Stream theo pattern features:archive:*.
+# 2. Không lấy dữ liệu 1 giờ gần nhất.
+# 3. Export từng batch ra SSD dạng .jsonl.gz.
+# 4. Ghi .tmp.gz trước, đóng gzip, fsync, rename final.
+# 5. Ghi manifest.
+# 6. Sau khi file + manifest thành công mới XDEL Redis IDs.
+# 7. XTRIM từng stream để Redis dọn RAM.
+# 8. Log rõ tiến độ theo coin / batch / tổng dòng.
 # ============================================================
 
 
 # ============================================================
 # 1. CẤU HÌNH CỨNG
 # ============================================================
-
-# Redis vẫn có thể lấy từ .env để bạn không phải hard-code host nếu đổi VPS.
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379")
 
-# Redis Stream chứa dữ liệu live archive.
-ARCHIVE_KEY = "features:archive"
+ARCHIVE_PATTERN = "features:archive:*"
 
-# Thư mục SSD lưu dữ liệu đã export.
 EXPORT_DIR = Path("./data/live_features_archive")
-
-# File manifest ghi lại các batch đã export thành công.
 MANIFEST_FILE = Path("./data/live_features_archive/_manifest.jsonl")
 
-# Không export dữ liệu 1 giờ gần nhất để tránh đụng dữ liệu đang ghi realtime.
+# Không export dữ liệu 1 giờ gần nhất để tránh đụng dữ liệu đang ghi.
 SKIP_RECENT_SEC = 3600
 
-# Mỗi batch đọc bao nhiêu dòng từ Redis Stream.
+# Mỗi batch đọc tối đa N dòng / 1 stream coin.
 BATCH_SIZE = 5000
 
-# Sau khi export file thành công thì xóa từng ID khỏi Redis.
+# Sau khi export file thành công thì xóa các ID khỏi Redis.
 DELETE_AFTER_EXPORT = True
 
-# Sau khi export hết dữ liệu cũ hơn cutoff thì XTRIM MINID để Redis dọn RAM.
+# Sau khi xử lý xong một stream, XTRIM MINID để Redis dọn RAM.
 TRIM_AFTER_EXPORT = True
 
-# Dừng nếu ổ cứng trống dưới ngưỡng này.
+# Dừng nếu ổ cứng trống dưới mức này.
 MIN_FREE_DISK_GB = 2.0
 
-# Chạy thử, không ghi/xóa. Khi chạy thật để False.
+# Nếu True: chỉ scan/log, không ghi file, không xóa Redis.
 DRY_RUN = False
 
-# Version.
-EXPORT_VERSION = "redis_archive_exporter_v1_hardcoded"
+EXPORT_VERSION = "redis_archive_multi_key_exporter_v2"
 
 
 # ============================================================
@@ -119,19 +109,28 @@ def stream_id_to_str(stream_id: Any) -> str:
     return str(stream_id)
 
 
+def key_to_str(key: Any) -> str:
+    if isinstance(key, bytes):
+        return key.decode("utf-8", errors="replace")
+    return str(key)
+
+
+def symbol_from_key(key: str) -> str:
+    # features:archive:BTCUSDT -> BTCUSDT
+    return key.split(":")[-1].upper().strip()
+
+
 def safe_decode_bytes(value: Any) -> Any:
     if not isinstance(value, (bytes, bytearray)):
         return value
 
     raw = bytes(value)
 
-    # 1. Thử decode msgpack.
     try:
         return msgpack.unpackb(raw, raw=False)
     except Exception:
         pass
 
-    # 2. Thử decode UTF-8 / JSON.
     try:
         text = raw.decode("utf-8", errors="replace")
         stripped = text.strip()
@@ -148,21 +147,13 @@ def safe_decode_bytes(value: Any) -> Any:
 
 
 def normalize_stream_fields(fields: Dict[Any, Any]) -> Dict[str, Any]:
-    """
-    Redis Stream có thể lưu theo nhiều kiểu:
-    - data: msgpack bytes
-    - feature: json/msgpack
-    - payload: json/msgpack
-    - hoặc nhiều field flat.
-    Hàm này cố decode linh hoạt.
-    """
     clean = {}
 
     for k, v in fields.items():
         key = k.decode("utf-8", errors="replace") if isinstance(k, bytes) else str(k)
         clean[key] = safe_decode_bytes(v)
 
-    # Nếu toàn bộ feature nằm trong một field container.
+    # Trường hợp stream lưu cả feature trong 1 field.
     for container_key in ["data", "feature", "payload", "json", "msgpack"]:
         val = clean.get(container_key)
 
@@ -212,7 +203,7 @@ def append_manifest(record: Dict[str, Any]):
         os.fsync(f.fileno())
 
 
-def build_export_paths(start_id: str, end_id: str, count: int, cutoff_ms: int) -> Tuple[Path, Path]:
+def build_export_paths(redis_key: str, symbol: str, start_id: str, end_id: str, count: int, cutoff_ms: int) -> Tuple[Path, Path]:
     start_ms = stream_id_to_ms(start_id) or cutoff_ms
     parts = utc_parts(start_ms)
 
@@ -222,7 +213,7 @@ def build_export_paths(start_id: str, end_id: str, count: int, cutoff_ms: int) -
     safe_start = start_id.replace("-", "_")
     safe_end = end_id.replace("-", "_")
 
-    base_name = f"{ARCHIVE_KEY.replace(':', '_')}_{safe_start}_{safe_end}_{count}"
+    base_name = f"{symbol}_{safe_start}_{safe_end}_{count}"
     final_path = folder / f"{base_name}.jsonl.gz"
     tmp_path = folder / f"{base_name}.jsonl.gz.tmp"
 
@@ -245,6 +236,10 @@ class RedisArchiveExporter:
         )
 
         self.stats = {
+            "keys_found": 0,
+            "keys_stream": 0,
+            "keys_skipped": 0,
+            "keys_completed": 0,
             "read": 0,
             "exported": 0,
             "deleted": 0,
@@ -260,34 +255,39 @@ class RedisArchiveExporter:
         except Exception:
             pass
 
-    async def check_key(self):
-        key_type = await self.redis.type(ARCHIVE_KEY)
+    async def scan_archive_keys(self) -> List[str]:
+        keys = []
+
+        async for raw_key in self.redis.scan_iter(match=ARCHIVE_PATTERN, count=500):
+            key = key_to_str(raw_key)
+            keys.append(key)
+
+        keys = sorted(set(keys))
+        self.stats["keys_found"] = len(keys)
+        return keys
+
+    async def get_key_type_and_len(self, key: str):
+        key_type = await self.redis.type(key)
 
         if isinstance(key_type, bytes):
             key_type = key_type.decode("utf-8", errors="replace")
 
-        if key_type != "stream":
-            raise RuntimeError(
-                f"Redis key {ARCHIVE_KEY} hiện là type={key_type}, không phải stream. "
-                f"File này chỉ dùng cho Redis Stream."
-            )
+        if key_type == "stream":
+            length = await self.redis.xlen(key)
+        else:
+            length = 0
 
-        length = await self.redis.xlen(ARCHIVE_KEY)
-        return key_type, length
+        return key_type, int(length or 0)
 
-    async def fetch_batch(self, cutoff_id: str):
-        """
-        Luôn đọc từ đầu stream đến cutoff.
-        Vì mỗi batch export xong sẽ XDEL, batch sau lại đọc từ đầu.
-        """
+    async def fetch_batch(self, key: str, cutoff_id: str):
         return await self.redis.xrange(
-            ARCHIVE_KEY,
+            key,
             min="-",
             max=cutoff_id,
             count=BATCH_SIZE
         )
 
-    def convert_entries_to_records(self, entries) -> List[Dict[str, Any]]:
+    def convert_entries_to_records(self, redis_key: str, symbol: str, entries) -> List[Dict[str, Any]]:
         records = []
         seen_ids = set()
 
@@ -308,7 +308,10 @@ class RedisArchiveExporter:
 
             record = dict(feature)
 
-            record["_redis_key"] = ARCHIVE_KEY
+            # Đảm bảo symbol luôn có.
+            record["symbol"] = str(record.get("symbol") or symbol).upper().strip()
+
+            record["_redis_key"] = redis_key
             record["_redis_stream_id"] = stream_id
             record["_redis_stream_ms"] = stream_id_to_ms(stream_id)
             record["_export_id"] = self.export_id
@@ -320,17 +323,16 @@ class RedisArchiveExporter:
 
         return records
 
-    def write_records_atomic(self, records: List[Dict[str, Any]], cutoff_ms: int) -> Path:
+    def write_records_atomic(self, redis_key: str, symbol: str, records: List[Dict[str, Any]], cutoff_ms: int) -> Path:
         if not records:
             raise RuntimeError("No records to write")
 
         start_id = records[0]["_redis_stream_id"]
         end_id = records[-1]["_redis_stream_id"]
 
-        tmp_path, final_path = build_export_paths(start_id, end_id, len(records), cutoff_ms)
+        tmp_path, final_path = build_export_paths(redis_key, symbol, start_id, end_id, len(records), cutoff_ms)
 
-        # Nếu final đã tồn tại nghĩa là batch id-range này đã ghi trước đó.
-        # Không ghi lại để tránh trùng file.
+        # Nếu file final đã tồn tại, coi như batch này đã từng export.
         if final_path.exists():
             print(f"♻️ [SKIP FILE EXISTS] {final_path}")
             return final_path
@@ -342,21 +344,17 @@ class RedisArchiveExporter:
             for record in records:
                 f.write(json_dumps(record))
                 f.write("\n")
-
             f.flush()
 
-        # Gzip đã close. Fsync file .tmp.
         fsync_file(tmp_path)
 
-        # Atomic rename.
         os.replace(tmp_path, final_path)
 
-        # Fsync file final.
         fsync_file(final_path)
 
         return final_path
 
-    async def delete_stream_ids(self, ids: List[str]) -> int:
+    async def delete_stream_ids(self, key: str, ids: List[str]) -> int:
         if not ids:
             return 0
 
@@ -368,48 +366,44 @@ class RedisArchiveExporter:
 
         for i in range(0, len(ids), chunk_size):
             chunk = ids[i:i + chunk_size]
-            result = await self.redis.xdel(ARCHIVE_KEY, *chunk)
+            result = await self.redis.xdel(key, *chunk)
             deleted += int(result or 0)
 
         return deleted
 
-    async def trim_stream(self, cutoff_id: str):
+    async def trim_stream(self, key: str, cutoff_id: str):
         if DRY_RUN or not TRIM_AFTER_EXPORT:
             return
 
         try:
-            # MINID giúp Redis dọn entries cũ hơn cutoff.
-            result = await self.redis.execute_command("XTRIM", ARCHIVE_KEY, "MINID", cutoff_id)
-            print(f"🧹 [XTRIM] MINID {cutoff_id} result={result}")
+            result = await self.redis.execute_command("XTRIM", key, "MINID", cutoff_id)
+            print(f"🧹 [XTRIM] key={key} MINID={cutoff_id} result={result}")
         except Exception as e:
-            print(f"⚠️ [XTRIM] Không trim được: {e}")
+            print(f"⚠️ [XTRIM] key={key} không trim được: {e}")
 
-    async def export_once(self):
-        key_type, initial_len = await self.check_key()
+    async def export_key(self, key: str, cutoff_id: str, cutoff_ms: int, index: int, total_keys: int):
+        symbol = symbol_from_key(key)
 
-        cutoff_ms = now_ms() - SKIP_RECENT_SEC * 1000
-        cutoff_id = f"{cutoff_ms}-999999"
+        key_type, initial_len = await self.get_key_type_and_len(key)
 
-        print("")
-        print("============================================================")
-        print("🚚 REDIS ARCHIVE EXPORT START")
-        print("============================================================")
-        print(f"redis={REDIS_URL}")
-        print(f"key={ARCHIVE_KEY} type={key_type} initial_len={initial_len}")
-        print(f"output_dir={EXPORT_DIR.resolve()}")
-        print(f"manifest={MANIFEST_FILE.resolve()}")
-        print(f"skip_recent={SKIP_RECENT_SEC}s")
-        print(f"cutoff_id={cutoff_id} cutoff_iso={utc_parts(cutoff_ms)['iso']}")
-        print(f"batch_size={BATCH_SIZE}")
-        print(f"delete_after_export={DELETE_AFTER_EXPORT}")
-        print(f"trim_after_export={TRIM_AFTER_EXPORT}")
-        print(f"dry_run={DRY_RUN}")
-        print("============================================================")
-        print("")
+        if key_type != "stream":
+            self.stats["keys_skipped"] += 1
+            print(f"⏭️ [KEY {index}/{total_keys}] skip {key} type={key_type}")
+            return
+
+        self.stats["keys_stream"] += 1
 
         if initial_len <= 0:
-            print("ℹ️ Stream rỗng, không có gì để export")
+            self.stats["keys_completed"] += 1
+            print(f"ℹ️ [KEY {index}/{total_keys}] {key} stream rỗng")
             return
+
+        print("")
+        print(f"🔎 [KEY {index}/{total_keys}] {key} symbol={symbol} initial_len={initial_len}")
+
+        key_exported = 0
+        key_deleted = 0
+        key_batches = 0
 
         while True:
             free_gb = disk_free_gb(EXPORT_DIR)
@@ -419,42 +413,47 @@ class RedisArchiveExporter:
                     f"Disk free thấp: {free_gb:.2f}GB < {MIN_FREE_DISK_GB}GB. Dừng để an toàn."
                 )
 
-            entries = await self.fetch_batch(cutoff_id)
+            entries = await self.fetch_batch(key, cutoff_id)
 
             if not entries:
-                print("✅ Không còn dữ liệu cũ hơn cutoff để export")
+                print(
+                    f"✅ [KEY DONE] {key} exported={key_exported} deleted={key_deleted} batches={key_batches}"
+                )
                 break
 
             self.stats["batches"] += 1
-            batch_no = self.stats["batches"]
+            key_batches += 1
 
             ids = [stream_id_to_str(e[0]) for e in entries]
             first_id = ids[0]
             last_id = ids[-1]
 
-            current_len_before = await self.redis.xlen(ARCHIVE_KEY)
+            current_len_before = await self.redis.xlen(key)
 
             print(
-                f"📥 [BATCH {batch_no}] "
+                f"📥 [BATCH] key={key} "
+                f"batch={key_batches} "
                 f"read={len(entries)} "
-                f"range={first_id} → {last_id} "
+                f"range={first_id}→{last_id} "
                 f"stream_len_before={current_len_before}"
             )
 
-            records = self.convert_entries_to_records(entries)
+            records = self.convert_entries_to_records(key, symbol, entries)
+
             self.stats["read"] += len(records)
 
             if DRY_RUN:
-                print(f"🧪 [DRY RUN] would_export={len(records)} would_delete={len(ids)}")
+                print(f"🧪 [DRY RUN] key={key} would_export={len(records)} would_delete={len(ids)}")
                 break
 
             try:
-                final_path = self.write_records_atomic(records, cutoff_ms)
+                final_path = self.write_records_atomic(key, symbol, records, cutoff_ms)
 
                 manifest_record = {
                     "export_id": self.export_id,
                     "export_version": EXPORT_VERSION,
-                    "redis_key": ARCHIVE_KEY,
+                    "redis_key": key,
+                    "symbol": symbol,
                     "first_id": first_id,
                     "last_id": last_id,
                     "records": len(records),
@@ -468,16 +467,19 @@ class RedisArchiveExporter:
 
                 append_manifest(manifest_record)
 
-                deleted = await self.delete_stream_ids(ids)
+                deleted = await self.delete_stream_ids(key, ids)
 
                 self.stats["exported"] += len(records)
                 self.stats["deleted"] += deleted
                 self.stats["files"] += 1
 
-                current_len_after = await self.redis.xlen(ARCHIVE_KEY)
+                key_exported += len(records)
+                key_deleted += deleted
+
+                current_len_after = await self.redis.xlen(key)
 
                 print(
-                    f"✅ [BATCH {batch_no} DONE] "
+                    f"✅ [BATCH DONE] key={key} "
                     f"file={final_path} "
                     f"exported={len(records)} "
                     f"deleted={deleted} "
@@ -488,27 +490,60 @@ class RedisArchiveExporter:
 
             except Exception as e:
                 self.stats["errors"] += 1
-                print(f"❌ [BATCH {batch_no} ERROR] {e}")
+                print(f"❌ [BATCH ERROR] key={key} error={e}")
                 print("⚠️ Không xóa Redis IDs vì export batch chưa hoàn tất")
                 raise
 
-            # Dọn RAM Python sau mỗi batch.
             del entries
             del records
             del ids
             gc.collect()
 
-        await self.trim_stream(cutoff_id)
+        await self.trim_stream(key, cutoff_id)
+        self.stats["keys_completed"] += 1
 
-        final_len = await self.redis.xlen(ARCHIVE_KEY)
+    async def export_once(self):
+        cutoff_ms = now_ms() - SKIP_RECENT_SEC * 1000
+        cutoff_id = f"{cutoff_ms}-999999"
+
+        keys = await self.scan_archive_keys()
+
+        print("")
+        print("============================================================")
+        print("🚚 REDIS MULTI-KEY ARCHIVE EXPORT START")
+        print("============================================================")
+        print(f"redis={REDIS_URL}")
+        print(f"pattern={ARCHIVE_PATTERN}")
+        print(f"keys_found={len(keys)}")
+        print(f"output_dir={EXPORT_DIR.resolve()}")
+        print(f"manifest={MANIFEST_FILE.resolve()}")
+        print(f"skip_recent={SKIP_RECENT_SEC}s")
+        print(f"cutoff_id={cutoff_id}")
+        print(f"cutoff_iso={utc_parts(cutoff_ms)['iso']}")
+        print(f"batch_size={BATCH_SIZE}")
+        print(f"delete_after_export={DELETE_AFTER_EXPORT}")
+        print(f"trim_after_export={TRIM_AFTER_EXPORT}")
+        print(f"dry_run={DRY_RUN}")
+        print("============================================================")
+        print("")
+
+        if not keys:
+            print("ℹ️ Không tìm thấy key archive nào")
+            return
+
+        for idx, key in enumerate(keys, 1):
+            await self.export_key(key, cutoff_id, cutoff_ms, idx, len(keys))
+
         runtime_sec = (now_ms() - self.stats["started_at_ms"]) / 1000
 
         print("")
         print("============================================================")
-        print("✅ REDIS ARCHIVE EXPORT DONE")
+        print("✅ REDIS MULTI-KEY ARCHIVE EXPORT DONE")
         print("============================================================")
-        print(f"initial_len={initial_len}")
-        print(f"final_len={final_len}")
+        print(f"keys_found={self.stats['keys_found']}")
+        print(f"keys_stream={self.stats['keys_stream']}")
+        print(f"keys_skipped={self.stats['keys_skipped']}")
+        print(f"keys_completed={self.stats['keys_completed']}")
         print(f"batches={self.stats['batches']}")
         print(f"files={self.stats['files']}")
         print(f"read={self.stats['read']}")
