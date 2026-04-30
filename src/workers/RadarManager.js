@@ -62,10 +62,10 @@ const MAX_SLOT_STALE_MS = 15 * 60 * 1000;
 // Chặn republish spam cùng một symbol.
 const MIN_REPUBLISH_INTERVAL_MS = 60 * 1000;
 
-const OPPORTUNITY_THRESHOLD = 0.58;
-const HOT_THRESHOLD = 0.74;
+const OPPORTUNITY_THRESHOLD = 0.5;
+const HOT_THRESHOLD = 0.65;
 
-const MIN_24H_QUOTE_VOLUME = 5_000_000;
+const MIN_24H_QUOTE_VOLUME = 3_000_000;
 
 const EXCLUDED_SYMBOLS = new Set([
     'BTCUSDT',
@@ -93,13 +93,13 @@ const SAFE_SYMBOL_REGEX = /^[A-Z0-9]+USDT$/;
 
 const KLINE_LIMIT = 48;
 
-const MIN_ABS_MOVE = 0.003;
-const MIN_RANGE = 0.005;
-const MIN_BODY_STRENGTH = 0.30;
+const MIN_ABS_MOVE = 0.002;
+const MIN_RANGE = 0.003;
+const MIN_BODY_STRENGTH = 0.0;
 
-const MIN_VOLUME_RATIO = 1.8;
-const MIN_QUOTE_VOLUME_RATIO = 1.8;
-const MIN_TRADES_RATIO = 1.5;
+const MIN_VOLUME_RATIO = 1.5;
+const MIN_QUOTE_VOLUME_RATIO = 1.5;
+const MIN_TRADES_RATIO = 1.3;
 
 const MIN_TRIGGER_COUNT = 3;
 
