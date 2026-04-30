@@ -1,247 +1,328 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="vi">
 <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Scout Trading Control Room</title>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
-    <!-- Lightweight Charts dùng để vẽ nến live. -->
-    <script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+  <title>Trading Control Room V3</title>
 
-    <!-- Socket.IO client được serve tự động từ DashboardServer. -->
-    <script src="/socket.io/socket.io.js"></script>
+  <link rel="stylesheet" href="./style.css" />
 
-    <link rel="stylesheet" href="/style.css" />
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
+
 <body>
-    <div class="app-shell">
-        <!-- =====================================================
-             TOP BAR
-        ====================================================== -->
-        <header class="topbar">
-            <div class="brand-block">
-                <div class="brand-dot"></div>
-                <div>
-                    <h1>Scout Trading Control Room</h1>
-                    <p>Realtime monitor · AI inference · Paper/Live safety dashboard</p>
-                </div>
+  <div class="app">
+    <!-- ===================================================== -->
+    <!-- HEADER -->
+    <!-- ===================================================== -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-dot"></div>
+        <div>
+          <h1>Trading Control Room</h1>
+          <p>Dual Brain Monitor · EntryBrain / ExitBrain · Trade Audit</p>
+        </div>
+      </div>
+
+      <div class="top-status">
+        <div class="status-pill" id="redisStatus">Redis: --</div>
+        <div class="status-pill" id="mongoStatus">Mongo: --</div>
+        <div class="status-pill" id="feedStatus">Feed: --</div>
+        <div class="status-pill" id="clientStatus">Socket: --</div>
+      </div>
+    </header>
+
+    <!-- ===================================================== -->
+    <!-- KPI STRIP -->
+    <!-- ===================================================== -->
+    <section class="kpi-grid">
+      <div class="kpi-card">
+        <span class="kpi-label">Mode</span>
+        <strong id="accountMode">--</strong>
+        <small id="paperBalance">Balance: --</small>
+      </div>
+
+      <div class="kpi-card">
+        <span class="kpi-label">Open Trades</span>
+        <strong id="openTradesCount">0</strong>
+        <small>Đang giữ lệnh</small>
+      </div>
+
+      <div class="kpi-card">
+        <span class="kpi-label">Today PnL</span>
+        <strong id="todayPnl">0.0000</strong>
+        <small id="todayWinrate">Winrate: --</small>
+      </div>
+
+      <div class="kpi-card">
+        <span class="kpi-label">Brain Version</span>
+        <strong id="brainVersion">--</strong>
+        <small id="brainStatus">Entry/Exit: --</small>
+      </div>
+
+      <div class="kpi-card">
+        <span class="kpi-label">Feed Age</span>
+        <strong id="feedAge">--</strong>
+        <small id="symbolCount">Symbols: --</small>
+      </div>
+    </section>
+
+    <!-- ===================================================== -->
+    <!-- MAIN GRID -->
+    <!-- ===================================================== -->
+    <main class="main-grid">
+      <!-- LEFT PANEL -->
+      <aside class="panel watchlist-panel">
+        <div class="panel-head">
+          <div>
+            <h2>Watchlist</h2>
+            <p>Chỉ hiển thị coin LIVE/STALE hoặc coin đang có lệnh.</p>
+          </div>
+
+          <input
+            id="watchlistSearch"
+            class="search-input"
+            type="text"
+            placeholder="Tìm symbol..."
+          />
+        </div>
+
+        <div class="table-wrap watchlist-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Price</th>
+                <th>Ready</th>
+                <th>Flow</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="watchlistBody">
+              <tr>
+                <td colspan="5" class="empty-cell">Đang chờ dữ liệu...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </aside>
+
+      <!-- CENTER -->
+      <section class="center-stack">
+        <section class="panel chart-panel">
+          <div class="panel-head">
+            <div>
+              <h2 id="selectedSymbolTitle">Chưa chọn symbol</h2>
+              <p id="selectedSymbolMeta">Chọn coin bên trái để xem chart, AI và marker vào/ra lệnh.</p>
             </div>
 
-            <div class="top-stats">
-                <div class="stat-card">
-                    <span class="label">Mode</span>
-                    <strong id="modeValue">--</strong>
-                </div>
-                <div class="stat-card">
-                    <span class="label">Paper Wallet</span>
-                    <strong id="paperWalletValue">--</strong>
-                </div>
-                <div class="stat-card">
-                    <span class="label">Today PnL</span>
-                    <strong id="todayPnlValue">--</strong>
-                </div>
-                <div class="stat-card">
-                    <span class="label">Winrate</span>
-                    <strong id="winrateValue">--</strong>
-                </div>
-                <div class="stat-card health-card">
-                    <span class="label">System</span>
-                    <strong id="systemStatusValue">BOOT</strong>
-                </div>
+            <div class="chart-actions">
+              <button class="btn ghost" id="reloadBrainBtn">Reload AI</button>
+              <button class="btn danger" id="closeAllBtn">Close All</button>
             </div>
-        </header>
+          </div>
 
-        <!-- =====================================================
-             ACTION BAR
-        ====================================================== -->
-        <section class="action-bar">
-            <div class="connection-group">
-                <span class="pill" id="redisStatus">Redis: --</span>
-                <span class="pill" id="mongoStatus">Mongo: --</span>
-                <span class="pill" id="feedStatus">Feed: --</span>
-                <span class="pill" id="clientStatus">Clients: 0</span>
-            </div>
+          <div id="chart" class="chart-box"></div>
 
-            <div class="control-group">
-                <button class="btn warning" id="pauseBtn">Pause Trading</button>
-                <button class="btn success" id="resumeBtn">Resume</button>
-                <button class="btn danger" id="closeAllBtn">Close All</button>
-                <button class="btn neutral" id="reloadAiBtn">Reload AI</button>
-            </div>
+          <div class="chart-legend">
+            <span><b class="dot in"></b> IN</span>
+            <span><b class="dot out"></b> OUT</span>
+            <span><b class="dot ai"></b> AI timeline</span>
+            <span id="chartLastUpdate">--</span>
+          </div>
         </section>
 
-        <!-- =====================================================
-             MAIN GRID
-        ====================================================== -->
-        <main class="main-grid">
-            <!-- LEFT: WATCHLIST -->
-            <aside class="panel watchlist-panel">
-                <div class="panel-header">
-                    <div>
-                        <h2>Coin đang theo dõi</h2>
-                        <p id="watchlistSubtitle">0 symbols</p>
-                    </div>
-                    <input id="watchlistSearch" class="search-input" placeholder="Tìm symbol..." />
-                </div>
+        <section class="panel brain-panel">
+          <div class="panel-head">
+            <div>
+              <h2>Bộ não hiện tại</h2>
+              <p>Theo dõi xác suất EntryBrain và ExitBrain mới nhất của symbol đang chọn.</p>
+            </div>
+          </div>
 
-                <div class="watchlist-table-wrap">
-                    <table class="watchlist-table">
-                        <thead>
-                            <tr>
-                                <th>Symbol</th>
-                                <th>Bias</th>
-                                <th>Long</th>
-                                <th>Short</th>
-                                <th>Spread</th>
-                                <th>Status</th>
-                            </tr>
-                        </thead>
-                        <tbody id="watchlistBody">
-                            <tr>
-                                <td colspan="6" class="empty-cell">Chưa có dữ liệu feature...</td>
-                            </tr>
-                        </tbody>
-                    </table>
-                </div>
-            </aside>
+          <div class="brain-grid">
+            <div class="brain-card">
+              <div class="brain-title">
+                <span>EntryBrain</span>
+                <small id="entryBrainTime">--</small>
+              </div>
 
-            <!-- CENTER: CHART -->
-            <section class="panel chart-panel">
-                <div class="panel-header chart-header">
-                    <div>
-                        <h2 id="selectedSymbolTitle">Chọn một coin</h2>
-                        <p id="selectedSymbolSubtitle">Live candle · AI probability · entry/exit markers</p>
-                    </div>
-                    <div class="chart-badges">
-                        <span class="pill" id="selectedStatusBadge">--</span>
-                        <span class="pill" id="selectedPriceBadge">Price: --</span>
-                        <span class="pill" id="selectedMarkBadge">Mark: --</span>
-                    </div>
-                </div>
+              <div class="prob-row">
+                <span>FLAT</span>
+                <div class="bar"><i id="probFlat"></i></div>
+                <b id="probFlatText">--</b>
+              </div>
 
-                <div id="chartContainer" class="chart-container"></div>
+              <div class="prob-row">
+                <span>LONG</span>
+                <div class="bar"><i id="probLong"></i></div>
+                <b id="probLongText">--</b>
+              </div>
 
-                <div class="ai-strip">
-                    <div class="ai-meter">
-                        <div class="ai-meter-head">
-                            <span>AI Long</span>
-                            <strong id="longProbText">--</strong>
-                        </div>
-                        <div class="meter-track">
-                            <div class="meter-fill long" id="longProbBar"></div>
-                        </div>
-                    </div>
-                    <div class="ai-meter">
-                        <div class="ai-meter-head">
-                            <span>AI Short</span>
-                            <strong id="shortProbText">--</strong>
-                        </div>
-                        <div class="meter-track">
-                            <div class="meter-fill short" id="shortProbBar"></div>
-                        </div>
-                    </div>
-                    <div class="bias-box" id="biasBox">WAIT</div>
-                </div>
-            </section>
-
-            <!-- RIGHT: METRICS -->
-            <aside class="panel metrics-panel">
-                <div class="panel-header">
-                    <div>
-                        <h2>Thông số coin</h2>
-                        <p>Feature live từ FeedHandler</p>
-                    </div>
-                </div>
-
-                <div class="metric-grid" id="metricGrid">
-                    <div class="metric-item"><span>Spread</span><strong id="metricSpread">--</strong></div>
-                    <div class="metric-item"><span>Funding</span><strong id="metricFunding">--</strong></div>
-                    <div class="metric-item"><span>ATR14</span><strong id="metricAtr">--</strong></div>
-                    <div class="metric-item"><span>MFA</span><strong id="metricMfa">--</strong></div>
-                    <div class="metric-item"><span>OFI</span><strong id="metricOfi">--</strong></div>
-                    <div class="metric-item"><span>VPIN</span><strong id="metricVpin">--</strong></div>
-                    <div class="metric-item"><span>Whale Net</span><strong id="metricWhale">--</strong></div>
-                    <div class="metric-item"><span>BTC Relative</span><strong id="metricBtcRel">--</strong></div>
-                    <div class="metric-item"><span>Liq Long</span><strong id="metricLiqLong">--</strong></div>
-                    <div class="metric-item"><span>Liq Short</span><strong id="metricLiqShort">--</strong></div>
-                    <div class="metric-item"><span>Taker Buy</span><strong id="metricTakerBuy">--</strong></div>
-                    <div class="metric-item"><span>Age</span><strong id="metricAge">--</strong></div>
-                </div>
-            </aside>
-        </main>
-
-        <!-- =====================================================
-             BOTTOM GRID
-        ====================================================== -->
-        <section class="bottom-grid">
-            <div class="panel trades-panel">
-                <div class="panel-header">
-                    <div>
-                        <h2>Lệnh đang mở</h2>
-                        <p id="openTradesSubtitle">0 open trades</p>
-                    </div>
-                </div>
-                <div class="table-scroll">
-                    <table class="trade-table">
-                        <thead>
-                            <tr>
-                                <th>Symbol</th>
-                                <th>Side</th>
-                                <th>Entry</th>
-                                <th>Lev</th>
-                                <th>Prob</th>
-                                <th>Margin</th>
-                                <th>Mode</th>
-                            </tr>
-                        </thead>
-                        <tbody id="openTradesBody">
-                            <tr><td colspan="7" class="empty-cell">Chưa có lệnh mở.</td></tr>
-                        </tbody>
-                    </table>
-                </div>
+              <div class="prob-row">
+                <span>SHORT</span>
+                <div class="bar"><i id="probShort"></i></div>
+                <b id="probShortText">--</b>
+              </div>
             </div>
 
-            <div class="panel trades-panel">
-                <div class="panel-header">
-                    <div>
-                        <h2>Lịch sử lệnh AI</h2>
-                        <p id="closedTradesSubtitle">0 closed trades</p>
-                    </div>
-                </div>
-                <div class="table-scroll">
-                    <table class="trade-table">
-                        <thead>
-                            <tr>
-                                <th>Symbol</th>
-                                <th>Side</th>
-                                <th>Entry</th>
-                                <th>Close</th>
-                                <th>PNL</th>
-                                <th>ROI</th>
-                                <th>Reason</th>
-                            </tr>
-                        </thead>
-                        <tbody id="closedTradesBody">
-                            <tr><td colspan="7" class="empty-cell">Chưa có lịch sử lệnh.</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
+            <div class="brain-card">
+              <div class="brain-title">
+                <span>ExitBrain</span>
+                <small id="exitBrainTime">--</small>
+              </div>
 
-            <div class="panel logs-panel">
-                <div class="panel-header">
-                    <div>
-                        <h2>System Logs</h2>
-                        <p>OrderManager · RiskGuard · Dashboard</p>
-                    </div>
-                </div>
-                <div class="logs-list" id="logsList">
-                    <div class="log-line muted">Đang chờ log hệ thống...</div>
-                </div>
+              <div class="prob-row">
+                <span>HOLD</span>
+                <div class="bar"><i id="probHold"></i></div>
+                <b id="probHoldText">--</b>
+              </div>
+
+              <div class="prob-row">
+                <span>EXIT</span>
+                <div class="bar"><i id="probExit"></i></div>
+                <b id="probExitText">--</b>
+              </div>
+
+              <div class="brain-note" id="brainNote">
+                Chưa có quyết định AI cho symbol này.
+              </div>
             </div>
+          </div>
         </section>
+      </section>
+
+      <!-- RIGHT PANEL -->
+      <aside class="right-stack">
+        <section class="panel trades-panel">
+          <div class="panel-head">
+            <div>
+              <h2>Lệnh đang mở</h2>
+              <p>Bấm vào lệnh để xem audit timeline.</p>
+            </div>
+          </div>
+
+          <div id="openTradesList" class="trade-list">
+            <div class="empty-box">Chưa có lệnh mở.</div>
+          </div>
+        </section>
+
+        <section class="panel trades-panel">
+          <div class="panel-head">
+            <div>
+              <h2>Lịch sử lệnh</h2>
+              <p>Click để xem: thời gian vào/ra, bộ não, lỗi, log liên quan.</p>
+            </div>
+          </div>
+
+          <div id="closedTradesList" class="trade-list closed-list">
+            <div class="empty-box">Chưa có lịch sử lệnh.</div>
+          </div>
+        </section>
+      </aside>
+    </main>
+
+    <!-- ===================================================== -->
+    <!-- BOTTOM LOGS -->
+    <!-- ===================================================== -->
+    <section class="panel logs-panel">
+      <div class="panel-head">
+        <div>
+          <h2>System Logs</h2>
+          <p>Log realtime từ backend, risk, order và dashboard.</p>
+        </div>
+      </div>
+
+      <div id="logsBox" class="logs-box">
+        <div class="empty-box">Chưa có log.</div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ===================================================== -->
+  <!-- TRADE AUDIT MODAL -->
+  <!-- ===================================================== -->
+  <div id="tradeModal" class="modal hidden">
+    <div class="modal-backdrop" id="tradeModalBackdrop"></div>
+
+    <div class="modal-card">
+      <div class="modal-head">
+        <div>
+          <h2 id="modalTradeTitle">Trade Audit</h2>
+          <p id="modalTradeMeta">--</p>
+        </div>
+
+        <button class="icon-btn" id="closeTradeModalBtn">×</button>
+      </div>
+
+      <div class="modal-body">
+        <section class="audit-summary" id="auditSummary">
+          <div class="empty-box">Đang tải chi tiết lệnh...</div>
+        </section>
+
+        <section class="audit-chart-section">
+          <div class="section-head">
+            <h3>Biểu đồ thời gian vào / ra lệnh</h3>
+            <p>Marker IN/OUT được lấy từ lệnh thật, overlay trên nến gần thời điểm giao dịch.</p>
+          </div>
+
+          <div id="auditChart" class="audit-chart"></div>
+        </section>
+
+        <section class="audit-grid">
+          <div class="audit-card">
+            <div class="section-head">
+              <h3>Bộ não lúc vào / ra</h3>
+              <p>EntryBrain và ExitBrain trong vùng thời gian của lệnh.</p>
+            </div>
+
+            <div id="brainAuditBox" class="json-box"></div>
+          </div>
+
+          <div class="audit-card">
+            <div class="section-head">
+              <h3>Lỗi / cảnh báo lệnh</h3>
+              <p>Lỗi được gom từ trade.errors và log liên quan.</p>
+            </div>
+
+            <div id="orderErrorsBox" class="error-list"></div>
+          </div>
+        </section>
+
+        <section class="audit-grid">
+          <div class="audit-card">
+            <div class="section-head">
+              <h3>Feature lúc vào lệnh</h3>
+              <p>Snapshot gần thời điểm mở lệnh.</p>
+            </div>
+
+            <div id="entryFeatureBox" class="json-box"></div>
+          </div>
+
+          <div class="audit-card">
+            <div class="section-head">
+              <h3>Feature lúc thoát lệnh</h3>
+              <p>Snapshot gần thời điểm đóng lệnh.</p>
+            </div>
+
+            <div id="exitFeatureBox" class="json-box"></div>
+          </div>
+        </section>
+
+        <section class="audit-timeline-section">
+          <div class="section-head">
+            <h3>Timeline quyết định</h3>
+            <p>Thứ tự sự kiện: AI → vào lệnh → log/risk → thoát lệnh.</p>
+          </div>
+
+          <div id="decisionTimeline" class="timeline"></div>
+        </section>
+      </div>
     </div>
+  </div>
 
-    <script src="/app.js"></script>
+  <script src="./app.js"></script>
 </body>
 </html>

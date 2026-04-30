@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-TRAIN DUAL BRAIN V2 - FULL LIFECYCLE TRADING TRAINER
+TRAIN DUAL BRAIN V3.1.4 - TIME-AWARE + FEED V25.2 ALIGNED PATCHED
 ============================================================
 
 Mục tiêu:
@@ -14,23 +14,23 @@ Mục tiêu:
    - Pub/Sub recorder jsonl.gz
    - Redis archive exporter jsonl.gz
    - Feed schema cũ 13 field
-   - Feed schema mới có mark_price, spread_bps, local flow...
+   - FeedHandler V25.2 có mark_price, spread_bps, local flow, kline, bookTicker,
+     feature quality flags, radar metadata...
 
 3. Train 2 bộ não:
    - EntryBrain: 0 = FLAT, 1 = LONG, 2 = SHORT
    - ExitBrain : 0 = HOLD, 1 = EXIT
 
-4. Replay test full vòng đời lệnh:
-   - EntryBrain quyết định vào/đứng ngoài
-   - ExitBrain quyết định giữ/thoát
-   - Có emergency stop
-   - Có max hold
-   - Có phí + slippage
-   - Có vốn gốc, margin, leverage
-   - Có ROI theo vốn và PnL USDT
-   - Log tiến độ mỗi 5%
+4. V3 thay đổi quan trọng:
+   - horizon là giây thật dựa trên _ts, không còn là số dòng.
+   - feature list khớp OrderManager V22.2.
+   - ExitBrain train bằng ROI đã nhân leverage giống live OrderManager.
+   - Entry train split theo thời gian trước, chỉ downsample FLAT trong train set.
+   - Replay có max active trades, reserve margin, entry validation filter.
+   - Report có data quality summary.
+   - V3.1 vá fallback quote/liquidation/local volume và đồng bộ ROI replay với ExitBrain dataset.
 
-5. Export:
+5. Export giữ nguyên tên file:
    - EntryBrain.json
    - EntryBrain.onnx
    - EntryBrain.features.json
@@ -44,10 +44,10 @@ Cài thư viện:
 source .venv/bin/activate
 pip install numpy pandas xgboost scikit-learn onnxmltools onnx
 
-Chạy full:
+Chạy ví dụ:
 python src/services/training/train_dual_brain.py \
   --data-dir ./data/live_features_archive \
-  --output-dir ./models_test_full \
+  --output-dir ./models_test_v3 \
   --train-entry \
   --train-exit \
   --replay-test \
@@ -65,17 +65,20 @@ python src/services/training/train_dual_brain.py \
   --initial-capital 200 \
   --fixed-margin 2 \
   --sim-leverage 8 \
+  --sim-max-active-trades 10 \
   --entry-threshold 0.56 \
-  --exit-threshold 0.55
+  --exit-threshold 0.55 \
+  --max-spread-bps 25 \
+  --min-feature-ready-score 0.65 \
+  --max-adverse-return 0.20
 """
 
 import argparse
 import gzip
 import json
 import math
-import os
 import time
-from collections import Counter, defaultdict, deque
+from collections import Counter, deque
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -99,9 +102,8 @@ except Exception as e:
 # ============================================================
 # 1. FEATURE LIST
 # ============================================================
-# Lưu ý:
-# Các tên feature này phải khớp với OrderManager V21.
-# Không tạo feature quá lạ mà OrderManager không build được.
+# Các tên feature này phải khớp với OrderManager V22.2.
+# OrderManager đọc *.features.json và build vector theo đúng thứ tự này.
 # ============================================================
 
 LEGACY_13_FEATURES = [
@@ -159,6 +161,25 @@ ENHANCED_MARKET_FEATURES = [
     "depth_age_ms",
     "trade_age_ms",
     "mark_price_age_ms",
+
+    # FeedHandler V25.2 / OrderManager V22.2 aligned fields.
+    "microprice_bias",
+    "top_book_imbalance",
+    "feature_ready_score",
+    "k1m_taker_buy_ratio",
+    "k1m_range_pct",
+    "k1m_body_pct",
+    "k1m_wick_pct",
+    "k1m_close_position",
+    "liq_net_quote",
+    "max_trade_quote_imbalance",
+    "max_buy_trade_quote",
+    "max_sell_trade_quote",
+    "liq_long_quote",
+    "liq_short_quote",
+    "book_ticker_age_ms",
+    "kline_age_ms",
+    "radar_age_ms",
 ]
 
 POSITION_EXTRA_FEATURES = [
@@ -219,6 +240,16 @@ def safe_int(value: Any, fallback: int = 0) -> int:
         return fallback
 
 
+def safe_bool(value: Any, fallback: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return fallback
+
+
 def timestamp_to_ms(value: Any) -> int:
     n = safe_float(value, 0.0)
     if n <= 0:
@@ -248,12 +279,11 @@ def pct_return(entry_price: float, current_price: float, side: str) -> float:
 
 def list_data_files(data_dir: Path) -> List[Path]:
     patterns = ["*.jsonl.gz", "*.json.gz", "*.jsonl", "*.json"]
-    files = []
+    files: List[Path] = []
 
     for pattern in patterns:
         files.extend(data_dir.rglob(pattern))
 
-    # Loại manifest khỏi dữ liệu train.
     files = [
         f for f in files
         if "_manifest" not in f.name.lower()
@@ -278,6 +308,13 @@ def append_jsonl(path: Path, obj: Dict[str, Any]):
     with open(path, "a", encoding="utf-8") as f:
         f.write(json_dumps(obj))
         f.write("\n")
+
+
+def finite_percentile(series: pd.Series, q: float) -> Optional[float]:
+    arr = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna().values
+    if len(arr) == 0:
+        return None
+    return float(np.percentile(arr, q))
 
 
 # ============================================================
@@ -423,26 +460,54 @@ def normalize_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     clean["spread_bps"] = spread_bps
 
     # --------------------------------------------------------
-    # Taker / local flow
+    # Feed V25.2 alias mapping
     # --------------------------------------------------------
-    clean["local_taker_buy_ratio"] = safe_float(
-        clean.get("local_taker_buy_ratio"),
-        safe_float(clean.get("taker_buy_ratio"), 0.5)
+    clean["coin_pct_local"] = safe_float(
+        clean.get("coin_pct_local"),
+        safe_float(clean.get("coin_pct"), 0.0)
     )
-    clean["taker_buy_ratio"] = safe_float(clean.get("taker_buy_ratio"), clean["local_taker_buy_ratio"])
-    clean["taker_buy_ratio_24h"] = safe_float(clean.get("taker_buy_ratio_24h"), clean["taker_buy_ratio"])
+    clean["btc_pct_local"] = safe_float(
+        clean.get("btc_pct_local"),
+        safe_float(clean.get("btc_pct"), 0.0)
+    )
 
-    clean["local_taker_buy_ratio"] = min(1.0, max(0.0, clean["local_taker_buy_ratio"]))
-    clean["taker_buy_ratio"] = min(1.0, max(0.0, clean["taker_buy_ratio"]))
-    clean["taker_buy_ratio_24h"] = min(1.0, max(0.0, clean["taker_buy_ratio_24h"]))
-
-    clean["local_quote_volume"] = safe_float(clean.get("local_quote_volume"), 0.0)
-    clean["local_buy_quote"] = safe_float(clean.get("local_buy_quote"), 0.0)
-    clean["local_sell_quote"] = safe_float(clean.get("local_sell_quote"), 0.0)
-    clean["local_trade_count"] = safe_float(clean.get("local_trade_count"), 0.0)
+    clean["local_quote_volume"] = safe_float(
+        clean.get("local_quote_volume"),
+        safe_float(clean.get("trade_quote_window"), safe_float(clean.get("quote_volume"), 0.0))
+    )
+    clean["local_buy_quote"] = safe_float(
+        clean.get("local_buy_quote"),
+        safe_float(clean.get("buy_quote_window"), 0.0)
+    )
+    clean["local_sell_quote"] = safe_float(
+        clean.get("local_sell_quote"),
+        safe_float(clean.get("sell_quote_window"), 0.0)
+    )
+    clean["local_trade_count"] = safe_float(
+        clean.get("local_trade_count"),
+        safe_float(clean.get("k1m_trade_count"), 0.0)
+    )
 
     if clean["local_quote_volume"] <= 0:
-        clean["local_quote_volume"] = safe_float(clean.get("quote_volume"), 0.0)
+        buy_q = safe_float(clean.get("buy_quote_window"), 0.0)
+        sell_q = safe_float(clean.get("sell_quote_window"), 0.0)
+
+        if buy_q + sell_q > 0:
+            clean["local_quote_volume"] = buy_q + sell_q
+
+    clean["k1m_taker_buy_ratio"] = safe_float(
+        clean.get("k1m_taker_buy_ratio"),
+        safe_float(clean.get("taker_buy_ratio"), 0.5)
+    )
+    clean["local_taker_buy_ratio"] = safe_float(
+        clean.get("local_taker_buy_ratio"),
+        safe_float(clean.get("taker_buy_ratio"), clean["k1m_taker_buy_ratio"])
+    )
+    clean["taker_buy_ratio"] = safe_float(clean.get("taker_buy_ratio"), clean["local_taker_buy_ratio"])
+    clean["taker_buy_ratio_24h"] = safe_float(clean.get("taker_buy_ratio_24h"), clean["k1m_taker_buy_ratio"])
+
+    for ratio_name in ["local_taker_buy_ratio", "taker_buy_ratio", "taker_buy_ratio_24h", "k1m_taker_buy_ratio"]:
+        clean[ratio_name] = min(1.0, max(0.0, safe_float(clean.get(ratio_name), 0.5)))
 
     if clean["local_buy_quote"] <= 0 and clean["local_quote_volume"] > 0:
         clean["local_buy_quote"] = clean["local_quote_volume"] * clean["local_taker_buy_ratio"]
@@ -460,13 +525,63 @@ def normalize_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     # --------------------------------------------------------
     # Whale / liquidation fallback
     # --------------------------------------------------------
-    clean["liq_long_usdt"] = safe_float(
-        clean.get("liq_long_usdt"),
-        safe_float(clean.get("liq_long_vol"), 0.0) * price
-    )
-    clean["liq_short_usdt"] = safe_float(
-        clean.get("liq_short_usdt"),
-        safe_float(clean.get("liq_short_vol"), 0.0) * price
+    # --------------------------------------------------------
+    # Max trade quote fallback
+    # --------------------------------------------------------
+    max_buy_trade_quote = safe_float(clean.get("max_buy_trade_quote"), 0.0)
+    max_sell_trade_quote = safe_float(clean.get("max_sell_trade_quote"), 0.0)
+
+    if max_buy_trade_quote <= 0:
+        max_buy_trade_quote = safe_float(clean.get("max_buy_trade"), 0.0) * price
+
+    if max_sell_trade_quote <= 0:
+        max_sell_trade_quote = safe_float(clean.get("max_sell_trade"), 0.0) * price
+
+    clean["max_buy_trade_quote"] = max_buy_trade_quote
+    clean["max_sell_trade_quote"] = max_sell_trade_quote
+
+    max_buy_trade_usdt = safe_float(clean.get("max_buy_trade_usdt"), 0.0)
+    max_sell_trade_usdt = safe_float(clean.get("max_sell_trade_usdt"), 0.0)
+
+    if max_buy_trade_usdt <= 0:
+        max_buy_trade_usdt = max_buy_trade_quote
+
+    if max_sell_trade_usdt <= 0:
+        max_sell_trade_usdt = max_sell_trade_quote
+
+    clean["max_buy_trade_usdt"] = max_buy_trade_usdt
+    clean["max_sell_trade_usdt"] = max_sell_trade_usdt
+
+    # --------------------------------------------------------
+    # Liquidation quote fallback
+    # --------------------------------------------------------
+    liq_long_quote = safe_float(clean.get("liq_long_quote"), 0.0)
+    liq_short_quote = safe_float(clean.get("liq_short_quote"), 0.0)
+
+    if liq_long_quote <= 0:
+        liq_long_quote = safe_float(clean.get("liq_long_vol"), 0.0) * price
+
+    if liq_short_quote <= 0:
+        liq_short_quote = safe_float(clean.get("liq_short_vol"), 0.0) * price
+
+    clean["liq_long_quote"] = liq_long_quote
+    clean["liq_short_quote"] = liq_short_quote
+
+    liq_long_usdt = safe_float(clean.get("liq_long_usdt"), 0.0)
+    liq_short_usdt = safe_float(clean.get("liq_short_usdt"), 0.0)
+
+    if liq_long_usdt <= 0:
+        liq_long_usdt = liq_long_quote
+
+    if liq_short_usdt <= 0:
+        liq_short_usdt = liq_short_quote
+
+    clean["liq_long_usdt"] = liq_long_usdt
+    clean["liq_short_usdt"] = liq_short_usdt
+
+    clean["liq_net_quote"] = safe_float(
+        clean.get("liq_net_quote"),
+        clean["liq_short_usdt"] - clean["liq_long_usdt"]
     )
 
     local_quote_safe = clean["local_quote_volume"] if clean["local_quote_volume"] > 0 else 1e-8
@@ -480,15 +595,6 @@ def normalize_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         clean["liq_short_usdt"] / local_quote_safe
     )
 
-    clean["max_buy_trade_usdt"] = safe_float(
-        clean.get("max_buy_trade_usdt"),
-        safe_float(clean.get("max_buy_trade"), 0.0) * price
-    )
-    clean["max_sell_trade_usdt"] = safe_float(
-        clean.get("max_sell_trade_usdt"),
-        safe_float(clean.get("max_sell_trade"), 0.0) * price
-    )
-
     clean["max_buy_trade_local_norm"] = safe_float(
         clean.get("max_buy_trade_local_norm"),
         clean["max_buy_trade_usdt"] / local_quote_safe
@@ -498,11 +604,46 @@ def normalize_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         clean["max_sell_trade_usdt"] / local_quote_safe
     )
 
+    total_max_trade_quote = clean["max_buy_trade_usdt"] + clean["max_sell_trade_usdt"]
+    clean["max_trade_quote_imbalance"] = safe_float(
+        clean.get("max_trade_quote_imbalance"),
+        (clean["max_buy_trade_usdt"] - clean["max_sell_trade_usdt"]) / total_max_trade_quote
+        if total_max_trade_quote > 0 else 0.0
+    )
+
+    whale_net = safe_float(clean.get("WHALE_NET"), 0.0)
+
+    clean["WHALE_NET_LOCAL"] = safe_float(
+        clean.get("WHALE_NET_LOCAL"),
+        whale_net
+    )
+
+    # --------------------------------------------------------
+    # Quality / bookTicker / kline / radar fallbacks
+    # --------------------------------------------------------
+    clean["feature_ready_score"] = safe_float(clean.get("feature_ready_score"), 1.0)
+    clean["is_data_stale"] = safe_bool(clean.get("is_data_stale"), False)
+
+    clean["microprice_bias"] = safe_float(clean.get("microprice_bias"), 0.0)
+    clean["top_book_imbalance"] = safe_float(clean.get("top_book_imbalance"), 0.0)
+    clean["k1m_range_pct"] = safe_float(clean.get("k1m_range_pct"), 0.0)
+    clean["k1m_body_pct"] = safe_float(clean.get("k1m_body_pct"), 0.0)
+    clean["k1m_wick_pct"] = safe_float(clean.get("k1m_wick_pct"), 0.0)
+    clean["k1m_close_position"] = safe_float(clean.get("k1m_close_position"), 0.5)
+    clean["book_ticker_age_ms"] = safe_float(clean.get("book_ticker_age_ms"), 0.0)
+    clean["kline_age_ms"] = safe_float(clean.get("kline_age_ms"), 0.0)
+    clean["radar_age_ms"] = safe_float(clean.get("radar_age_ms"), 0.0)
+
     # --------------------------------------------------------
     # Đảm bảo toàn bộ feature numeric tồn tại
     # --------------------------------------------------------
     for name in ENHANCED_MARKET_FEATURES:
-        clean[name] = safe_float(clean.get(name), 0.0)
+        default = 1.0 if name == "feature_ready_score" else 0.0
+        if name == "k1m_taker_buy_ratio":
+            default = clean.get("taker_buy_ratio", 0.5)
+        if name == "k1m_close_position":
+            default = 0.5
+        clean[name] = safe_float(clean.get(name), default)
 
     return clean
 
@@ -560,7 +701,6 @@ def load_records(data_dir: Path, max_rows: int = 0, verbose_every: int = 250_000
 
     df = df.sort_values(["symbol", "_ts"]).reset_index(drop=True)
 
-    # Dedup chống trùng khi export chạy lại hoặc có batch ghi lại.
     before = len(df)
     df = df.drop_duplicates(subset=["symbol", "_ts"], keep="last").reset_index(drop=True)
     after = len(df)
@@ -577,6 +717,46 @@ def load_records(data_dir: Path, max_rows: int = 0, verbose_every: int = 250_000
     print("")
 
     return df
+
+
+def summarize_data_quality(df: pd.DataFrame) -> Dict[str, Any]:
+    def summarize_col(name: str, percentiles=(10, 50, 90)) -> Optional[Dict[str, Any]]:
+        if name not in df.columns:
+            return None
+        numeric = pd.to_numeric(df[name], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+        if numeric.empty:
+            return None
+        result = {
+            "mean": float(numeric.mean()),
+        }
+        for p in percentiles:
+            result[f"p{p}"] = float(np.percentile(numeric.values, p))
+        return result
+
+    quality: Dict[str, Any] = {}
+
+    feature_ready = summarize_col("feature_ready_score", percentiles=(10, 50, 90))
+    if feature_ready:
+        quality["feature_ready_score"] = feature_ready
+
+    if "is_data_stale" in df.columns:
+        stale = df["is_data_stale"].apply(lambda x: 1 if safe_bool(x, False) else 0)
+        quality["is_data_stale_true_ratio"] = float(stale.mean()) if len(stale) else 0.0
+
+    for name, percentiles in [
+        ("spread_bps", (50, 90, 99)),
+        ("price_age_ms", (50, 90, 99)),
+        ("depth_age_ms", (50, 90, 99)),
+        ("trade_age_ms", (50, 90, 99)),
+        ("mark_price_age_ms", (50, 90, 99)),
+        ("book_ticker_age_ms", (50, 90, 99)),
+        ("kline_age_ms", (50, 90, 99)),
+    ]:
+        summary = summarize_col(name, percentiles=percentiles)
+        if summary:
+            quality[name] = summary
+
+    return quality
 
 
 # ============================================================
@@ -655,8 +835,8 @@ def assign_episodes(df: pd.DataFrame, max_gap_sec: float, min_episode_rows: int)
 
 def future_max_min(values: np.ndarray, horizon: int) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Với mỗi i, lấy max/min trong tương lai i+1 -> i+horizon.
-    Dùng deque O(n).
+    Legacy helper: horizon theo số dòng.
+    V3 không dùng cho label chính nữa, chỉ giữ lại để backward/reference.
     """
     n = len(values)
     future_max = np.full(n, np.nan, dtype=np.float64)
@@ -689,6 +869,60 @@ def future_max_min(values: np.ndarray, horizon: int) -> Tuple[np.ndarray, np.nda
     return future_max, future_min
 
 
+def future_max_min_by_time(
+    values: np.ndarray,
+    timestamps_ms: np.ndarray,
+    horizon_sec: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    V3 time-aware future window.
+
+    Với mỗi index i, lấy max/min trong khoảng:
+    i+1 đến timestamp <= timestamps_ms[i] + horizon_sec * 1000.
+
+    Dùng deque O(n), không nested loop O(n*horizon).
+    Điều kiện: timestamps_ms đã sort tăng trong từng episode.
+    """
+    n = len(values)
+    future_max = np.full(n, np.nan, dtype=np.float64)
+    future_min = np.full(n, np.nan, dtype=np.float64)
+
+    if n == 0:
+        return future_max, future_min
+
+    horizon_ms = int(float(horizon_sec) * 1000)
+    maxdq = deque()
+    mindq = deque()
+    right = -1
+
+    for i in range(n):
+        limit_ts = timestamps_ms[i] + horizon_ms
+
+        while right + 1 < n and timestamps_ms[right + 1] <= limit_ts:
+            right += 1
+
+            while maxdq and values[maxdq[-1]] <= values[right]:
+                maxdq.pop()
+            maxdq.append(right)
+
+            while mindq and values[mindq[-1]] >= values[right]:
+                mindq.pop()
+            mindq.append(right)
+
+        # Không dùng chính nến/dòng hiện tại làm future.
+        while maxdq and maxdq[0] <= i:
+            maxdq.popleft()
+        while mindq and mindq[0] <= i:
+            mindq.popleft()
+
+        if maxdq:
+            future_max[i] = values[maxdq[0]]
+        if mindq:
+            future_min[i] = values[mindq[0]]
+
+    return future_max, future_min
+
+
 # ============================================================
 # 8. ENTRY DATASET
 # ============================================================
@@ -699,40 +933,48 @@ def build_entry_dataset(
     min_return: float,
     fee_bps: float,
     action_margin: float,
-    sample_flat_ratio: float,
+    max_adverse_return: float,
     random_seed: int
 ) -> Tuple[pd.DataFrame, pd.Series, pd.Series, pd.DataFrame]:
 
-    rng = np.random.default_rng(random_seed)
     fee_pct = fee_bps / 100.0
 
     print("")
     print("============================================================")
-    print("🏷️ BUILD ENTRY DATASET")
+    print("🏷️ BUILD ENTRY DATASET V3 TIME-AWARE")
     print("============================================================")
-    print(f"horizon={horizon}s")
+    print(f"horizon={horizon}s real time by _ts")
     print(f"min_return={min_return}%")
     print(f"action_margin={action_margin}%")
     print(f"fee_bps={fee_bps} => fee_pct={fee_pct}%")
+    print(f"max_adverse_return={max_adverse_return}% ({'OFF' if max_adverse_return <= 0 else 'ON'})")
 
     parts = []
 
     for ep_id, ep in df.groupby("episode_id"):
         ep = ep.sort_values("_ts").copy().reset_index(drop=True)
         prices = ep["_price"].values.astype(np.float64)
+        ts_arr = ep["_ts"].values.astype(np.int64)
 
-        if len(prices) <= horizon + 5:
+        if len(prices) <= 5:
             continue
 
-        fmax, fmin = future_max_min(prices, horizon)
+        fmax, fmin = future_max_min_by_time(prices, ts_arr, horizon)
 
         long_reward = (fmax - prices) / prices * 100.0 - fee_pct
         short_reward = (prices - fmin) / prices * 100.0 - fee_pct
+
+        long_adverse = (prices - fmin) / prices * 100.0
+        short_adverse = (fmax - prices) / prices * 100.0
 
         labels = np.zeros(len(ep), dtype=np.int64)
 
         long_ok = (long_reward >= min_return) & (long_reward >= short_reward + action_margin)
         short_ok = (short_reward >= min_return) & (short_reward >= long_reward + action_margin)
+
+        if max_adverse_return > 0:
+            long_ok = long_ok & (long_adverse <= max_adverse_return)
+            short_ok = short_ok & (short_adverse <= max_adverse_return)
 
         labels[long_ok] = 1
         labels[short_ok] = 2
@@ -744,6 +986,8 @@ def build_entry_dataset(
         ep["oracle_long_reward"] = long_reward[valid]
         ep["oracle_short_reward"] = short_reward[valid]
         ep["oracle_best_reward"] = np.maximum(long_reward[valid], short_reward[valid])
+        ep["oracle_long_adverse"] = long_adverse[valid]
+        ep["oracle_short_adverse"] = short_adverse[valid]
 
         parts.append(ep)
 
@@ -751,18 +995,7 @@ def build_entry_dataset(
         raise RuntimeError("Không tạo được entry dataset")
 
     data = pd.concat(parts, ignore_index=True)
-
-    # Downsample FLAT để train nhanh hơn nhưng không làm não FOMO.
-    # sample_flat_ratio = 3 nghĩa là giữ FLAT tối đa ~3 lần số non-flat.
-    if 0 < sample_flat_ratio < 999:
-        flat = data[data["entry_label"] == 0]
-        non_flat = data[data["entry_label"] != 0]
-
-        if len(flat) > 0 and len(non_flat) > 0:
-            keep_flat_n = int(min(len(flat), max(len(non_flat) * sample_flat_ratio, 1000)))
-            keep_idx = rng.choice(flat.index.values, size=keep_flat_n, replace=False)
-            data = pd.concat([flat.loc[keep_idx], non_flat], ignore_index=True)
-            data = data.sample(frac=1, random_state=random_seed).reset_index(drop=True)
+    data = data.sort_values(["_ts", "symbol"]).reset_index(drop=True)
 
     X = data[ENHANCED_MARKET_FEATURES].astype(np.float32)
     y = data["entry_label"].astype(np.int64)
@@ -792,7 +1025,8 @@ def build_exit_dataset(
     max_hold_sec: int,
     entry_stride: int,
     random_seed: int,
-    max_positions_per_episode: int
+    max_positions_per_episode: int,
+    sim_leverage: float
 ) -> Tuple[pd.DataFrame, pd.Series, pd.Series, pd.DataFrame]:
 
     rng = np.random.default_rng(random_seed)
@@ -800,31 +1034,33 @@ def build_exit_dataset(
 
     print("")
     print("============================================================")
-    print("🏷️ BUILD EXIT DATASET")
+    print("🏷️ BUILD EXIT DATASET V3 TIME-AWARE + LEVERAGED ROI")
     print("============================================================")
-    print(f"horizon={horizon}s")
+    print(f"horizon={horizon}s real time by _ts")
     print(f"min_return={min_return}%")
     print(f"max_hold_sec={max_hold_sec}")
     print(f"entry_stride={entry_stride}")
     print(f"fee_bps={fee_bps}")
+    print(f"sim_leverage={sim_leverage}x")
 
     rows = []
 
     for ep_id, ep in df.groupby("episode_id"):
         ep = ep.sort_values("_ts").copy().reset_index(drop=True)
         prices = ep["_price"].values.astype(np.float64)
+        ts_arr = ep["_ts"].values.astype(np.int64)
 
-        if len(ep) <= horizon + 20:
+        if len(ep) <= 20:
             continue
 
-        fmax, fmin = future_max_min(prices, horizon)
+        fmax, fmin = future_max_min_by_time(prices, ts_arr, horizon)
 
         long_reward = (fmax - prices) / prices * 100.0 - fee_pct
         short_reward = (prices - fmin) / prices * 100.0 - fee_pct
 
         candidates = []
 
-        for i in range(0, len(ep) - horizon - 1, max(1, entry_stride)):
+        for i in range(0, len(ep) - 1, max(1, entry_stride)):
             if not np.isfinite(long_reward[i]) or not np.isfinite(short_reward[i]):
                 continue
 
@@ -845,28 +1081,31 @@ def build_exit_dataset(
             if entry_price <= 0:
                 continue
 
-            max_steps = min(max_hold_sec, len(ep) - entry_i - horizon - 1)
-            if max_steps <= 5:
+            max_end_ts = ts_arr[entry_i] + int(max_hold_sec * 1000)
+            max_j = int(np.searchsorted(ts_arr, max_end_ts, side="right") - 1)
+            max_j = min(max_j, len(ep) - 1)
+
+            if max_j <= entry_i + 5:
                 continue
 
             best_roi = -999.0
             worst_roi = 999.0
 
-            for step in range(1, max_steps):
-                j = entry_i + step
+            for j in range(entry_i + 1, max_j + 1):
                 current_price = prices[j]
                 if current_price <= 0:
                     continue
 
-                current_roi = pct_return(entry_price, current_price, side) - fee_pct
+                price_roi = pct_return(entry_price, current_price, side)
+                current_roi = price_roi * sim_leverage - fee_pct * sim_leverage
 
                 best_roi = max(best_roi, current_roi)
                 worst_roi = min(worst_roi, current_roi)
 
                 if side == "LONG":
-                    future_best_roi = pct_return(entry_price, fmax[j], "LONG") - fee_pct
+                    future_best_roi = pct_return(entry_price, fmax[j], "LONG") * sim_leverage - fee_pct * sim_leverage
                 else:
-                    future_best_roi = pct_return(entry_price, fmin[j], "SHORT") - fee_pct
+                    future_best_roi = pct_return(entry_price, fmin[j], "SHORT") * sim_leverage - fee_pct * sim_leverage
 
                 if not np.isfinite(future_best_roi):
                     continue
@@ -875,20 +1114,15 @@ def build_exit_dataset(
                 hold_sec = (int(ep.loc[j, "_ts"]) - int(ep.loc[entry_i, "_ts"])) / 1000.0
                 improvement = future_best_roi - current_roi
 
-                # Label EXIT:
-                # 1. Đang lời đủ nhưng tương lai không còn cải thiện rõ.
-                # 2. Giveback lớn.
-                # 3. Đang lỗ và giữ tiếp không cho edge tốt.
-                # 4. Gần hết max hold.
                 exit_label = 0
 
-                if current_roi >= min_return and improvement < 0.05:
+                if current_roi >= min_return * sim_leverage and improvement < 0.05 * sim_leverage:
                     exit_label = 1
-                if giveback >= max(0.15, min_return * 0.75):
+                if giveback >= max(0.15 * sim_leverage, min_return * 0.75 * sim_leverage):
                     exit_label = 1
-                if current_roi <= -min_return and improvement < min_return:
+                if current_roi <= -min_return * sim_leverage and improvement < min_return * sim_leverage:
                     exit_label = 1
-                if step >= max_steps - 2:
+                if j >= max_j - 1:
                     exit_label = 1
 
                 row = ep.loc[j].copy()
@@ -900,8 +1134,8 @@ def build_exit_dataset(
                 row["position_worst_roi"] = worst_roi
                 row["position_giveback_roi"] = giveback
                 row["position_hold_sec"] = hold_sec
-                row["position_leverage"] = 1.0
-                row["position_entry_distance_pct"] = pct_return(entry_price, current_price, side)
+                row["position_leverage"] = sim_leverage
+                row["position_entry_distance_pct"] = price_roi
                 row["exit_label"] = exit_label
                 row["exit_future_best_roi"] = future_best_roi
                 row["exit_improvement"] = improvement
@@ -914,6 +1148,7 @@ def build_exit_dataset(
         raise RuntimeError("Không tạo được exit dataset")
 
     data = pd.DataFrame(rows)
+    data = data.sort_values(["_ts", "symbol"]).reset_index(drop=True)
 
     for name in ENHANCED_POSITION_FEATURES:
         if name not in data.columns:
@@ -937,7 +1172,7 @@ def build_exit_dataset(
 
 
 # ============================================================
-# 10. CLASS WEIGHT
+# 10. CLASS WEIGHT / DOWNSAMPLE
 # ============================================================
 
 def build_class_weights(y: pd.Series, task: str) -> pd.Series:
@@ -966,6 +1201,65 @@ def build_class_weights(y: pd.Series, task: str) -> pd.Series:
     return pd.Series(np.ones(len(y), dtype=np.float32), index=y.index)
 
 
+def class_distribution(y: pd.Series, label_names: Dict[int, str]) -> Dict[str, int]:
+    c = Counter(y.tolist())
+    return {label_names.get(k, str(k)): int(c.get(k, 0)) for k in sorted(label_names.keys())}
+
+
+def downsample_flat_train_only(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    w_train: pd.Series,
+    sample_flat_ratio: float,
+    random_seed: int,
+    label_names: Dict[int, str]
+) -> Tuple[pd.DataFrame, pd.Series, pd.Series, Dict[str, Any]]:
+    """
+    V3: split theo thời gian trước, chỉ downsample FLAT trong TRAIN set.
+    VAL giữ nguyên phân phối thật để tránh validation đẹp giả.
+    """
+    before_dist = class_distribution(y_train, label_names)
+
+    stats = {
+        "before": before_dist,
+        "after": before_dist,
+        "applied": False,
+        "sample_flat_ratio": sample_flat_ratio,
+    }
+
+    if not (0 < sample_flat_ratio < 999):
+        return X_train, y_train, w_train, stats
+
+    flat_idx = y_train[y_train == 0].index.values
+    non_flat_idx = y_train[y_train != 0].index.values
+
+    if len(flat_idx) == 0 or len(non_flat_idx) == 0:
+        return X_train, y_train, w_train, stats
+
+    keep_flat_n = int(min(len(flat_idx), max(len(non_flat_idx) * sample_flat_ratio, 1000)))
+
+    if keep_flat_n >= len(flat_idx):
+        return X_train, y_train, w_train, stats
+
+    rng = np.random.default_rng(random_seed)
+    keep_flat_idx = rng.choice(flat_idx, size=keep_flat_n, replace=False)
+    keep_idx = np.sort(np.concatenate([keep_flat_idx, non_flat_idx]))
+
+    X_down = X_train.loc[keep_idx].copy()
+    y_down = y_train.loc[keep_idx].copy()
+    w_down = w_train.loc[keep_idx].copy()
+
+    after_dist = class_distribution(y_down, label_names)
+    stats.update({
+        "after": after_dist,
+        "applied": True,
+        "kept_rows": int(len(y_down)),
+        "removed_rows": int(len(y_train) - len(y_down)),
+    })
+
+    return X_down, y_down, w_down, stats
+
+
 # ============================================================
 # 11. TRAIN / EVAL
 # ============================================================
@@ -985,10 +1279,7 @@ def train_val_split_by_time(X: pd.DataFrame, y: pd.Series, w: pd.Series, val_rat
     )
 
 
-def make_xgb_classifier(
-    num_class: int,
-    args,
-):
+def make_xgb_classifier(num_class: int, args):
     if num_class == 2:
         return XGBClassifier(
             objective="binary:logistic",
@@ -1096,8 +1387,27 @@ def train_model(
     label_names: Dict[int, str],
     args,
     title: str,
+    task: str,
 ):
     X_train, X_val, y_train, y_val, w_train, w_val = train_val_split_by_time(X, y, weights, args.val_ratio)
+
+    downsample_stats = None
+    if task == "entry":
+        print("📌 EntryBrain time split before downsample")
+        print(f"train_distribution_before={class_distribution(y_train, label_names)}")
+        print(f"val_distribution_unchanged={class_distribution(y_val, label_names)}")
+
+        X_train, y_train, w_train, downsample_stats = downsample_flat_train_only(
+            X_train=X_train,
+            y_train=y_train,
+            w_train=w_train,
+            sample_flat_ratio=args.sample_flat_ratio,
+            random_seed=args.seed,
+            label_names=label_names
+        )
+
+        print(f"train_distribution_after={class_distribution(y_train, label_names)}")
+        print(f"downsample_stats={downsample_stats}")
 
     model = make_xgb_classifier(num_class=len(label_names), args=args)
 
@@ -1124,6 +1434,9 @@ def train_model(
     )
 
     evaluation = evaluate_classifier(model, X_val, y_val, label_names, title)
+    if downsample_stats:
+        evaluation["train_downsample"] = downsample_stats
+        evaluation["validation_distribution_unchanged"] = class_distribution(y_val, label_names)
 
     return model, evaluation
 
@@ -1147,6 +1460,7 @@ def export_xgboost_json(model, path: Path):
 def export_onnx(model, path: Path, n_features: int) -> bool:
     """
     Fix lỗi onnxmltools yêu cầu feature names dạng f0, f1, f2...
+    Không thêm onnxruntime test để không thêm package mới.
     """
     try:
         import onnxmltools
@@ -1193,12 +1507,19 @@ def make_position_features(row: pd.Series, position: Dict[str, Any]) -> Dict[str
     leverage = safe_float(position.get("leverage"), 1.0)
 
     price_return_pct = pct_return(entry_price, price, side)
-    roi = price_return_pct * leverage
+
+    fee_bps = safe_float(position.get("fee_bps"), 0.0)
+    fee_pct = fee_bps / 100.0
+
+    roi = price_return_pct * leverage - fee_pct * leverage
 
     best_roi = max(safe_float(position.get("best_roi"), roi), roi)
     worst_roi = min(safe_float(position.get("worst_roi"), roi), roi)
 
-    hold_sec = max(0.0, (safe_int(row.get("_ts"), 0) - safe_int(position.get("entry_ts"), 0)) / 1000.0)
+    hold_sec = max(
+        0.0,
+        (safe_int(row.get("_ts"), 0) - safe_int(position.get("entry_ts"), 0)) / 1000.0
+    )
 
     return {
         "position_side_long": 1.0 if side == "LONG" else 0.0,
@@ -1224,6 +1545,30 @@ def build_single_exit_vector(row: pd.Series, position: Dict[str, Any]) -> pd.Dat
             data[name] = safe_float(row.get(name), 0.0)
 
     return pd.DataFrame([data], columns=ENHANCED_POSITION_FEATURES).astype(np.float32)
+
+
+def is_row_valid_for_entry_replay(row: pd.Series, args) -> Tuple[bool, str]:
+    price = safe_float(row.get("_price"), 0.0)
+    if price <= 0:
+        return False, "BAD_PRICE"
+
+    ready_score = safe_float(row.get("feature_ready_score"), 1.0)
+    if ready_score < args.min_feature_ready_score:
+        return False, "LOW_FEATURE_READY"
+
+    if args.replay_reject_stale_flag and safe_bool(row.get("is_data_stale"), False):
+        return False, "STALE_FLAG"
+
+    spread_bps = safe_float(row.get("spread_bps"), 0.0)
+    if spread_bps < 0 or spread_bps > args.max_spread_bps:
+        return False, "BAD_SPREAD"
+
+    bid = safe_float(row.get("best_bid"), 0.0)
+    ask = safe_float(row.get("best_ask"), 0.0)
+    if bid <= 0 or ask <= 0 or ask <= bid:
+        return False, "BAD_BOOK"
+
+    return True, "OK"
 
 
 def close_sim_position(position: Dict[str, Any], row: pd.Series, reason: str, args) -> Dict[str, Any]:
@@ -1338,12 +1683,12 @@ def replay_backtest_dual_brain(
 
     print("")
     print("============================================================")
-    print("🎮 FULL LIFECYCLE REPLAY BACKTEST")
+    print("🎮 FULL LIFECYCLE REPLAY BACKTEST V3.1.4")
     print("============================================================")
     print("Mô phỏng:")
     print("EntryBrain: FLAT/LONG/SHORT")
     print("ExitBrain : HOLD/EXIT")
-    print("Có phí/slippage, margin, leverage, emergency stop, max hold")
+    print("Có phí/slippage, margin reserve, max active trades, leverage, emergency stop, max hold")
     print("============================================================")
 
     df = df.sort_values(["_ts", "symbol"]).copy().reset_index(drop=True)
@@ -1358,13 +1703,19 @@ def replay_backtest_dual_brain(
 
     print(f"test_rows={len(test_df):,}")
     print(f"val_ratio={args.val_ratio}")
+    print(f"entry_features={len(ENHANCED_MARKET_FEATURES)}")
+    print(f"exit_features={len(ENHANCED_POSITION_FEATURES)}")
     print(f"initial_capital={args.initial_capital}")
     print(f"fixed_margin={args.fixed_margin}")
     print(f"sim_leverage={args.sim_leverage}")
+    print(f"sim_max_active_trades={args.sim_max_active_trades}")
     print(f"fee_bps={args.fee_bps}")
     print(f"entry_threshold={args.entry_threshold}")
     print(f"exit_threshold={args.exit_threshold}")
     print(f"min_exit_gap={args.min_exit_gap}")
+    print(f"max_spread_bps={args.max_spread_bps}")
+    print(f"min_feature_ready_score={args.min_feature_ready_score}")
+    print(f"replay_reject_stale_flag={args.replay_reject_stale_flag}")
     print("============================================================")
     print("")
 
@@ -1383,6 +1734,10 @@ def replay_backtest_dual_brain(
 
     entry_signals = Counter()
     exit_reasons = Counter()
+    rejected_entry_rows_by_filter = Counter()
+    skipped_by_no_free_margin = 0
+    skipped_by_max_active_trades = 0
+    max_open_positions_seen = 0
 
     for i, row in test_df.iterrows():
         symbol = normalize_symbol(row.get("symbol"))
@@ -1394,6 +1749,7 @@ def replay_backtest_dual_brain(
 
         # ----------------------------------------------------
         # 1. Quản lý lệnh đang mở
+        # Active position chỉ cần giá tối thiểu, không reject strict.
         # ----------------------------------------------------
         if symbol in open_positions:
             pos = open_positions[symbol]
@@ -1440,57 +1796,68 @@ def replay_backtest_dual_brain(
         # 2. Xét vào lệnh nếu symbol chưa có position
         # ----------------------------------------------------
         if symbol not in open_positions:
-            X_entry_one = build_single_market_vector(row)
-            p_entry = entry_model.predict_proba(X_entry_one)[0]
+            valid_entry_row, reject_reason = is_row_valid_for_entry_replay(row, args)
+            if not valid_entry_row:
+                rejected_entry_rows_by_filter[reject_reason] += 1
+            elif len(open_positions) >= args.sim_max_active_trades:
+                skipped_by_max_active_trades += 1
+            else:
+                used_margin = len(open_positions) * args.fixed_margin
+                free_capital = capital - used_margin
 
-            if len(p_entry) >= 3:
-                p_flat = float(p_entry[0])
-                p_long = float(p_entry[1])
-                p_short = float(p_entry[2])
-
-                sorted_probs = sorted([p_flat, p_long, p_short], reverse=True)
-                gap = sorted_probs[0] - sorted_probs[1]
-
-                side = None
-                prob = 0.0
-
-                if (
-                    p_long >= args.entry_threshold
-                    and p_long > p_short
-                    and p_long > p_flat
-                    and gap >= args.action_margin
-                ):
-                    side = "LONG"
-                    prob = p_long
-
-                elif (
-                    p_short >= args.entry_threshold
-                    and p_short > p_long
-                    and p_short > p_flat
-                    and gap >= args.action_margin
-                ):
-                    side = "SHORT"
-                    prob = p_short
-
+                if free_capital < args.fixed_margin:
+                    skipped_by_no_free_margin += 1
                 else:
-                    entry_signals["FLAT"] += 1
+                    X_entry_one = build_single_market_vector(row)
+                    p_entry = entry_model.predict_proba(X_entry_one)[0]
 
-                if side:
-                    entry_signals[side] += 1
+                    if len(p_entry) >= 3:
+                        p_flat = float(p_entry[0])
+                        p_long = float(p_entry[1])
+                        p_short = float(p_entry[2])
 
-                    # Mô phỏng vốn margin cố định.
-                    # Không mở nếu capital thấp hơn margin.
-                    if capital >= args.fixed_margin:
-                        open_positions[symbol] = {
-                            "symbol": symbol,
-                            "side": side,
-                            "entry_ts": ts,
-                            "entry_price": price,
-                            "prob": prob,
-                            "leverage": args.sim_leverage,
-                            "best_roi": 0.0,
-                            "worst_roi": 0.0,
-                        }
+                        sorted_probs = sorted([p_flat, p_long, p_short], reverse=True)
+                        gap = sorted_probs[0] - sorted_probs[1]
+
+                        side = None
+                        prob = 0.0
+
+                        if (
+                            p_long >= args.entry_threshold
+                            and p_long > p_short
+                            and p_long > p_flat
+                            and gap >= args.action_margin
+                        ):
+                            side = "LONG"
+                            prob = p_long
+
+                        elif (
+                            p_short >= args.entry_threshold
+                            and p_short > p_long
+                            and p_short > p_flat
+                            and gap >= args.action_margin
+                        ):
+                            side = "SHORT"
+                            prob = p_short
+
+                        else:
+                            entry_signals["FLAT"] += 1
+
+                        if side:
+                            entry_signals[side] += 1
+
+                            open_positions[symbol] = {
+                                "symbol": symbol,
+                                "side": side,
+                                "entry_ts": ts,
+                                "entry_price": price,
+                                "prob": prob,
+                                "leverage": args.sim_leverage,
+                                "fee_bps": args.fee_bps,
+                                "best_roi": 0.0,
+                                "worst_roi": 0.0,
+                            }
+                            max_open_positions_seen = max(max_open_positions_seen, len(open_positions))
 
         # ----------------------------------------------------
         # 3. Log tiến độ mỗi 5%
@@ -1507,6 +1874,7 @@ def replay_backtest_dual_brain(
             summary["open_positions"] = len(open_positions)
             summary["entry_signal_distribution"] = dict(entry_signals)
             summary["exit_reason_distribution"] = dict(exit_reasons)
+            summary["max_open_positions_seen"] = int(max_open_positions_seen)
             progress_reports.append(summary)
 
             print(
@@ -1553,9 +1921,14 @@ def replay_backtest_dual_brain(
     final_summary["test_start_ts"] = int(test_df["_ts"].min())
     final_summary["test_end_ts"] = int(test_df["_ts"].max())
     final_summary["trades_file"] = str(trade_path)
+    final_summary["sim_max_active_trades"] = int(args.sim_max_active_trades)
+    final_summary["max_open_positions_seen"] = int(max_open_positions_seen)
+    final_summary["rejected_entry_rows_by_filter"] = dict(rejected_entry_rows_by_filter)
+    final_summary["skipped_by_no_free_margin"] = int(skipped_by_no_free_margin)
+    final_summary["skipped_by_max_active_trades"] = int(skipped_by_max_active_trades)
 
     print("")
-    print("================ REPLAY BACKTEST FINAL ================")
+    print("================ REPLAY BACKTEST FINAL V3.1.4 ================")
     print(f"trades={final_summary['trades']}")
     print(f"capital_start={final_summary['capital_start']:.4f}")
     print(f"capital_end={final_summary['capital_end']:.4f}")
@@ -1574,6 +1947,10 @@ def replay_backtest_dual_brain(
     print(f"max_loss={final_summary['max_loss_usdt']:.4f} USDT")
     print(f"gross_win={final_summary['gross_win_usdt']:.4f} USDT")
     print(f"gross_loss={final_summary['gross_loss_usdt']:.4f} USDT")
+    print(f"max_open_positions_seen={final_summary['max_open_positions_seen']}")
+    print(f"rejected_entry_rows_by_filter={final_summary['rejected_entry_rows_by_filter']}")
+    print(f"skipped_by_no_free_margin={final_summary['skipped_by_no_free_margin']}")
+    print(f"skipped_by_max_active_trades={final_summary['skipped_by_max_active_trades']}")
     print(f"trades_file={trade_path}")
     print("=======================================================")
     print("")
@@ -1595,15 +1972,18 @@ def main():
     parser.add_argument("--train-exit", action="store_true")
     parser.add_argument("--replay-test", action="store_true")
 
+    # V3: horizon là giây thật theo _ts, không phải số dòng.
     parser.add_argument("--horizon", type=int, default=300)
     parser.add_argument("--min-return", type=float, default=0.25)
     parser.add_argument("--action-margin", type=float, default=0.08)
     parser.add_argument("--fee-bps", type=float, default=8.0)
+    parser.add_argument("--max-adverse-return", type=float, default=0.0)
 
     parser.add_argument("--max-gap-sec", type=float, default=5.0)
     parser.add_argument("--min-episode-rows", type=int, default=900)
     parser.add_argument("--max-rows", type=int, default=0)
 
+    # V3: chỉ downsample FLAT trong train split của EntryBrain.
     parser.add_argument("--sample-flat-ratio", type=float, default=3.0)
 
     parser.add_argument("--exit-max-hold-sec", type=int, default=900)
@@ -1626,6 +2006,7 @@ def main():
     parser.add_argument("--initial-capital", type=float, default=200.0)
     parser.add_argument("--fixed-margin", type=float, default=2.0)
     parser.add_argument("--sim-leverage", type=float, default=8.0)
+    parser.add_argument("--sim-max-active-trades", type=int, default=10)
     parser.add_argument("--entry-threshold", type=float, default=0.56)
     parser.add_argument("--exit-threshold", type=float, default=0.55)
     parser.add_argument("--min-exit-gap", type=float, default=0.06)
@@ -1633,6 +2014,9 @@ def main():
     parser.add_argument("--sim-emergency-stop-roi", type=float, default=-10.0)
     parser.add_argument("--sim-max-hold-sec", type=int, default=900)
     parser.add_argument("--sim-min-hold-exit-sec", type=int, default=10)
+    parser.add_argument("--max-spread-bps", type=float, default=25.0)
+    parser.add_argument("--min-feature-ready-score", type=float, default=0.65)
+    parser.add_argument("--replay-reject-stale-flag", action="store_true")
 
     args = parser.parse_args()
 
@@ -1648,25 +2032,31 @@ def main():
 
     print("")
     print("============================================================")
-    print("🧠 TRAIN DUAL BRAIN V2 - FULL LIFECYCLE")
+    print("🧠 TRAIN DUAL BRAIN V3.1.4 - TIME-AWARE + FEED V25.2 ALIGNED PATCHED")
     print("============================================================")
     print(f"data_dir={data_dir}")
     print(f"output_dir={output_dir}")
     print(f"train_entry={args.train_entry}")
     print(f"train_exit={args.train_exit}")
     print(f"replay_test={args.replay_test}")
-    print(f"horizon={args.horizon}s")
+    print(f"horizon={args.horizon}s real time by _ts")
     print(f"min_return={args.min_return}%")
     print(f"action_margin={args.action_margin}%")
+    print(f"max_adverse_return={args.max_adverse_return}%")
     print(f"fee_bps={args.fee_bps}")
     print(f"val_ratio={args.val_ratio}")
+    print(f"entry_features={len(ENHANCED_MARKET_FEATURES)}")
+    print(f"exit_features={len(ENHANCED_POSITION_FEATURES)}")
     print("============================================================")
     print("")
 
     df = load_records(data_dir, max_rows=args.max_rows)
     df = assign_episodes(df, max_gap_sec=args.max_gap_sec, min_episode_rows=args.min_episode_rows)
 
+    data_quality = summarize_data_quality(df)
+
     report = {
+        "version": "TRAIN_DUAL_BRAIN_V3_1_4_TIME_AWARE_FEED_V25_2_ALIGNED_PATCHED",
         "created_at_ms": now_ms(),
         "args": vars(args),
         "data": {
@@ -1676,6 +2066,7 @@ def main():
             "start_ts": int(df["_ts"].min()),
             "end_ts": int(df["_ts"].max()),
         },
+        "data_quality": data_quality,
         "models": {}
     }
 
@@ -1692,7 +2083,7 @@ def main():
             min_return=args.min_return,
             fee_bps=args.fee_bps,
             action_margin=args.action_margin,
-            sample_flat_ratio=args.sample_flat_ratio,
+            max_adverse_return=args.max_adverse_return,
             random_seed=args.seed
         )
 
@@ -1702,7 +2093,8 @@ def main():
             w_entry,
             ENTRY_LABEL_NAMES,
             args,
-            title="EntryBrain"
+            title="EntryBrain",
+            task="entry"
         )
 
         entry_json = output_dir / "EntryBrain.json"
@@ -1719,6 +2111,9 @@ def main():
             "features_path": str(entry_features),
             "onnx_exported": bool(onnx_ok),
             "features": ENHANCED_MARKET_FEATURES,
+            "expected_input_features": len(ENHANCED_MARKET_FEATURES),
+            "label_order": [ENTRY_LABEL_NAMES[i] for i in sorted(ENTRY_LABEL_NAMES.keys())],
+            "expected_output_dim": 3,
             "evaluation": entry_eval,
         }
 
@@ -1734,7 +2129,8 @@ def main():
             max_hold_sec=args.exit_max_hold_sec,
             entry_stride=args.exit_entry_stride,
             random_seed=args.seed,
-            max_positions_per_episode=args.exit_max_positions_per_episode
+            max_positions_per_episode=args.exit_max_positions_per_episode,
+            sim_leverage=args.sim_leverage
         )
 
         exit_model, exit_eval = train_model(
@@ -1743,7 +2139,8 @@ def main():
             w_exit,
             EXIT_LABEL_NAMES,
             args,
-            title="ExitBrain"
+            title="ExitBrain",
+            task="exit"
         )
 
         exit_json = output_dir / "ExitBrain.json"
@@ -1760,6 +2157,9 @@ def main():
             "features_path": str(exit_features),
             "onnx_exported": bool(onnx_ok),
             "features": ENHANCED_POSITION_FEATURES,
+            "expected_input_features": len(ENHANCED_POSITION_FEATURES),
+            "label_order": [EXIT_LABEL_NAMES[i] for i in sorted(EXIT_LABEL_NAMES.keys())],
+            "expected_output_dim": 2,
             "evaluation": exit_eval,
         }
 
@@ -1786,7 +2186,7 @@ def main():
 
     print("")
     print("============================================================")
-    print("✅ TRAINING DONE")
+    print("✅ TRAINING DONE V3.1.4")
     print("============================================================")
     print(f"output_dir={output_dir}")
     print(f"report={report_path}")
